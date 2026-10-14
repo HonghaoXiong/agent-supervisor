@@ -1,0 +1,12 @@
+--- a/apps/zcode-cli/packages/bootstrap/src/app/app-config-options.ts
++++ b/apps/zcode-cli/packages/bootstrap/src/app/app-config-options.ts
+@@ -14,9 +14,6 @@ export function createConfigCliOverrides(options: ZCodeAppOptions): RuntimeConfigPa
+   if (options.runtimeConfig?.mode) {
+     permission.mode = options.runtimeConfig.mode;
+   }
+-  if (options.runtimeConfig?.toolAllowlist) {
+-    permission.allowedTools = [...options.runtimeConfig.toolAllowlist];
+-  }
+   if (options.runtimeConfig?.toolDisallowlist) {
+     // headless CLI 的 denylist 同时投影到 permission config，让执行期权限
+     // 路径与 provider-visible 工具面共享同一份禁用清单。

@@ -1,0 +1,17 @@
+# Never publish machine configuration, worker data, logs or CLI copies.
+.czs/
+out/
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.coverage
+.pytest_cache/
+.DS_Store
+.env
+.env.*
+*.log
+*.events.jsonl

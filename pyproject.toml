@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codex-zcode-supervisor"
+version = "0.1.0"
+description = "Evidence-audited Codex to ZCode delegation through the ZCode app-server protocol"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
+requires-python = ">=3.11"
+authors = [{name = "HonghaoXiong"}]
+dependencies = []
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Programming Language :: Python :: 3",
+  "Operating System :: POSIX",
+]
+
+[project.scripts]
+czs = "zcode_supervisor.cli:main"
+
+[project.urls]
+Repository = "https://github.com/HonghaoXiong/zcode-supervisor"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+zcode_supervisor = ["patches/*.patch"]
