@@ -84,7 +84,7 @@ class CommittedRegistryTests(unittest.TestCase):
         self.assertIn("0.17.0", pin["provenance"])
         # Same exact one-fragment deletion as the reviewed 0.16.9 pins.
         self.assertEqual(runtime.CLI_VERSION, "0.16.9")
-        self.assertEqual(runtime.CACHE_LAYOUT, 2)
+        self.assertEqual(runtime.CACHE_LAYOUT, 3)
         self.assertEqual(runtime.COMPATIBILITY, "pinned-0.16.9")
 
 class PreparedCliTests(RuntimeFixture):
@@ -191,9 +191,9 @@ class PreparedCliTests(RuntimeFixture):
         (legacy_dir / "zcode.cjs").write_bytes(self.expected)
         before = {p.name: p.read_bytes() for p in legacy_dir.iterdir()}
         again = runtime.prepare_cli(self.config)
-        self.assertEqual(again, output)  # v2 目录照常复用
+        self.assertEqual(again, output)  # 当前布局目录照常复用
         self.assertEqual({p.name: p.read_bytes() for p in legacy_dir.iterdir()}, before)
-        self.assertTrue(again.parent.name.endswith("-v2"))
+        self.assertTrue(again.parent.name.endswith(f"-v{runtime.CACHE_LAYOUT}"))
 
     def test_v2_layout_tampering_is_still_rejected_after_migration(self):
         output = runtime.prepare_cli(self.config)

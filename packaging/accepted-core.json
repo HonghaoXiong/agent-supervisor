@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "acceptance": "2026-10-24 acceptance: fixed-model packet field (create/setModel/snapshot/provider-receipt verification), memory-index habits import, doctor habit-profile report, skills-closure binding for Skill packets, Edit replace_all schema-default equivalence, and the Desktop 3.16.3 / CLI 0.17.0 pin; 338 tests pass; live evidence under out/zcode-compatibility-20261024",
+  "acceptance": "2026-10-24 acceptance: fixed-model packet field (create/setModel/snapshot/provider-receipt verification), memory-index habits import, doctor habit-profile report, skills-closure binding for Skill packets, Edit replace_all schema-default equivalence, and the Desktop 3.16.3 / CLI 0.17.0 pin; 338 tests pass; cache layout v3; live evidence under out/zcode-compatibility-20261024",
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
@@ -65,8 +65,8 @@
     },
     "src/zcode_supervisor/runtime.py": {
       "mode": "100644",
-      "blob": "7f6823a95cbd3d64d77ce3f3add5276493297b36",
-      "sha256": "4bfc6f3ece2c20aa104b760773ff7fff175fa550e789e4ade7d0f2a1c59863e1"
+      "blob": "0abb53b7b75050a045f62f3d3e3fa548c9e36b89",
+      "sha256": "5c87a9fd3725ccade0c0d8dffb0711bba17fe0b7b4f17d70cdec0ff94eba12ab"
     }
   }
 }

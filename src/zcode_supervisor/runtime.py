@@ -24,10 +24,13 @@ FRAGMENT = b"e.runtimeConfig?.toolAllowlist&&(n.allowedTools=[...e.runtimeConfig
 COMPATIBILITY = "pinned-0.16.9"
 # Cache layout version. Layout v1 dirs (written by the single-pin releases, whose
 # manifests lack source_revision_status/reviewed/provenance) are never read or
-# modified by this version: a fresh v2 directory is prepared from the verified
-# installed bundle instead. Old caches stay on disk as retained evidence; a
-# tampered v2 manifest or patched copy is still rejected, never repaired.
-CACHE_LAYOUT = 2
+# modified by this version: a fresh directory is prepared from the verified
+# installed bundle instead. Layout v3 (2026-10-24) applies the same rule to v2
+# dirs: pin provenance text was normalized to carry no machine-specific paths,
+# which changes every manifest, so v2 dirs stay on disk as retained evidence and
+# are neither compared nor repaired. A tampered current-layout manifest or
+# patched copy is still rejected, never repaired.
+CACHE_LAYOUT = 3
 
 # Reviewed bundle registry: installed-bundle SHA256 -> pin record. Each pin was
 # accepted only after the real-hardware steps in docs/COMPATIBILITY.md; any
