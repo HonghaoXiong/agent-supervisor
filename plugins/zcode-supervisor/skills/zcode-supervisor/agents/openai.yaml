@@ -1,0 +1,6 @@
+interface:
+  display_name: "ZCode Supervisor"
+  short_description: "Delegate bounded ZCode work and verify delivery evidence"
+  default_prompt: "Use $zcode-supervisor:zcode-supervisor to check this Mac and delegate my scoped development task to ZCode."
+policy:
+  allow_implicit_invocation: true

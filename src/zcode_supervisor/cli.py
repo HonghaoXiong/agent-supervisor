@@ -10,6 +10,7 @@ import subprocess
 import sys
 
 from . import __version__
+from .profile import load_profile, resolve_profile_path
 from .runtime import load_config
 
 
@@ -75,19 +76,44 @@ def create_project(directory, cli_path=None, provider_config=None, node='node'):
 
 def doctor(config):
     command = config.command()  # verifies source compatibility and local copy
+    from .runtime import REVIEWED_BUNDLES, CLI_VERSION
+    installed = hashlib.sha256(Path(config.cli_path).read_bytes()).hexdigest()
+    pin = REVIEWED_BUNDLES.get(installed) or {}
     node_version = subprocess.run([command[0], '--version'], capture_output=True,
                                   text=True, timeout=15, check=True).stdout.strip()
     result = subprocess.run([*command, '--version'], capture_output=True,
                             text=True, env=config.environment(), timeout=30, check=True)
     cli_version = result.stdout.strip()
-    if cli_version != '0.16.9':
+    # Accept only the ACTUAL version of the matched pin; the version string
+    # alone never grants compatibility (unknown hashes already failed closed
+    # inside config.command()). Legacy pins without an explicit cli_version
+    # keep their reviewed 0.16.9 semantics.
+    expected_version = pin.get('cli_version', CLI_VERSION)
+    if cli_version != expected_version:
         raise ValueError('Prepared CLI version differs from the reviewed compatibility target')
-    return {'ok': True, 'supervisor_version': __version__, 'python': sys.version.split()[0],
-            'platform': sys.platform, 'node_version': node_version, 'zcode_cli_version': cli_version,
-            'cli_sha256': hashlib.sha256(Path(command[1]).read_bytes()).hexdigest(),
-            'work_root': str(config.work_root),
-            'authentication': 'not tested; use a real bounded task',
-            'scope_enforcement': 'permission broker and post-run evidence audit; not an OS sandbox'}
+    result = {'ok': True, 'supervisor_version': __version__, 'python': sys.version.split()[0],
+              'platform': sys.platform, 'node_version': node_version, 'zcode_cli_version': cli_version,
+              'cli_sha256': hashlib.sha256(Path(command[1]).read_bytes()).hexdigest(),
+              'bundle_sha256': installed,
+              'bundle_source_revision': pin.get('upstream_commit') or 'unknown',
+              'bundle_reviewed': pin.get('reviewed') or 'unreviewed',
+              'work_root': str(config.work_root),
+              'notifications': 'enabled' if config.notify else 'disabled',
+              'authentication': 'not tested; use a real bounded task',
+              'scope_enforcement': 'permission broker and post-run evidence audit; not an OS sandbox'}
+    # Habit profile health is informational here: a drifted or broken profile
+    # must never take the whole doctor report down with it.
+    path = resolve_profile_path(config)
+    if path is None:
+        result['habit_profile'] = {'profile': None}
+    else:
+        try:
+            loaded = load_profile(path)
+            result['habit_profile'] = {'profile': str(path), 'ok': True,
+                                       'rules': len(loaded['rules']), 'tools': len(loaded['tools'])}
+        except ValueError as error:
+            result['habit_profile'] = {'profile': str(path), 'ok': False, 'error': str(error)[:300]}
+    return result
 
 
 def parser():
@@ -110,6 +136,16 @@ def parser():
     run.add_argument('--out', type=Path, required=True)
     run.add_argument('--resume', help='A completed worker session registered by this installation')
     run.add_argument('--timeout', type=int, default=300)
+    habits = sub.add_parser('habits', help='Import or inspect user ZCode habits; no model calls')
+    habits_sub = habits.add_subparsers(dest='habit_action', required=True)
+    habits_import = habits_sub.add_parser(
+        'import', help='Scan real ZCode stores and write a reviewable draft profile')
+    habits_import.add_argument('--zcode-home', type=Path, default=Path.home() / '.zcode')
+    habits_import.add_argument('--repo', type=Path, default=Path.cwd(),
+                               help='Project repo for its AGENTS.md and pixi interpreter')
+    habits_import.add_argument('--python', type=Path,
+                               help='Extra interpreter for Python module probes')
+    habits_sub.add_parser('status', help='Live profile summary and source drift')
     return result
 
 
@@ -123,6 +159,16 @@ def main(argv=None):
         config = load_config(args.config)
         if args.action == 'doctor':
             print(json.dumps(doctor(config), ensure_ascii=False, indent=2))
+            return 0
+        if args.action == 'habits':
+            from . import habits
+            if args.habit_action == 'status':
+                print(json.dumps(habits.habits_status(config), ensure_ascii=False, indent=2))
+                return 0
+            summary = habits.import_habits(
+                config, zcode_home=args.zcode_home, repo=args.repo,
+                extra_python=args.python)
+            print(json.dumps(summary, ensure_ascii=False, indent=2))
             return 0
         from .protocol import execute, probe
         if args.action == 'probe':

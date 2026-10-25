@@ -1,0 +1,72 @@
+{
+  "schema_version": 1,
+  "acceptance": "2026-10-24 acceptance: fixed-model packet field (create/setModel/snapshot/provider-receipt verification), memory-index habits import, doctor habit-profile report, skills-closure binding for Skill packets, Edit replace_all schema-default equivalence, and the Desktop 3.16.3 / CLI 0.17.0 pin; 338 tests pass; live evidence under out/zcode-compatibility-20261024",
+  "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
+  "files": {
+    "src/zcode_supervisor/__init__.py": {
+      "mode": "100644",
+      "blob": "2967bca4c15ec14f1527b466667d7403ca8d026c",
+      "sha256": "e410a040c0527a55488847402bedf19863aff0ded234905a80cd1c7065c143ba"
+    },
+    "src/zcode_supervisor/__main__.py": {
+      "mode": "100644",
+      "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
+      "sha256": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
+    },
+    "src/zcode_supervisor/cli.py": {
+      "mode": "100644",
+      "blob": "1334eac76d6931248e3cbf7266b2ddcdeaae1f14",
+      "sha256": "1492d58e1a95b73414c5cf54e99c3b0e63c42d3999901c865ebfe3139ac3bc87"
+    },
+    "src/zcode_supervisor/common.py": {
+      "mode": "100644",
+      "blob": "dccf0020ead5b735d2488c374554592e2dd65085",
+      "sha256": "e8b9926c09c76eede25094e1b3a3c4e9dfad325212a773eb007697af05d3924d"
+    },
+    "src/zcode_supervisor/digest.py": {
+      "mode": "100644",
+      "blob": "0d7f359764ecd3ff3cf0a9cee5f54208a4ec359c",
+      "sha256": "c362c7e14634e31d69e24d1097bf8b5b99b41abf5c12db71ca5dc55a1ca03fce"
+    },
+    "src/zcode_supervisor/habits.py": {
+      "mode": "100644",
+      "blob": "e0e336240ed21934c01144e68396a6721dcb2ae3",
+      "sha256": "d29900a60c63bedab1fe4b164c1aad13fb4dbb4b48c98bc35fbf78b8122b475d"
+    },
+    "src/zcode_supervisor/mcp_readonly.py": {
+      "mode": "100644",
+      "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
+      "sha256": "6a47a099f4c51a4bb49de1b0ab32c6e2908d77a2f0833dfea309fd7f80789d14"
+    },
+    "src/zcode_supervisor/notify.py": {
+      "mode": "100644",
+      "blob": "255344734dc05a8a5bbc0df98dae90723f91473c",
+      "sha256": "7f2ac2c261a9d1459dcfba2cf2585783291cf7caa0c2403e58a19806d4e1b5d6"
+    },
+    "src/zcode_supervisor/orchestration.py": {
+      "mode": "100644",
+      "blob": "9f18808ca0e3454b1ccac9a6823935d9703ec2b1",
+      "sha256": "ff752c3a27ff3f577c51b94c7a89e1c945649b2b398fd465fe68798f5279c60d"
+    },
+    "src/zcode_supervisor/patches/zcode-permission-allowlist.patch": {
+      "mode": "100644",
+      "blob": "8792f8ec94b1d2697bd981edd3529de3863fb33c",
+      "sha256": "4f5a1e2b28b27cc90401f5edbe61605e48a7289db56f6b31f9f74f1521a6eff4"
+    },
+    "src/zcode_supervisor/profile.py": {
+      "mode": "100644",
+      "blob": "24620c3d009487d11e914b462a274a3dd5ad0c3d",
+      "sha256": "349baef41ec575b49cda4c75fb1fc5a7d9a81ed20abae7e19803563b0e3a28fe"
+    },
+    "src/zcode_supervisor/protocol.py": {
+      "mode": "100644",
+      "blob": "31c1aac918b0b4f40243745d049e6d4f1ee2d48a",
+      "sha256": "6b87c3b333318a64d0f35da7c1152d636e37015b8bd46cbfae179ced3006c09e"
+    },
+    "src/zcode_supervisor/runtime.py": {
+      "mode": "100644",
+      "blob": "7f6823a95cbd3d64d77ce3f3add5276493297b36",
+      "sha256": "4bfc6f3ece2c20aa104b760773ff7fff175fa550e789e4ade7d0f2a1c59863e1"
+    }
+  }
+}

@@ -8,7 +8,41 @@
 czs --config /absolute/project/.czs/config.json doctor
 ```
 
+本机经验证入口是安装 venv 内的完整路径（shell PATH 中没有裸 `czs`，也无需改全局 PATH）：
+
+```bash
+/Users/honghaoxiong/zcode-supervisor/.venv/bin/czs \
+  --config /Users/honghaoxiong/zcode-supervisor/.czs/config.json <subcommand>
+```
+
 配置中的 `cli_path`、可选 `provider_config` 指向本机安装；`node` 是 Node.js 命令或路径。`work_root`、`state_dir`、`cache_dir` 相对于配置文件所在目录解析，缺省分别为 `work`、`state`、`cache`。不要把旧机器生成的配置、缓存或状态目录直接提交到 Git。
+
+可选 `notify`（布尔）控制本机桌面通知：`czs run` 在任务包实际派发给 worker、以及运行结束（含失败）时各发一条 macOS 通知；失败带提示音。macOS 缺省开启，其他平台缺省关闭；`doctor` 输出中的 `notifications` 字段显示当前状态。通知只包含运行名、会话短标识与交付检查结论，不含提示词、凭据或原始异常文本；它只是给操作者的状态提示，不属于交付证据，发送失败也不影响任务结果与退出码。
+
+## 习惯 profile：自动继承用户规则与适用工具
+
+`czs run` 会自动发现配置目录旁的 `profile.json`（或在配置中显式指定 `profile` 路径）。profile 是经审查的控制端 JSON，把用户在 ZCode 中的既有习惯带入每个任务包，分三层且互不混淆：
+
+1. **规则层（自动加载）**：`rules` 的习惯文本在适用时自动追加进任务 prompt（附有界预算），每条规则用 SHA-256 固定其蒸馏来源文件；来源漂移即拒绝运行，需重审 profile。
+2. **工具层（适用性选择）**：`tools` 按工作区文件 glob 判定适用性。`executor` 类工具作为额外精确字符串 Bash 命令注入任务包（`habit-` 前缀、执行器脚本哈希进 `trusted_hashes`、命令原文披露进 prompt 供 worker 逐字复制），默认 `required=false`（建议性）；`unavailable` 类工具每次运行都如实报告不可用及原因。
+3. **执行层（实际可执行）**：以运行结束时的命令回执为准。结果 JSON 的 `habits` 块记录 profile 指纹、各规则/工具的适用与执行状态；提示词提到工具不构成执行证据。
+
+profile 只做扩展、绝不放宽权限：与任务包命令重号、命令串重合或受信哈希不一致都会硬错误拒收；profile 必须位于 work_root 之外。工具命令的 `{workspace}` 占位符必须独立成词且不得预加引号：预引号或嵌套形式在加载与派发前都会被拒收，替换时以 shell 安全引用渲染为单一参数。schema 与冲突判据见 `src/zcode_supervisor/profile.py` 与 `tests/test_profile.py`。
+
+### 从现有 ZCode 习惯一次性导入
+
+```bash
+czs habits import --repo /absolute/project-repo   # 扫描真实存储，生成可审查草稿
+czs habits status                                  # 在用 profile 摘要 + 来源漂移
+```
+
+`import` 确定性扫描本机真实来源：全局 `~/.zcode/AGENTS.md` 与 `--repo/AGENTS.md` 的逐条习惯（跳过表格/代码块/标题）、`~/.zcode/skills/*/SKILL.md` 的**段落感知操作摘录**、`~/.zcode/cli/config.json` 的 MCP 服务清单、graphify/ocr CLI 探测、pixi 解释器的 sympy/mpmath 模块探测。产物：`habits-sources/<sha256>.md`（**内容寻址、写后不可变**的规则载体——同内容同文件；导入与在用 profile 互不改写对方依赖的文件）、`habits-import.json`（全部发现 + 来源哈希 + 与上轮的漂移）、`profile.draft.json`（可直接通过 load_profile 校验的完整草稿：在用规则原钉定保留、新自动规则按内容寻址 ID 追加并与在用规则去重）。上游不变时重复导入完全幂等；上游变化以新 ID 进草稿待审，不静默跳过、不失效在用 profile。旧版单一 `habits-source.md` 若被在用 profile 钉定则只读保留、永不改写。
+
+**技能摘录与两类哈希的区别**：技能摘录按 markdown 完整段落累积（frontmatter/代码栅栏剥离、装不下的段落整段跳过、`excerpt_truncated` 如实标记，不半句截断），作为规则候选进入草稿并可晋升为自动选用的注入规则；其 `sources` **运行时钉定 SKILL.md 本体**——技能文件被修改后，在用规则即 fail-closed，重跑 `import` 会在同一稳定 ID 下生成携带新正文+新哈希的可审查更新草稿（`skills_drifted` 记录新旧哈希），晋升后恢复可用。与之相对，AGENTS.md 习惯进入内容寻址源文件后才成为运行时钉子，manifest 里的 AGENTS 来源哈希只是给人看的溯源记录，上游变化不中断运行、由 `status` 报告漂移。
+
+导入**永不改写**在用 `profile.json`；晋升 = 人工审查草稿（剪裁规则/技能条目、调整 applies_to、必要时刷新来源哈希钉定）后显式复制。未晋升的技能与 MCP 条目以 `unavailable` 形态登记（原因写明接线路径），CLI/模块探测成功则自动生成哈希固定的回执执行器。
+
+**任务执行输入不可变**：注入执行器消费的 `.habit-params/` 命名空间（公式脚本、图谱参数等）是派发合同的一部分——packet 的 `allowed_files` 与之任何重合都会在派发前被拒绝，防止 worker 改写输入后借已批准的精确命令执行未复审代码。
 
 典型布局：
 
@@ -57,6 +91,16 @@ czs probe \
 
 只有明确列出的文件可以获得 Write/Edit 批准。未列出的现有文件会被冻结，执行前后检查哈希与模式。worker 不应修改自己的合同或验收器。
 
+需要固定执行模型时，任务包增加 `model`，使用本机 ZCode 实际配置中的两个标识，例如：
+
+```json
+{"model": {"providerId": "<本机提供方标识>", "modelId": "<精确模型标识>", "options": {"reasoningLevel": "<本机该模型支持的档位>"}}}
+```
+
+桥接在新建会话时显式选择该模型；新建和续接后都调用完整对象形式的 `session/setModel`，再读取快照。这是对 CLI 0.16.9 创建路径丢失 reasoning options 的兼容处理，保持严格模型检查。发送任务前和完成后都核对运行时选择，并检查当前 turn 的真实主 agent 提供方请求记录。标识不匹配或缺少请求证据时拒收；发送前不匹配则不发模型任务。结果的 `requested_model`、`effective_model_before`、`effective_model_after`、`model_execution` 是验收依据；`observed_model_initial/before/after` 保留各阶段观察到的安全选择字段，预检失败也可复核。`options` 可省略；提供时只接受 `reasoningLevel`，并在前后快照中精确核对。部分提供方要求此项，应通过只读 probe 的 `settings.model.available[].reasoning` 确认支持档位与默认值，不能凭显示名称猜测。提供方请求回执中的 reasoning 信息原样保存；`effectiveLevel=unknown` 只说明实际强度未被提供方证明，不能表述为已确认。省略 `model` 时保持原有选择行为，提示词中的模型名称不等于选择约束。不同机器应重新确认提供方标识，不能照搬另一台机器的 UUID。
+
+工具仍限定 Read、Write、Edit、Bash，原生 MCP 服务未向 worker 暴露。需要 Serena、graphify 等工具时，可把限定操作写进独立、已审查且哈希冻结的执行器，经下面的精确 Bash 命令批准实际调用，并保存工具原始回执。只在提示词里提到工具、或只检查工具已安装，不能作为已经使用的证据。
+
 允许执行命令时，另加：
 
 ```json
@@ -77,6 +121,10 @@ czs probe \
 ```
 
 以上是需要填入真实路径和哈希的字段片段。命令按**完整字符串**匹配，不支持通配或任意 shell 权限。每条命令使用唯一 `id`；默认要求执行。Bash 必须前台执行，不能请求关闭沙箱，超时不能超过合同预算。一个已批准的脚本仍能在本机权限范围内做事，因此要审查其源码、参数与输入，再固定受信文件哈希。
+
+**两个实测陷阱（2026-10-24，CLI 0.17.0 活体验证）**：
+1. **低风险命令不经审批回调**：只读/无害命令（如裸 `echo`、`ls`、`grep`）会被服务端原生自动执行，不产生 `interaction/requestPermission` 回调；事后证据审计把这类未配对执行判为 `Bash execution has no matching broker approval` 并拒收交付。任务提示词必须写明"Bash 仅限逐字执行批准命令，查看文件用 Read"；拒收验证探针也要用会触发回调的形式（如 `/bin/sh -c '…'`）。
+2. **`max_timeout_ms` 小于 120000 的超时陷阱**：worker 调用 Bash 不带 `timeout` 字段时，broker 按默认 120000 与包预算比较，`max_timeout_ms < 120000` 的批准命令会被 `Command timeout exceeds task budget` 拒绝。要么在提示词里要求 worker 显式设置 `timeout ≤ 预算`（习惯 profile 注入的工具披露行已含预算说明），要么把该命令预算设为 120000。
 
 执行器应自行设置确定的工作目录和必要环境，核验运行前后输入哈希，保存完整测试结果，并传回真实退出码。测试数量和测试内容属于独立验收要求，桥接不会从一句“测试通过”推断正确性。
 

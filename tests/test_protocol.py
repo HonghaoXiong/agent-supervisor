@@ -278,6 +278,30 @@ class ExecutionEvidenceTests(AuthorityFixture):
         self.assertEqual(problems, [])
         self.assertEqual([item["command_id"] for item in commands], ["check"])
 
+    def test_edit_without_replace_all_matches_schema_default_approval(self):
+        edit_input = {"file_path": str(self.workspace.resolve() / "editable.py"),
+                      "old_string": "a", "new_string": "b"}
+        decision = self.authority.decide(self.request(
+            toolName="Edit", input={**edit_input, "replace_all": False}))
+        self.assertEqual(decision["decision"], "allow")
+        scheduled = self.event("scheduled", toolName="Edit", input=edit_input)
+        streamed = self.model_call(toolName="Edit", input=edit_input)
+        _, problems = protocol.execution_evidence(
+            [streamed, scheduled, self.event("result")], self.authority)
+        self.assertEqual(problems, [])
+
+    def test_edit_streamed_text_change_is_still_rejected(self):
+        edit_input = {"file_path": str(self.workspace.resolve() / "editable.py"),
+                      "old_string": "a", "new_string": "b"}
+        self.authority.decide(self.request(
+            toolName="Edit", input={**edit_input, "replace_all": False}))
+        changed = {**edit_input, "new_string": "unexpected"}
+        scheduled = self.event("scheduled", toolName="Edit", input=changed)
+        streamed = self.model_call(toolName="Edit", input=changed)
+        _, problems = protocol.execution_evidence(
+            [streamed, scheduled, self.event("result")], self.authority)
+        self.assertTrue(problems)
+
     def test_duplicate_scheduled_or_terminal_event_is_rejected(self):
         self.decide()
         for duplicate in ("scheduled", "result"):

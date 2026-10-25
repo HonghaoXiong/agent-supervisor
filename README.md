@@ -16,6 +16,12 @@ Python 包名为 `codex-zcode-supervisor`，命令为 `czs`；也可使用 `pyth
 
 ## 安装与首次使用
 
+多台 Mac 使用 Codex 插件时，优先使用已构建的 `zcode-supervisor-macos-0.1.2.zip`：
+解压后运行 `Install.command`，重启 Codex 并开新聊天，对它说“使用 ZCode Supervisor 检查环境并委派任务”。
+`Check.command` 生成无模型环境诊断；`Validate.command` 验证本机技能发现并生成可回传报告。
+插件内含已审核心与自动发现技能，无需克隆本仓或单独 pip 安装。
+构建与目标机器前提见[插件发行说明](docs/DISTRIBUTION.md)；安装不会发送模型任务。
+
 需要 Python 3.11+、Node.js、已安装且能正常登录使用的 ZCode。私有仓库访问使用自己的 GitHub 登录或 SSH 配置；不要把 token 放进 URL。
 
 ```bash
@@ -55,7 +61,8 @@ czs run \
 
 ## 在 Codex 中使用
 
-将以下约定放进目标项目的协作说明即可，不需要让两个 GUI 互相模拟点击：
+安装上述插件后，Codex 可发现 `zcode-supervisor` skill，按其中的合同与证据流程调用包内入口。
+源码/普通 Python 包用户也可把以下约定放进目标项目的协作说明，不需要让两个 GUI 互相模拟点击：
 
 > Codex 负责方案、任务合同和独立验收。每次把小型工作副本放入配置的 work_root，合同和证据放在副本外；通过 czs run 委派给 ZCode。按实际 diff、工具结果和测试输出验收。失败时给出具体返工合同，并续接本桥接登记的 session。通过前不自动合并或发布。
 
