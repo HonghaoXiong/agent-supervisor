@@ -11,8 +11,8 @@ czs --config /absolute/project/.czs/config.json doctor
 本机经验证入口是安装 venv 内的完整路径（shell PATH 中没有裸 `czs`，也无需改全局 PATH）：
 
 ```bash
-/Users/honghaoxiong/zcode-supervisor/.venv/bin/czs \
-  --config /Users/honghaoxiong/zcode-supervisor/.czs/config.json <subcommand>
+~/zcode-supervisor/.venv/bin/czs \
+  --config ~/zcode-supervisor/.czs/config.json <subcommand>
 ```
 
 配置中的 `cli_path`、可选 `provider_config` 指向本机安装；`node` 是 Node.js 命令或路径。`work_root`、`state_dir`、`cache_dir` 相对于配置文件所在目录解析，缺省分别为 `work`、`state`、`cache`。不要把旧机器生成的配置、缓存或状态目录直接提交到 Git。

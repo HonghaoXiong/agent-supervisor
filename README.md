@@ -22,7 +22,7 @@ Python 包名为 `codex-zcode-supervisor`（仓库名 agent-supervisor），命�
 插件内含已审核心与自动发现技能，无需克隆本仓或单独 pip 安装。
 构建与目标机器前提见[插件发行说明](docs/DISTRIBUTION.md)；安装不会发送模型任务。
 
-需要 Python 3.11+、Node.js、已安装且能正常登录使用的 ZCode。私有仓库访问使用自己的 GitHub 登录或 SSH 配置；不要把 token 放进 URL。
+需要 Python 3.11+、Node.js、已安装且能正常登录使用的 ZCode。本仓库为公开仓库，直接克隆即可；推送权限使用自己的 GitHub 登录或 SSH 配置，不要把 token 放进 URL。
 
 ```bash
 gh repo clone HonghaoXiong/agent-supervisor

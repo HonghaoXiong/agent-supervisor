@@ -1,5 +1,6 @@
 """Contract tests for the reviewed native-orchestration packet extension."""
 import json
+import os
 import sys
 import unittest
 from pathlib import Path
@@ -610,8 +611,11 @@ class SkillPinningAndNeutralizationTests(unittest.TestCase):
 class SettleSchemaReplayTests(unittest.TestCase):
     """Replay the frozen lanes3 real RPCs through the settle logic."""
 
-    RAW = Path("/Users/honghaoxiong/underworld2-2.17.3/out/czs-native-orchestration-20261014/"
-               "reviewer-20261016-candidate-1/raw/orch-lanes3/run-lanes3.json")
+    # Optional local replay fixture (never shipped); override the location
+    # with CZS_LANES3_RAW when the snapshot lives elsewhere.
+    RAW = Path(os.environ.get("CZS_LANES3_RAW", str(
+        Path.home() / "underworld2-2.17.3/out/czs-native-orchestration-20261014/"
+        "reviewer-20261016-candidate-1/raw/orch-lanes3/run-lanes3.json")))
 
     def test_goal_final_and_background_jobs_read_from_real_projection(self):
         from zcode_supervisor.protocol import goal_state_from_snapshot, workflow_jobs_from_snapshot
