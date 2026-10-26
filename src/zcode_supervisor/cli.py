@@ -146,7 +146,61 @@ def parser():
     habits_import.add_argument('--python', type=Path,
                                help='Extra interpreter for Python module probes')
     habits_sub.add_parser('status', help='Live profile summary and source drift')
+    probe_all = sub.add_parser(
+        'probe-all', help='Read-only Codex/ZCode/dsh install probe, contracts and '
+                          'baseline diff plus an MCP handshake smoke; no model calls')
+    probe_all.add_argument('--out', type=Path, required=True,
+                           help='Output directory for contracts and tri-probe.json')
+    probe_all.add_argument('--write-baseline', action='store_true',
+                           help='Overwrite the stored baseline after comparing '
+                                '(explicit action; by default the baseline is only created)')
+    probe_all.add_argument('--revalidate', action='store_true',
+                           help='Publish the probe result as hub health.json and print '
+                                'the routing view; exit 0 only when every installed '
+                                'worker stays enabled (fail-closed)')
+    probe_all.add_argument('--hub-server-argv',
+                           help='JSON array overriding the MCP smoke-test server command')
+    hub = sub.add_parser('hub', help='Hub-side operations: contracts, health view, MCP server')
+    hub_sub = hub.add_subparsers(dest='hub_action', required=True)
+    hub_register = hub_sub.add_parser(
+        'register-contract', help='Validate a human-supplied contract file and freeze '
+                                  'it under the hub state directory')
+    hub_register.add_argument('file', type=Path, help='Contract JSON file to register')
+    hub_sub.add_parser('health', help='Print the published hub health.json '
+                                      '(written by probe-all --revalidate)')
+    hub_serve = hub_sub.add_parser('serve', help='Run the hub MCP server on stdio')
+    hub_serve.add_argument('--evidence-root', type=Path, default=None,
+                           help='Evidence root for hub dispatches '
+                                '(default <work_root>/hub-evidence)')
     return result
+
+
+def _hub_action(args, config) -> int:
+    """The three hub subcommands; contract rejection prints its problem list."""
+    from . import contracts, health, hub_server
+    if args.hub_action == 'register-contract':
+        try:
+            result = contracts.register_contract(config.state_dir, args.file)
+        except contracts.ContractError as error:
+            print(json.dumps({'ok': False, 'error': str(error)}, ensure_ascii=False))
+            return 1
+        print(json.dumps(result, ensure_ascii=False, indent=2))
+        return 0
+    if args.hub_action == 'health':
+        document = health.read_health(config.state_dir)
+        if document is None:
+            print(json.dumps({'ok': False,
+                              'error': 'no health.json; run probe-all --revalidate'},
+                             ensure_ascii=False))
+            return 1
+        print(json.dumps(document, ensure_ascii=False, indent=2))
+        return 0
+    # serve: hand the flags to hub_server's own entry point so its defaults
+    # (config resolution, evidence-root under work_root) stay identical.
+    hub_argv = ['--config', str(args.config)]
+    if args.evidence_root is not None:
+        hub_argv += ['--evidence-root', str(args.evidence_root)]
+    return hub_server.main(hub_argv)
 
 
 def main(argv=None):
@@ -160,6 +214,33 @@ def main(argv=None):
         if args.action == 'doctor':
             print(json.dumps(doctor(config), ensure_ascii=False, indent=2))
             return 0
+        if args.action == 'probe-all':
+            from .tri_probe import revalidate, run_probe_all
+            hub_argv = None
+            if args.hub_server_argv:
+                hub_argv = json.loads(args.hub_server_argv)
+                if (not isinstance(hub_argv, list) or not hub_argv
+                        or not all(isinstance(item, str) and item for item in hub_argv)):
+                    raise ValueError('--hub-server-argv must be a JSON array of command strings')
+            if args.revalidate:
+                result = revalidate(config, args.out, hub_server_argv=hub_argv,
+                                    write_baseline=args.write_baseline)
+                document = result['health']
+                print(json.dumps({
+                    'overall': result['probe']['overall'],
+                    'routing': document['routing'],
+                    'workers': {name: {'status': entry['status'],
+                                       'enabled': entry['enabled'],
+                                       'reason': entry['reason']}
+                                for name, entry in document['workers'].items()},
+                }, ensure_ascii=False, indent=2))
+                return 0 if result['all_installed_enabled'] else 1
+            result = run_probe_all(config, args.out, hub_server_argv=hub_argv,
+                                   write_baseline=args.write_baseline)
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if result['overall'] == 'ok' else 1
+        if args.action == 'hub':
+            return _hub_action(args, config)
         if args.action == 'habits':
             from . import habits
             if args.habit_action == 'status':

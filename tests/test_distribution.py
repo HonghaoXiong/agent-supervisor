@@ -55,7 +55,9 @@ class DistributionTests(unittest.TestCase):
             self.assertTrue(any(n.endswith('/.agents/plugins/marketplace.json') for n in names))
             self.assertFalse(any('/.czs/' in n or n.endswith('.events.jsonl') or '/__pycache__/' in n for n in names))
         core = self.release / 'plugins/zcode-supervisor/lib/zcode_supervisor/protocol.py'
-        self.assertIn('def observed_model(', core.read_text())  # fixed-model feature ships since 0.1.2
+        self.assertIn('observed_model', core.read_text())  # re-export keeps protocol.* working
+        authority = self.release / 'plugins/zcode-supervisor/lib/zcode_supervisor/authority.py'
+        self.assertIn('def observed_model(', authority.read_text())  # fixed-model feature ships since 0.1.2
         pins = json.loads((REPO / 'packaging/accepted-core.json').read_text())
         actual = self.installer.verify_release(self.release)
         self.assertEqual(actual['accepted_core'], pins)

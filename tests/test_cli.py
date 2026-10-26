@@ -2,6 +2,7 @@
 import json
 import hashlib
 import io
+import sys
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
@@ -9,7 +10,13 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
+from zcode_supervisor import tri_probe
 from zcode_supervisor.cli import create_project, doctor, main
+
+# Reuse the fake codex/node/bundle harness from the tri-probe tests (the
+# tests directory is on sys.path under `unittest discover -s tests`).
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_tri_probe import Harness, write_bundle  # noqa: E402
 
 
 class InitTests(unittest.TestCase):
@@ -240,6 +247,155 @@ class RunExitCodeContractTests(unittest.TestCase):
         self.assertIs(receipt['delivery_ok'], False)
         self.assertEqual(receipt['outcome'], 'preflight-rejected')
         self.assertIn('controller-approved', receipt['skill_closure_refused'])
+
+
+class ProbeAllRevalidateCliTests(unittest.TestCase):
+    """probe-all --revalidate prints the routing view and exits on health.
+
+    The hub MCP smoke inside the probe is stubbed (it never influences the
+    worker verdicts); agent discovery uses the same fake harness as the
+    tri-probe tests, so no real codex/zcode/dsh is ever executed.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='czs revalidate cli ')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.harness = Harness(self.root / 'fakes')
+        self.config = self.harness.config(self.root)
+        self.harness.patch_discovery(self)
+        self.out = self.root / 'out'
+
+    def _main(self, *extra):
+        buffer = io.StringIO()
+        with patch('zcode_supervisor.cli.load_config', return_value=self.config), \
+                patch.object(tri_probe, 'probe_hub_mcp',
+                             return_value={'status': 'ok', 'tools': []}), \
+                redirect_stdout(buffer):
+            code = main(['probe-all', '--out', str(self.out), *extra])
+        return code, json.loads(buffer.getvalue())
+
+    def test_revalidate_exit_zero_then_one_across_an_upstream_update(self):
+        code, payload = self._main('--revalidate')
+        self.assertEqual(code, 0)
+        self.assertEqual(payload['overall'], 'ok')
+        self.assertEqual(sorted(payload['routing']['enabled_workers']),
+                         ['codex', 'zcode'])
+        self.assertEqual(payload['workers']['codex'],
+                         {'status': 'ok', 'enabled': True, 'reason': ''})
+        self.assertEqual(payload['workers']['dsh']['status'], 'absent')
+        # one upstream bundle edit flips the exit code and the routing view
+        write_bundle(self.harness.bundle,
+                     ['session/create', 'session/read',
+                      'interaction/requestPermission'],
+                     extra='// upstream drift\n')
+        code, payload = self._main('--revalidate')
+        self.assertEqual(code, 1)
+        zcode = payload['workers']['zcode']
+        self.assertIs(zcode['enabled'], False)
+        self.assertEqual(zcode['status'], 'changed')
+        self.assertIn('fingerprint', zcode['reason'])
+        self.assertNotIn('zcode', payload['routing']['enabled_workers'])
+        self.assertIn('zcode', payload['routing']['disabled_workers'])
+
+    def test_revalidate_with_write_baseline_accepts_then_recovers(self):
+        self._main('--revalidate')
+        write_bundle(self.harness.bundle,
+                     ['session/create', 'session/read',
+                      'interaction/requestPermission'],
+                     extra='// accepted upstream update\n')
+        code, _ = self._main('--revalidate')
+        self.assertEqual(code, 1)  # the drift this run observed fails closed
+        # accept the new baseline; that run still reports the drift it saw,
+        # so the clean verdict comes from the next revalidate
+        code, _ = self._main('--revalidate', '--write-baseline')
+        self.assertEqual(code, 1)
+        code, payload = self._main('--revalidate')
+        self.assertEqual(code, 0)
+        self.assertEqual(payload['workers']['zcode']['status'], 'ok')
+        self.assertIs(payload['workers']['zcode']['enabled'], True)
+
+    def test_hub_health_prints_the_published_document(self):
+        from zcode_supervisor.health import ROUTING_NOTE
+        self._main('--revalidate')
+        buffer = io.StringIO()
+        with patch('zcode_supervisor.cli.load_config', return_value=self.config), \
+                redirect_stdout(buffer):
+            code = main(['hub', 'health'])
+        self.assertEqual(code, 0)
+        document = json.loads(buffer.getvalue())
+        self.assertIs(document['workers']['zcode']['enabled'], True)
+        self.assertIs(document['workers']['codex']['enabled'], True)
+        self.assertEqual(document['routing']['note'], ROUTING_NOTE)
+
+
+class HubCliTests(unittest.TestCase):
+    """hub register-contract and hub health wire the hub state directory."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='czs hub cli ')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name).resolve()
+        self.harness = Harness(self.root / 'fakes')
+        self.config = self.harness.config(self.root)
+
+    def write_contract(self, **overrides) -> Path:
+        workspace = self.config.work_root / 'ws'
+        workspace.mkdir(parents=True, exist_ok=True)
+        contract = {
+            'contract_id': 'hub-cli-check',
+            'worker': 'zcode',
+            'workspace': str(workspace),
+            'prompt': 'Read-only hub CLI contract check.',
+            'allowed_files': [],
+            'commands': [],
+            'model': {'providerId': 'builtin', 'modelId': 'probe',
+                      'options': {'reasoningLevel': 'low'}},
+            'max_timeout_ms': 1000,
+            'budget': {'max_tokens': 100, 'max_cost_usd': 0.1},
+        }
+        contract.update(overrides)
+        path = self.root / 'contract.json'
+        path.write_text(json.dumps(contract))
+        return path
+
+    def _contracts_files(self):
+        directory = self.config.state_dir / 'hub' / 'contracts'
+        return list(directory.glob('*.json')) if directory.is_dir() else []
+
+    def _register(self, path):
+        buffer = io.StringIO()
+        with patch('zcode_supervisor.cli.load_config', return_value=self.config), \
+                redirect_stdout(buffer):
+            code = main(['hub', 'register-contract', str(path)])
+        return code, json.loads(buffer.getvalue())
+
+    def test_register_contract_freezes_a_valid_contract(self):
+        code, payload = self._register(self.write_contract())
+        self.assertEqual(code, 0)
+        self.assertEqual(payload['contract_id'], 'hub-cli-check')
+        self.assertTrue(payload['sha256'])
+        stored = self.config.state_dir / 'hub' / 'contracts' / 'hub-cli-check.json'
+        self.assertTrue(stored.is_file())
+
+    def test_register_contract_rejects_a_bad_contract_as_json_error(self):
+        code, payload = self._register(
+            self.write_contract(worker='dsh', allowed_files=['REPORT.md']))
+        self.assertEqual(code, 1)
+        self.assertIs(payload['ok'], False)
+        self.assertIn('allowed_files must be empty', payload['error'])
+        self.assertIn("worker 'dsh'", payload['error'])
+        self.assertEqual(self._contracts_files(), [])  # nothing stored
+
+    def test_hub_health_without_health_json_is_a_json_error(self):
+        buffer = io.StringIO()
+        with patch('zcode_supervisor.cli.load_config', return_value=self.config), \
+                redirect_stdout(buffer):
+            code = main(['hub', 'health'])
+        self.assertEqual(code, 1)
+        self.assertEqual(json.loads(buffer.getvalue()),
+                         {'ok': False,
+                          'error': 'no health.json; run probe-all --revalidate'})
 
 
 if __name__ == '__main__':

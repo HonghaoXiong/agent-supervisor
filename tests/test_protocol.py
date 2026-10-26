@@ -5,6 +5,7 @@ import io
 import json
 import math
 import os
+from contextlib import redirect_stdout
 from pathlib import Path
 import tempfile
 import unittest
@@ -784,6 +785,83 @@ class ProtocolLifecycleTests(unittest.IsolatedAsyncioTestCase):
         task.add_done_callback(client.reverse_done)
         await asyncio.gather(task, return_exceptions=True)
         self.assertIn("permission callback failed", client.failure)
+
+
+class QuietSummaryTests(unittest.IsolatedAsyncioTestCase):
+    """execute()'s tail run-summary print must be suppressible (args.quiet)
+    for in-process callers that own stdout — e.g. the hub's zcode runner,
+    where stdout is the stdio MCP wire and a stray print corrupts frames."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.root = Path(self.temporary.name).resolve()
+        self.workspace = self.root / 'workspace'
+        self.workspace.mkdir()
+        self.packet = self.root / 'packet.json'
+        self.output = self.root / 'run.json'
+        self.packet.write_text(json.dumps({'workspace': str(self.workspace),
+                                           'prompt': 'Fixture work',
+                                           'allowed_files': []}))
+        self.config = SimpleNamespace(work_root=self.root,
+                                      state_dir=self.root / 'state',
+                                      cache_dir=self.root / 'cache')
+
+    def make_args(self, quiet):
+        args = SimpleNamespace(packet=str(self.packet), out=str(self.output),
+                               resume=None, timeout=5)
+        if quiet:
+            args.quiet = True
+        return args
+
+    async def run_execute(self, quiet):
+        class FakeClient:
+            def __init__(self, *args, **kwargs):
+                self.events = []
+                self.failure = None
+                self.on_event = None
+                self.process = SimpleNamespace(pid=987654, returncode=None)
+
+            async def start(self):
+                pass
+
+            async def close(self):
+                self.process.returncode = 0
+
+            async def request(self, method, params):
+                if method == 'session/create':
+                    return {'session': {'sessionId': 'sess_quiet'}}
+                if method == 'session/subscribe':
+                    return {'eventSeq': 0}
+                if method == 'session/read':
+                    return {'session': {'status': 'idle'},
+                            'runtime': {'pendingRequestIds': []}}
+                if method == 'session/send':
+                    started = {'type': 'turn.started', 'sessionId': 'sess_quiet',
+                               'turnId': 'turn_quiet', 'seq': 1,
+                               'payload': {'inputId': params['inputId']}}
+                    self.on_event(started)
+                    self.events.append(started)
+                    self.events.append({'type': 'turn.completed',
+                                        'sessionId': 'sess_quiet',
+                                        'turnId': 'turn_quiet', 'seq': 2,
+                                        'payload': {'resultType': 'success'}})
+                return {}
+
+        captured = io.StringIO()
+        with patch.object(protocol, 'ProtocolClient', FakeClient), \
+                redirect_stdout(captured):
+            await protocol.execute(self.make_args(quiet), self.config)
+        self.assertTrue(json.loads(self.output.read_text())['delivery_ok'])
+        return captured.getvalue()
+
+    async def test_quiet_suppresses_the_run_summary_print(self):
+        self.assertEqual(await self.run_execute(quiet=True), '')
+
+    async def test_default_args_still_print_the_run_summary(self):
+        output = await self.run_execute(quiet=False)
+        self.assertIn('delivery_ok', output)
+        self.assertIn('sess_quiet', output)
 
 
 if __name__ == "__main__":
