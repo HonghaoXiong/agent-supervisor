@@ -84,11 +84,14 @@ class ValidateContractTests(unittest.TestCase):
             contracts.validate_contract(contract)
         self.assertIn("extra_thing", str(caught.exception))
 
-    def test_non_empty_allowed_files_is_out_of_p0_scope(self):
+    def test_codex_exec_rejects_allowed_files_no_approval_callback(self):
         contract = codex_contract(self.ws, allowed_files=["REPORT.md"])
         with self.assertRaises(ContractError) as caught:
             contracts.validate_contract(contract)
-        self.assertIn("write path is out of P0 scope", str(caught.exception))
+        message = str(caught.exception)
+        self.assertIn("codex exec mode has no approval callback", message)
+        self.assertIn("allowed_files must be empty", message)
+        self.assertIn('"app-server"', message)
 
     def test_dsh_worker_is_rejected_as_absent(self):
         contract = codex_contract(self.ws, worker="dsh")
@@ -115,15 +118,24 @@ class ValidateContractTests(unittest.TestCase):
             contracts.validate_contract(codex_contract(str(link)))
         self.assertIn("symlink", str(caught.exception))
 
-    def test_codex_commands_must_be_empty_in_p0(self):
+    def test_codex_exec_rejects_commands_no_approval_callback(self):
         command = {"id": "run-tests", "command": "/bin/true",
                    "max_uses": 1, "max_timeout_ms": 120000, "required": True}
         contract = codex_contract(self.ws, commands=[command])
         with self.assertRaises(ContractError) as caught:
             contracts.validate_contract(contract)
-        self.assertIn("codex worker commands must be empty", str(caught.exception))
-        # the same command list is fine for a zcode worker
+        message = str(caught.exception)
+        self.assertIn("codex exec mode has no approval callback", message)
+        self.assertIn("commands must be empty", message)
+        # the same command list is fine for a zcode worker (any mode)
         contracts.validate_contract(zcode_contract(self.ws, commands=[command]))
+        contracts.validate_contract(
+            zcode_contract(self.ws, mode="resident", commands=[command]))
+        # and for codex app-server mode under the workspace-write sandbox
+        appserver = codex_contract(self.ws, commands=[command],
+                                   mode="app-server", sandbox="workspace-write")
+        del appserver["output_schema"]
+        contracts.validate_contract(appserver)
 
     def test_command_specification_shape_is_validated(self):
         bad = [{"id": "bad id!", "command": "/bin/true"}]
@@ -268,6 +280,115 @@ class StrictOutputSchemaTests(unittest.TestCase):
         with self.assertRaises(ContractError):
             contracts.validate_contract(
                 zcode_contract(self.ws, output_schema={"type": "object"}))
+
+
+class ModeAndSandboxTests(unittest.TestCase):
+    """Optional worker mode + codex sandbox: legal matrix and every rule."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        workspace = Path(self.temporary.name) / "ws"
+        workspace.mkdir()
+        self.ws = str(workspace)
+        self.command = {"id": "run-tests", "command": "/bin/true",
+                        "max_uses": 1, "max_timeout_ms": 120000, "required": True}
+
+    def appserver_contract(self, **overrides):
+        contract = codex_contract(self.ws, mode="app-server", **overrides)
+        del contract["output_schema"]  # exec-only mechanism
+        return contract
+
+    def test_legal_mode_matrix(self):
+        contracts.validate_contract(zcode_contract(self.ws))                       # cold default
+        contracts.validate_contract(zcode_contract(self.ws, mode="cold"))
+        contracts.validate_contract(zcode_contract(self.ws, mode="resident"))
+        contracts.validate_contract(codex_contract(self.ws))                       # exec default
+        contracts.validate_contract(codex_contract(self.ws, mode="exec"))
+        contracts.validate_contract(self.appserver_contract())
+
+    def test_mode_for_wrong_worker_or_bad_value_is_rejected(self):
+        for bad in ("exec", "app-server", "banana", 1, None):
+            contract = zcode_contract(self.ws)
+            if bad is None:
+                contract["mode"] = None
+            else:
+                contract["mode"] = bad
+            with self.assertRaises(ContractError) as caught:
+                contracts.validate_contract(contract)
+            self.assertIn("mode must be one of", str(caught.exception))
+        for bad in ("cold", "resident", "banana"):
+            with self.assertRaises(ContractError) as caught:
+                contracts.validate_contract(codex_contract(self.ws, mode=bad))
+            self.assertIn("mode must be one of", str(caught.exception))
+
+    def test_zcode_write_paths_legal_in_both_modes(self):
+        for mode in (None, "cold", "resident"):
+            overrides = {"allowed_files": ["REPORT.md"], "commands": [self.command]}
+            if mode:
+                overrides["mode"] = mode
+            contracts.validate_contract(zcode_contract(self.ws, **overrides))
+
+    def test_appserver_write_task_requires_workspace_write(self):
+        # default sandbox (read-only) and explicit read-only both refuse a
+        # write task; explicit workspace-write accepts it
+        for overrides in ({"allowed_files": ["OUT.md"]},
+                          {"commands": [self.command]},
+                          {"allowed_files": ["OUT.md"], "sandbox": "read-only"}):
+            with self.assertRaises(ContractError) as caught:
+                contracts.validate_contract(self.appserver_contract(**overrides))
+            self.assertIn('must declare sandbox "workspace-write"',
+                          str(caught.exception))
+        contracts.validate_contract(
+            self.appserver_contract(allowed_files=["OUT.md"],
+                                    sandbox="workspace-write"))
+        # read-only tasks (nothing to broker) keep the default read-only sandbox
+        contracts.validate_contract(self.appserver_contract(sandbox="read-only"))
+
+    def test_appserver_rejects_output_schema(self):
+        with self.assertRaises(ContractError) as caught:
+            contracts.validate_contract(
+                codex_contract(self.ws, mode="app-server",
+                               sandbox="workspace-write"))
+        self.assertIn("output_schema is exec-only", str(caught.exception))
+        # exec still requires it
+        with self.assertRaises(ContractError) as caught:
+            contract = codex_contract(self.ws)
+            del contract["output_schema"]
+            contracts.validate_contract(contract)
+        self.assertIn("requires output_schema", str(caught.exception))
+
+    def test_old_contracts_without_mode_keep_their_semantics(self):
+        # zcode without mode: no output_schema requirement, write paths legal
+        contracts.validate_contract(zcode_contract(self.ws, allowed_files=["A.md"]))
+        # codex without mode: exec semantics, output_schema still required
+        with self.assertRaises(ContractError) as caught:
+            contract = codex_contract(self.ws)
+            del contract["output_schema"]
+            contracts.validate_contract(contract)
+        self.assertIn("requires output_schema", str(caught.exception))
+
+    def test_sandbox_value_and_worker_rules(self):
+        with self.assertRaises(ContractError) as caught:
+            contracts.validate_contract(codex_contract(self.ws, sandbox="danger"))
+        self.assertIn("sandbox must be one of", str(caught.exception))
+        with self.assertRaises(ContractError) as caught:
+            contracts.validate_contract(zcode_contract(self.ws, sandbox="read-only"))
+        self.assertIn("sandbox applies to codex workers only",
+                      str(caught.exception))
+        contracts.validate_contract(
+            self.appserver_contract(sandbox="workspace-write"))
+
+    def test_allowed_files_entries_must_be_normalized_relative_paths(self):
+        for bad in ("/abs/OUT.md", "../OUT.md", "./OUT.md", "a//b.md"):
+            contract = zcode_contract(self.ws, allowed_files=[bad])
+            with self.assertRaises(ContractError) as caught:
+                contracts.validate_contract(contract)
+            self.assertIn("normalized workspace-relative",
+                          str(caught.exception))
+        with self.assertRaises(ContractError) as caught:
+            contracts.validate_contract(zcode_contract(self.ws, allowed_files=[" "]))
+        self.assertIn("non-empty strings", str(caught.exception))
 
 
 class DigestTests(unittest.TestCase):

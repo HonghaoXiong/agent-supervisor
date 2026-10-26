@@ -1,15 +1,23 @@
 """Three-way orchestration hub MCP server (stdio): Codex / ZCode / dsh workers.
 
 The hub is the single dispatch point a decision-layer agent (any installed
-agent) drives over MCP. P0 shape:
+agent) drives over MCP. Shape:
 
-* **Read-only tasks only** — contracts must carry ``allowed_files: []``;
-* **Two workers configured** — zcode (via the czs protocol executor) and codex
-  (via ``codex exec -s read-only``); ``dsh`` is always reported absent and is
-  never dispatched;
+* **Two workers configured, each with two modes** — zcode (``cold`` via the
+  czs protocol executor, ``resident`` on one shared resident process) and
+  codex (``exec`` via ``codex exec -s read-only``, ``app-server`` with
+  approval callbacks brokered through the contract Authority); ``dsh`` is
+  always reported absent and is never dispatched;
+* **Write paths follow the contract layer's live-verified mode rules** (see
+  :mod:`zcode_supervisor.contracts`): zcode brokers allowed_files/commands in
+  both modes, codex only in app-server mode under workspace-write;
 * **Shared frozen workspaces** — the czs inventory-hash freeze still governs
   zcode runs, and codex runs take the same per-workspace advisory lock so
   writes to one workspace stay serialized across vendors;
+* **Resident singletons** — one resident ZCode process and one codex
+  app-server client serve every delegate for the server lifetime (lazy start
+  on first use, best-effort close at shutdown); app-server delegates
+  serialize behind one lock (P2 conservative);
 * **Credentials stay with each vendor** — the hub never reads or writes
   auth.json, API keys, or any credential file;
 * **MCP exposure is not approval** — ``delegate`` only runs a contract a human
@@ -31,7 +39,10 @@ State layout (all hub writes are confined to these trees):
   "status": "ok|changed|absent|error", "reason": str, "probe_ref": str}}}``;
   a missing file means every *installed* worker is ``status "unknown"`` with
   ``enabled true``;
-* ``evidence_root/tasks/<task_id>/`` — codex dispatch evidence;
+* ``evidence_root/tasks/<task_id>/`` — codex dispatch evidence (exec receipts,
+  app-server packets/receipts);
+* ``evidence_root/appserver/`` — shared codex app-server client evidence
+  (frames, stderr; one client per server lifetime);
 * ``work_root/hub-tasks/<task_id>/`` — zcode packet + run.json evidence.
 """
 
@@ -53,12 +64,14 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import __version__, common, contracts
+from .authority import Authority, inventory
 from .codex_driver import locate_rollout, run_readonly
 from .session_reader import read_context as read_session_context
 
 __all__ = [
     "HubError",
     "ROUTING_NOTE",
+    "ResidentWorkers",
     "build_server",
     "serve",
     "parser",
@@ -528,15 +541,151 @@ def _field(source, name: str, default=None):
     return getattr(source, name, default)
 
 
+def _zcode_packet(contract: dict) -> dict:
+    """Translate a contract into a czs task packet.
+
+    Same shape :func:`default_zcode_runner` writes for the cold path; the
+    resident branch reuses it so both zcode modes hand the Authority identical
+    packets.
+    """
+    packet = {
+        "workspace": contract["workspace"],
+        "prompt": contract["prompt"],
+        "allowed_files": list(contract.get("allowed_files", [])),
+        "commands": list(contract.get("commands", [])),
+        "trusted_hashes": {},
+    }
+    if isinstance(contract.get("model"), dict):
+        packet["model"] = contract["model"]
+    return packet
+
+
+class ResidentWorkers:
+    """Lazy, server-lifetime singletons for resident-mode dispatch (P2).
+
+    The first zcode+resident (or codex+app-server) delegate starts ONE shared
+    instance; every later delegate of the same kind reuses it for the rest of
+    the server lifetime — the fixed process-startup cost is paid once (the
+    measured zcode setup latency drops from ~604 ms cold to 94 ms first /
+    68 ms steady on the shared process).
+
+    Concurrency: the resident ZCode process isolates sessions itself and
+    keeps per-workspace locks, so concurrent ``run_packet`` calls on the
+    shared instance are allowed; ``CodexAppServerClient.run_task``
+    concurrency on one client is unverified, so every app-server delegate is
+    serialized behind one :class:`asyncio.Lock` (P2 conservative; the
+    concurrency semantics are a P3 validation item).
+    """
+
+    def __init__(self, config, evidence_root, *, codex_path=None,
+                 resident_factory=None, appserver_factory=None,
+                 appserver_driver_factory=None):
+        self.config = config
+        self.evidence_root = Path(evidence_root)
+        self.codex_path = codex_path
+        self.resident_factory = resident_factory
+        self.appserver_factory = appserver_factory
+        self.appserver_driver_factory = appserver_driver_factory
+        self.resident = None
+        self.appserver = None
+        self.appserver_lock = asyncio.Lock()
+        # Serializes lazy creation only (double-checked); run-level
+        # concurrency policy is per-worker-kind as documented above.
+        self.instance_lock = asyncio.Lock()
+
+    async def resident_instance(self):
+        """Start once (lazily), then reuse: the shared ResidentZCode driver."""
+        if self.resident is None:
+            async with self.instance_lock:
+                if self.resident is None:
+                    if self.resident_factory is not None:
+                        instance = self.resident_factory()
+                    else:
+                        from .zcode_resident import ResidentZCode
+                        instance = ResidentZCode(self.config, self.evidence_root)
+                    await _invoke(instance.start)
+                    self.resident = instance
+        return self.resident
+
+    async def appserver_instance(self):
+        """Start once (lazily), then reuse: the shared app-server client.
+
+        The client keeps its own evidence tree under ``evidence_root/appserver``
+        (frames/stderr for the whole server lifetime); per-task packets and
+        receipt copies land under ``evidence_root/tasks/<task_id>/``.
+        """
+        if self.appserver is None:
+            async with self.instance_lock:
+                if self.appserver is None:
+                    if self.appserver_factory is not None:
+                        client = self.appserver_factory()
+                    else:
+                        from .codex_appserver import CodexAppServerClient
+                        # codex_path may be unset here while the exec path
+                        # resolves discovery lazily; resolve it the same way
+                        # instead of spawning a literal None (live 2026-10-26:
+                        # FileNotFoundError 'None', then FileExistsError on
+                        # the retried 'x'-mode evidence files).
+                        resolved = self.codex_path
+                        if not resolved:
+                            fallback = _fallback_codex(None)
+                            resolved = fallback.get("path") if isinstance(fallback, dict) else None
+                        if not resolved:
+                            raise HubError(
+                                "worker-unavailable",
+                                "codex app-server dispatch needs a codex binary: "
+                                "pass codex_path or install Codex")
+                        # one fresh evidence dir per construction attempt so a
+                        # failed start never poisons the retry with FileExists
+                        self._appserver_attempts = getattr(self, "_appserver_attempts", 0) + 1
+                        subdir = ("appserver" if self._appserver_attempts == 1
+                                  else f"appserver-{self._appserver_attempts}")
+                        client = CodexAppServerClient(
+                            resolved, self.evidence_root / subdir)
+                    await _invoke(client.start)
+                    self.appserver = client
+        return self.appserver
+
+    def appserver_driver(self, client):
+        if self.appserver_driver_factory is not None:
+            return self.appserver_driver_factory(client)
+        from .codex_appserver import CodexAppServerDriver
+        return CodexAppServerDriver(client)
+
+    async def close(self):
+        """Best-effort stop of the shared instances at server shutdown."""
+        for instance, stop_name in ((self.resident, "stop"),
+                                    (self.appserver, "close")):
+            closer = getattr(instance, stop_name, None) if instance is not None else None
+            if callable(closer):
+                # best-effort: shutdown must never raise
+                with contextlib.suppress(Exception):
+                    await _invoke(closer)
+        self.resident = None
+        self.appserver = None
+
+
 async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                         codex_path=None, codex_home=None,
-                        zcode_runner=None, codex_runner=None) -> dict:
+                        zcode_runner=None, codex_runner=None,
+                        resident_factory=None, appserver_factory=None,
+                        appserver_driver_factory=None,
+                        workers=None) -> dict:
     """Execute one registered contract on its worker; async coroutine.
 
+    Dispatch follows the contract's ``(worker, mode)`` pair: zcode ``cold``
+    runs the czs protocol executor (``zcode_runner``), zcode ``resident``
+    runs the packet on the shared resident process, codex ``exec`` runs the
+    single-shot read-only driver (``codex_runner``), and codex ``app-server``
+    drives the shared app-server client with a real contract Authority and
+    the untrusted approval policy. ``workers`` carries the server-lifetime
+    resident singletons (build_server wires its own; direct callers get a
+    per-call holder unless they pass one).
+
     Refusals raise :class:`HubError` (unknown contract, disabled/absent
-    worker, out-of-P0 write path). A dispatched run that *fails* (non-zero
-    exit, timeout, schema mismatch) is a normal outcome, recorded and
-    returned — never an exception.
+    worker, mode-rule violations caught by contract re-validation). A
+    dispatched run that *fails* (non-zero exit, timeout, schema mismatch) is
+    a normal outcome, recorded and returned — never an exception.
     """
     if not isinstance(initiator, dict) \
             or not isinstance(initiator.get("agent"), str) \
@@ -560,6 +709,13 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         ) from error
 
     worker = contract["worker"]
+    mode = contract.get("mode") or ("cold" if worker == "zcode" else "exec")
+    if workers is None:
+        workers = ResidentWorkers(
+            config, evidence_root, codex_path=codex_path,
+            resident_factory=resident_factory,
+            appserver_factory=appserver_factory,
+            appserver_driver_factory=appserver_driver_factory)
     resolution = resolve_worker_health(config, codex_path)
     entry = resolution["workers"].get(worker, {})
     remaining = sorted(
@@ -579,9 +735,8 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             "worker-absent",
             f"{worker} is declared absent by health.json; "
             f"remaining_workers: {remaining}; {ROUTING_NOTE}")
-    if contract.get("allowed_files"):
-        raise HubError("p0-readonly",
-                       "write path is out of P0 scope: allowed_files must be empty")
+    # Write-path rules (allowed_files/commands per worker mode) live in the
+    # contract layer and are enforced by load_contract's re-validation above.
 
     if codex_runner is None:
         codex_runner = run_readonly
@@ -592,6 +747,11 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             and codex_runner is run_readonly:
         raise HubError("worker-unavailable",
                        "codex CLI not found on this host; cannot dispatch")
+    if (worker == "codex" and mode == "app-server"
+            and effective_codex_path is None and workers.appserver_factory is None):
+        raise HubError("worker-unavailable",
+                       "codex CLI not found on this host; "
+                       "cannot start the app-server client")
 
     task_id = uuid.uuid4().hex
     tasks_dir = _tasks_dir(config)
@@ -621,31 +781,114 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             model = contract.get("model")
             model_name = model.get("model") if isinstance(model, dict) else None
             common.ensure_directory(evidence_dir)
-            # Same per-workspace advisory lock as the czs executor: one
-            # workspace is never driven by two vendors at once.
-            with common.workspace_lock(Path(contract["workspace"]),
-                                       Path(config.state_dir)):
-                receipt = await _invoke(
-                    codex_runner, effective_codex_path,
-                    Path(contract["workspace"]), contract["prompt"],
-                    contract["output_schema"], evidence_dir,
-                    timeout_s=contract["max_timeout_ms"] / 1000,
-                    model=model_name)
-            outcome = str(_field(receipt, "outcome", "failed"))
-            thread_id = _field(receipt, "thread_id")
+            if mode == "app-server":
+                # Real contract Authority against a frozen pre-run inventory:
+                # every approval the bridge relays is decided by this packet,
+                # never by the model's own claims.
+                packet = {
+                    "workspace": contract["workspace"],
+                    "prompt": contract["prompt"],
+                    "allowed_files": list(contract.get("allowed_files", [])),
+                    "commands": list(contract.get("commands", [])),
+                }
+                if isinstance(model, dict):
+                    packet["model"] = model
+                packet_path = evidence_dir / "packet.json"
+                common.write_json(packet_path, packet)
+                before = inventory(Path(contract["workspace"]))
+                authority = Authority(packet, packet_path, before)
+                client = await workers.appserver_instance()
+                driver = workers.appserver_driver(client)
+                # P2 conservative serialization: run_task concurrency on one
+                # shared app-server client is unverified (P3 validates), so
+                # app-server delegates queue behind the server-lifetime lock.
+                # The per-workspace advisory lock still applies inside it.
+                async with workers.appserver_lock:
+                    with common.workspace_lock(Path(contract["workspace"]),
+                                               Path(config.state_dir)):
+                        receipt = await _invoke(
+                            driver.run_task, authority,
+                            Path(contract["workspace"]), contract["prompt"],
+                            model=model_name,
+                            sandbox=contract.get("sandbox") or "read-only",
+                            approval_policy="untrusted",
+                            timeout_s=contract["max_timeout_ms"] / 1000)
+                receipt = receipt if isinstance(receipt, dict) else {}
+                if receipt:
+                    # best-effort per-task copy; the task outcome stands
+                    with contextlib.suppress(OSError, ValueError, TypeError):
+                        common.write_json(evidence_dir / "appserver-receipt.json",
+                                          receipt)
+                outcome = str(_field(receipt, "outcome", "failed"))
+                thread_id = _field(receipt, "thread_id")
+                locator = None
+                if isinstance(thread_id, str) and thread_id:
+                    locator = {"agent": "codex", "thread_id": thread_id,
+                               "path": None}
+                result_payload = {
+                    "thread_id": thread_id,
+                    "final_message": _field(receipt, "final_message"),
+                    "command_items": _field(receipt, "command_items") or [],
+                    "approvals": _field(receipt, "approvals") or [],
+                }
+                error_text = _field(receipt, "error")
+                status = "completed"
+            else:
+                # Same per-workspace advisory lock as the czs executor: one
+                # workspace is never driven by two vendors at once.
+                with common.workspace_lock(Path(contract["workspace"]),
+                                           Path(config.state_dir)):
+                    receipt = await _invoke(
+                        codex_runner, effective_codex_path,
+                        Path(contract["workspace"]), contract["prompt"],
+                        contract["output_schema"], evidence_dir,
+                        timeout_s=contract["max_timeout_ms"] / 1000,
+                        model=model_name)
+                outcome = str(_field(receipt, "outcome", "failed"))
+                thread_id = _field(receipt, "thread_id")
+                locator = None
+                if isinstance(thread_id, str) and thread_id:
+                    locator = {"agent": "codex", "thread_id": thread_id, "path": None}
+                    if codex_home is not None:
+                        locator["codex_home"] = str(codex_home)
+                    located = locate_rollout(thread_id, codex_home)
+                    if located.get("status") == "located":
+                        locator["path"] = located.get("path")
+                result_payload = {
+                    "structured": _field(receipt, "structured"),
+                    "error": _field(receipt, "error"),
+                }
+                error_text = _field(receipt, "error")
+                status = "completed"
+        elif mode == "resident":
+            from math import ceil
+
+            # Packet under the hub evidence tree; run.json stays under
+            # work_root (checked_locations requires it outside the workspace).
+            task_dir = Path(config.work_root) / "hub-tasks" / task_id
+            common.ensure_directory(task_dir)
+            packet_dir = evidence_dir
+            common.write_json(packet_dir / "packet.json", _zcode_packet(contract))
+            timeout_s = max(1, ceil(contract["max_timeout_ms"] / 1000))
+            resident = await workers.resident_instance()
+            run = await _invoke(resident.run_packet, packet_dir / "packet.json",
+                                task_dir / "run.json", timeout_s=timeout_s)
+            run = run if isinstance(run, dict) else {}
+            outcome = (run.get("outcome")
+                       if isinstance(run.get("outcome"), str) and run.get("outcome")
+                       else ("delivered" if run.get("delivery_ok") else "failed"))
+            session_id = run.get("session_id")
             locator = None
-            if isinstance(thread_id, str) and thread_id:
-                locator = {"agent": "codex", "thread_id": thread_id, "path": None}
-                if codex_home is not None:
-                    locator["codex_home"] = str(codex_home)
-                located = locate_rollout(thread_id, codex_home)
-                if located.get("status") == "located":
-                    locator["path"] = located.get("path")
+            if isinstance(session_id, str) and session_id:
+                locator = {"agent": "zcode", "session_id": session_id}
+                if isinstance(run.get("db_path"), str):
+                    locator["db_path"] = run["db_path"]
+            evidence_dir = task_dir
             result_payload = {
-                "structured": _field(receipt, "structured"),
-                "error": _field(receipt, "error"),
+                "delivery_ok": bool(run.get("delivery_ok")),
+                "changed_files": run.get("changed_files") or [],
+                "problems": run.get("execution_problems") or [],
             }
-            error_text = _field(receipt, "error")
             status = "completed"
         else:
             from math import ceil
@@ -765,10 +1008,14 @@ def _tools() -> list[dict]:
         },
         {
             "name": "delegate",
-            "description": "Dispatch one human-registered contract to its worker "
-                           "(read-only P0; codex via codex exec -s read-only, zcode via "
-                           "the czs protocol executor). MCP exposure is not approval: "
-                           "an unregistered or incomplete contract is refused.",
+            "description": "Dispatch one human-registered contract to its worker. "
+                           "zcode: mode cold (czs protocol executor) or resident "
+                           "(shared resident process); codex: mode exec "
+                           "(codex exec -s read-only, strict output_schema) or "
+                           "app-server (approval callbacks brokered through the "
+                           "contract Authority under the untrusted approval "
+                           "policy). MCP exposure is not approval: an "
+                           "unregistered or incomplete contract is refused.",
             "inputSchema": {"type": "object", "properties": {
                 "contract_id": {"type": "string"},
                 "initiator": {"type": "object", "properties": {
@@ -783,17 +1030,31 @@ def _tools() -> list[dict]:
 
 
 def build_server(config, evidence_root: Path, *, codex_path=None,
-                 zcode_runner=None, codex_runner=None, codex_home=None):
+                 zcode_runner=None, codex_runner=None, codex_home=None,
+                 resident_factory=None, appserver_factory=None,
+                 appserver_driver_factory=None):
     """Wire the six hub tools onto one MCP lowlevel server.
 
     ``codex_runner`` / ``zcode_runner`` are injection points for tests; the
     production defaults are :func:`codex_driver.run_readonly` and
-    :func:`default_zcode_runner`.
+    :func:`default_zcode_runner`. ``resident_factory`` /
+    ``appserver_factory`` / ``appserver_driver_factory`` build the
+    server-lifetime resident singletons (lazy start on first resident-mode
+    delegate; production defaults are
+    :class:`zcode_resident.ResidentZCode` and
+    :class:`codex_appserver.CodexAppServerClient` /
+    :class:`~codex_appserver.CodexAppServerDriver`); the shared holder is
+    attached as ``server.czs_workers`` so :func:`serve` can close it at
+    shutdown.
     """
     from mcp.server import Server
     import mcp.types as types
 
     evidence_root = Path(evidence_root)
+    workers = ResidentWorkers(
+        config, evidence_root, codex_path=codex_path,
+        resident_factory=resident_factory, appserver_factory=appserver_factory,
+        appserver_driver_factory=appserver_driver_factory)
 
     def error_result(code: str, detail: str) -> types.CallToolResult:
         """Uniform tool-error surface: is_error result with a JSON body.
@@ -840,7 +1101,8 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
                     config, evidence_root,
                     arguments.get("contract_id"), arguments.get("initiator"),
                     codex_path=codex_path, codex_home=codex_home,
-                    zcode_runner=zcode_runner, codex_runner=codex_runner)
+                    zcode_runner=zcode_runner, codex_runner=codex_runner,
+                    workers=workers)
             else:
                 raise HubError("unknown-tool", name)
         except HubError as error:
@@ -854,8 +1116,10 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
             content=[types.TextContent(
                 type="text", text=json.dumps(value, ensure_ascii=False))])
 
-    return Server("czs-hub", version=__version__,
-                  on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+    server = Server("czs-hub", version=__version__,
+                    on_list_tools=on_list_tools, on_call_tool=on_call_tool)
+    server.czs_workers = workers  # serve() closes the singletons at shutdown
+    return server
 
 
 async def serve(config, evidence_root: Path, **injectables) -> None:
@@ -863,14 +1127,22 @@ async def serve(config, evidence_root: Path, **injectables) -> None:
     from mcp.server.stdio import stdio_server
 
     server = build_server(config, Path(evidence_root), **injectables)
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream,
-                         server.create_initialization_options())
+    workers = getattr(server, "czs_workers", None)
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream,
+                             server.create_initialization_options())
+    finally:
+        # Best-effort close of the resident singletons (never started, or
+        # already dead, are both fine).
+        if workers is not None:
+            await workers.close()
 
 
 def parser() -> argparse.ArgumentParser:
     result = argparse.ArgumentParser(
-        description="Codex/ZCode/dsh orchestration hub MCP server (stdio, P0 read-only)")
+        description="Codex/ZCode/dsh orchestration hub MCP server (stdio; "
+                    "zcode cold/resident, codex exec/app-server)")
     result.add_argument("--config", type=Path, default=Path(".czs/config.json"),
                         help="czs config.json (default .czs/config.json)")
     result.add_argument("--evidence-root", type=Path, default=None,

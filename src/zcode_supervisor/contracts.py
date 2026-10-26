@@ -4,11 +4,30 @@ Core principle: MCP exposure is not approval. A delegate call is only executed
 against a contract that a human previously registered on this host (see
 :func:`register_contract`); the hub never invents or widens authority itself.
 
-The contract freezes the P0 read-only shape shared by both configured workers:
+The contract freezes the delegation shape shared by both configured workers.
+Each worker has two modes (optional ``mode``, defaulting to the first):
 
-* ``allowed_files`` must be empty (no write path exists in P0);
-* codex workers run through ``codex exec -s read-only`` with no command broker,
-  so their ``commands`` must also be empty;
+* ``zcode``: ``"cold"`` (one app-server process per task via the czs protocol
+  executor) or ``"resident"`` (sessions on one shared resident process);
+* ``codex``: ``"exec"`` (``codex exec -s read-only`` single shot) or
+  ``"app-server"`` (resident app-server with approval callbacks brokered
+  through the contract Authority).
+
+Write paths (``allowed_files`` / ``commands``) follow live-verified worker
+semantics (evidence ``out/tri-agent-p1-20261026``):
+
+* codex ``exec`` has **no approval callback** — under a workspace-write
+  sandbox, sandbox-contained operations execute without any approval — so
+  ``allowed_files`` and ``commands`` must stay empty there;
+* zcode brokers ``allowed_files`` and exact ``commands`` in both modes;
+* codex ``app-server`` + ``approvalPolicy="untrusted"`` sends per-command
+  approval callbacks, and file approvals carry no per-file schema field
+  (the bridge declines them whole), so writes travel through approved exact
+  commands under ``sandbox: "workspace-write"`` — a write task in that mode
+  must therefore declare ``"workspace-write"``;
+* ``output_schema`` is the exec entry point's ``--output-schema`` mechanism:
+  required for codex ``exec``, refused for codex ``app-server`` (which
+  returns the final_message text), and unconsumed by zcode;
 * credentials are never part of a contract: the hub holds no auth.json, no API
   key, and reads none — each worker keeps its own credentials.
 
@@ -25,13 +44,17 @@ from pathlib import Path
 from .common import read_regular, write_json
 
 __all__ = [
-    "ContractError",
+    "CODEX_MODES",
+    "OPTIONAL",
     "REQUIRED",
+    "SANDBOX_MODES",
     "WORKERS",
-    "validate_contract",
+    "ZCODE_MODES",
+    "ContractError",
     "contract_digest",
-    "register_contract",
     "load_contract",
+    "register_contract",
+    "validate_contract",
 ]
 
 
@@ -51,13 +74,28 @@ REQUIRED = (
     "budget",
 )
 WORKERS = ("zcode", "codex")
-OPTIONAL = ("snapshots", "output_schema")
+OPTIONAL = ("snapshots", "output_schema", "mode", "sandbox")
+
+ZCODE_MODES = ("cold", "resident")
+CODEX_MODES = ("exec", "app-server")
+SANDBOX_MODES = ("read-only", "workspace-write")
 
 MAX_TIMEOUT_MS_CEILING = 3_600_000
 
 _CONTRACT_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 _COMMAND_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]*$")
 _COMMAND_KEYS = {"id", "command", "max_uses", "max_timeout_ms", "required"}
+
+# Live-verified fact (out/tri-agent-p1-20261026): the codex exec entry point
+# has no approval callback — under a workspace-write sandbox, sandbox-contained
+# operations execute without any approval. Write authority therefore cannot
+# exist in exec mode; app-server mode brokers every command through the
+# contract Authority instead.
+_CODEX_EXEC_NO_BROKER = (
+    "codex exec mode has no approval callback: under a workspace-write sandbox "
+    "sandbox-contained operations execute without any approval (live-verified "
+    '2026-10-26), so {field} must be empty; register write tasks as codex mode '
+    '"app-server"')
 
 
 def canonical_json(value) -> str:
@@ -164,6 +202,32 @@ def validate_contract(contract: dict) -> dict:
         problems.append("worker 'dsh' is absent on this host")
     elif value not in WORKERS:
         problems.append(f"worker must be one of {WORKERS} (dsh is not installed on this host)")
+    worker = contract.get("worker")
+
+    # --- mode (worker execution mode; default keeps old-contract meaning) ---
+    if worker == "zcode":
+        modes, default_mode = ZCODE_MODES, "cold"
+    else:
+        modes, default_mode = CODEX_MODES, "exec"
+    value = contract.get("mode")
+    if "mode" in contract and (not isinstance(value, str) or value not in modes):
+        problems.append(
+            f"mode must be one of {modes} for worker {worker!r} "
+            f"(default {default_mode!r})")
+    effective_mode = (value if isinstance(value, str) and value in modes
+                      else default_mode)
+
+    # --- sandbox (codex only; the czs packet path has no sandbox dial) ----
+    value = contract.get("sandbox")
+    if "sandbox" in contract:
+        if worker != "codex":
+            problems.append(
+                "sandbox applies to codex workers only; zcode brokering is "
+                "governed by the czs packet itself")
+        if not isinstance(value, str) or value not in SANDBOX_MODES:
+            problems.append(f"sandbox must be one of {SANDBOX_MODES}")
+    effective_sandbox = (value if isinstance(value, str) and value in SANDBOX_MODES
+                         else "read-only")
 
     # --- workspace -----------------------------------------------------
     value = contract.get("workspace")
@@ -183,13 +247,30 @@ def validate_contract(contract: dict) -> dict:
     if "prompt" in contract and (not isinstance(value, str) or not value.strip()):
         problems.append("prompt must be a non-empty string")
 
-    # --- allowed_files (P0: read-only, no write path) -------------------
+    # --- allowed_files (write path) -------------------------------------
     value = contract.get("allowed_files")
+    write_task = False
     if "allowed_files" in contract:
         if not isinstance(value, list):
             problems.append("allowed_files must be a list")
         elif value:
-            problems.append("write path is out of P0 scope: allowed_files must be empty")
+            write_task = True
+            for name in value:
+                if not isinstance(name, str) or not name.strip():
+                    problems.append(
+                        "allowed_files entries must be non-empty strings")
+                elif (name.startswith("/") or ".." in Path(name).parts
+                        or Path(name).as_posix() != name):
+                    problems.append(
+                        f"allowed_files entries must be normalized "
+                        f"workspace-relative paths: {name!r}")
+            if worker == "codex" and effective_mode == "exec":
+                problems.append(_CODEX_EXEC_NO_BROKER.format(field="allowed_files"))
+            elif worker not in WORKERS:
+                # Unknown/uninstalled workers get no write path at all.
+                problems.append(
+                    f"allowed_files must be empty for worker {worker!r} "
+                    "(no write path exists for this worker)")
 
     # --- commands ------------------------------------------------------
     value = contract.get("commands")
@@ -197,16 +278,27 @@ def validate_contract(contract: dict) -> dict:
         if not isinstance(value, list):
             problems.append("commands must be a list of command specifications")
         else:
+            write_task = write_task or bool(value)
             for position, command in enumerate(value):
                 problems.extend(
                     _command_problems(command, f"commands[{position}]"))
-            if contract.get("worker") == "codex" and value:
+            if worker == "codex" and effective_mode == "exec" and value:
+                problems.append(_CODEX_EXEC_NO_BROKER.format(field="commands"))
+            elif worker not in WORKERS and value:
                 problems.append(
-                    "codex worker commands must be empty in P0 "
-                    "(exec read-only sandbox has no broker)")
+                    f"commands must be empty for worker {worker!r} "
+                    "(no approval broker exists for this worker)")
+
+    # --- codex app-server write tasks need the workspace-write sandbox ----
+    if (worker == "codex" and effective_mode == "app-server" and write_task
+            and effective_sandbox != "workspace-write"):
+        problems.append(
+            'codex app-server write tasks (allowed_files or commands non-empty) '
+            'must declare sandbox "workspace-write": under "read-only" the '
+            'sandbox itself blocks the writes the contract expects to broker '
+            "(read-only app-server tasks keep the default read-only sandbox)")
 
     # --- model ---------------------------------------------------------
-    worker = contract.get("worker")
     value = contract.get("model")
     if "model" in contract:
         if worker == "zcode":
@@ -257,13 +349,19 @@ def validate_contract(contract: dict) -> dict:
                 isinstance(item, str) and item.strip() for item in value):
             problems.append("snapshots must be a list of non-empty strings")
 
-    # --- optional / codex-required: output_schema ------------------------
+    # --- optional / codex-exec-required: output_schema -------------------
     value = contract.get("output_schema")
-    if value is None and "output_schema" in contract:
-        problems.append("output_schema must be a JSON Schema object, not null")
-    elif "output_schema" in contract:
-        problems.extend(_output_schema_problems(value, "output_schema"))
-    elif worker == "codex":
+    if "output_schema" in contract:
+        if worker == "codex" and effective_mode == "app-server":
+            problems.append(
+                "output_schema is exec-only (codex exec recaptures the final "
+                "answer through --output-schema); app-server mode returns the "
+                "final_message text and must not carry output_schema")
+        elif value is None:
+            problems.append("output_schema must be a JSON Schema object, not null")
+        else:
+            problems.extend(_output_schema_problems(value, "output_schema"))
+    elif worker == "codex" and effective_mode == "exec":
         problems.append(
             "codex contract requires output_schema (strict object schema; "
             "the final answer is recaptured through --output-schema)")

@@ -327,6 +327,10 @@ class ApprovalBridge:
     def __init__(self, authority, thread_id):
         self.authority = authority
         self.thread_id = thread_id
+        # Live turn id, published by the driver after turn/start (and from
+        # turn/* notifications): approval requests do not always carry a
+        # turnId, and the real Authority checks turn identity on decide().
+        self.turn_id = None
         self.decisions = []
         self._seq = 0
 
@@ -342,14 +346,25 @@ class ApprovalBridge:
         tool_call_id = (strings[1] if len(strings) > 1 else f'{method}#{self._seq}')
         return request_id, tool_call_id
 
+    def _turn_id(self, params):
+        """The turnId sent to authority.decide.
+
+        Wire turnId first (when the approval request carries one), else the
+        driver-recorded live turn id; the historical 'codex-turn' constant
+        survives only as a last-resort placeholder for authorities that never
+        check turn identity — the real Authority would deny it (fail-closed).
+        """
+        for candidate in (params.get('turnId'), params.get('turn_id')):
+            if isinstance(candidate, str) and candidate:
+                return candidate
+        return self.turn_id or 'codex-turn'
+
     def _ask(self, method, worker, params, summary, tool_name, tool_input, hint=None):
         """One authority.decide round trip plus worker_response shaping."""
         request_id, tool_call_id = self._ids(method, params)
         authority_params = {
             'sessionId': self.thread_id,
-            'turnId': (params.get('turnId') if isinstance(params.get('turnId'), str) and params['turnId']
-                       else params.get('turn_id') if isinstance(params.get('turn_id'), str)
-                       else 'codex-turn'),
+            'turnId': self._turn_id(params),
             'requestId': request_id,
             'toolCallId': tool_call_id,
             'toolName': tool_name,
@@ -504,7 +519,7 @@ class ApprovalBridge:
         for path in files:
             one = self.authority.decide({
                 'sessionId': self.thread_id,
-                'turnId': params.get('turnId') if isinstance(params.get('turnId'), str) else 'codex-turn',
+                'turnId': self._turn_id(params),
                 'requestId': f'{method}:files',
                 'toolCallId': f'{method}:files:{path}:{self._seq}',
                 'toolName': 'Write',
@@ -558,8 +573,41 @@ class CodexAppServerDriver:
         self.client.on_server_request = bridge.handle
         terminal = {}
 
+        def publish_turn(turn_id):
+            """Propagate the live turn id to the bridge and the authority.
+
+            The real Authority re-checks turn identity on every decide() call;
+            approval requests do not always carry a turnId, so the recorded
+            live id is the fallback the bridge consults. note_turn() also
+            admits the turn for orchestrated authorities (a no-op for plain
+            ones). hasattr keeps SimpleContractAuthority (no identity
+            checking) working unchanged.
+            """
+            if not isinstance(turn_id, str) or not turn_id:
+                return
+            receipt['turn_id'] = turn_id
+            bridge.turn_id = turn_id
+            if hasattr(authority, 'turn_id'):
+                authority.turn_id = turn_id
+            note_turn = getattr(authority, 'note_turn', None)
+            if callable(note_turn):
+                note_turn(turn_id)
+
         def on_notification(method, params):
-            if (method == 'turn/completed' and isinstance(params, dict)
+            if not isinstance(method, str) or not isinstance(params, dict):
+                return
+            if method.startswith('turn/'):
+                # A notification may announce a turn the turn/start response
+                # did not carry (or a later turn): bind it before deciding.
+                candidate = params.get('turnId')
+                if not (isinstance(candidate, str) and candidate):
+                    turn_obj = params.get('turn')
+                    candidate = turn_obj.get('id') if isinstance(turn_obj, dict) else None
+                if (candidate and candidate != receipt['turn_id']
+                        and (not params.get('threadId')
+                             or params.get('threadId') == receipt['thread_id'])):
+                    publish_turn(candidate)
+            if (method == 'turn/completed'
                     and receipt['thread_id'] is not None
                     and params.get('threadId') == receipt['thread_id']
                     and terminal.get('turn') is None):
@@ -588,9 +636,15 @@ class CodexAppServerDriver:
                                                timeout=min(timeout_s, 120))
             thread = result.get('thread') if isinstance(result, dict) else None
             receipt['thread_id'] = (thread or {}).get('id') if isinstance(thread, dict) else None
-            bridge.thread_id = receipt['thread_id']
             if not receipt['thread_id']:
                 raise AppServerError('thread/start returned no thread id')
+            # Authority identity binding: the hub-built Authority re-checks
+            # sessionId on every decide(), so it must learn the thread id
+            # before any approval callback can fire (hasattr keeps
+            # SimpleContractAuthority working unchanged).
+            if hasattr(authority, 'session_id'):
+                authority.session_id = receipt['thread_id']
+            bridge.thread_id = receipt['thread_id']
 
             # v2/TurnStartParams.json: {threadId, input: [UserInput...]}; the
             # text variant is {type: "text", text: str}.
@@ -600,7 +654,7 @@ class CodexAppServerDriver:
                  'input': [{'type': 'text', 'text': prompt}]},
                 timeout=min(timeout_s, 120))
             turn = result.get('turn') if isinstance(result, dict) else None
-            receipt['turn_id'] = (turn or {}).get('id') if isinstance(turn, dict) else None
+            publish_turn((turn or {}).get('id') if isinstance(turn, dict) else None)
 
             deadline = time.monotonic() + timeout_s
             while time.monotonic() < deadline:

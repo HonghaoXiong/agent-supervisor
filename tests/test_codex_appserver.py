@@ -82,6 +82,22 @@ def run_turn():
     if MODE == "persistent":
         v2["proposedExecpolicyAmendment"] = ["cat TASK.md*"]
         v2["availableDecisions"] = ["accept", "acceptForSession", "decline"]
+    if MODE == "noturn":
+        # One command approval that carries NO turnId: the bridge must fall
+        # back to the driver-recorded live turn id, never a placeholder.
+        ask("srv-1", "item/commandExecution/requestApproval", {
+            "threadId": THREAD, "itemId": "item_cmd_1", "startedAtMs": 1,
+            "kind": "command", "cwd": "/ws",
+            "command": "/bin/zsh -lc 'cat TASK.md'",
+            "availableDecisions": ["accept", "decline"]})
+        note("item/completed", {"threadId": THREAD, "turnId": TURN,
+                                "completedAtMs": 10,
+                                "item": {"type": "commandExecution",
+                                         "command": "cat TASK.md", "exitCode": 0,
+                                         "status": "completed"}})
+        note("turn/completed", {"threadId": THREAD,
+                                "turn": {"id": TURN, "status": "completed"}})
+        return
     ask("srv-1", "item/commandExecution/requestApproval", v2)
     ask("srv-2", "execCommandApproval",
         {"callId": "call_1", "command": ["touch", "x"],
@@ -198,8 +214,10 @@ class FakeAppServerTests(unittest.TestCase):
         (root / "ws").mkdir()
         return root, fake, root / "diag.json"
 
-    def _drive(self, mode, timeout_s=8.0):
+    def _drive(self, mode, timeout_s=8.0, authority=None):
         root, fake, diag_path = self._prepare()
+        if authority is None:
+            authority = SimpleContractAuthority(["cat TASK.md"], ["OUT.md"])
 
         async def go():
             client = CodexAppServerClient(
@@ -207,7 +225,6 @@ class FakeAppServerTests(unittest.TestCase):
                 env={"FAKE_APPSERVER_MODE": mode,
                      "FAKE_APPSERVER_DIAG": str(diag_path),
                      "FAKE_APPSERVER_SECRET": SECRET})
-            authority = SimpleContractAuthority(["cat TASK.md"], ["OUT.md"])
             try:
                 await client.start()
                 receipt = await CodexAppServerDriver(client).run_task(
@@ -368,6 +385,49 @@ class FakeAppServerTests(unittest.TestCase):
         # the client kept serving the rest of the turn afterwards.
         self.assertEqual(receipt["outcome"], "delivered")
         self.assertEqual(receipt["final_message"], "done summary")
+
+    def test_real_turn_id_reaches_authority_when_request_omits_it(self):
+        # "noturn" mode: the approval request carries NO turnId, so the
+        # bridge's authority params must fall back to the driver-recorded
+        # live turn id from turn/start — never the 'codex-turn' placeholder
+        # (the real Authority denies unknown turn ids, fail-closed).
+        class RecordingAuthority(SimpleContractAuthority):
+            def __init__(self):
+                super().__init__(["cat TASK.md"], [])
+                self.session_id = None  # real authorities carry this slot
+                self.seen = []
+
+            def decide(self, params):
+                self.seen.append(params)
+                return super().decide(params)
+
+        authority = RecordingAuthority()
+        receipt, _root, diag = self._drive("noturn", authority=authority)
+        self.assertEqual(receipt["outcome"], "delivered")
+        self.assertEqual(authority.session_id, "th_fake_11111")
+        self.assertTrue(authority.seen)
+        for params in authority.seen:
+            self.assertEqual(params["turnId"], "turn_fake_1")
+            self.assertNotEqual(params["turnId"], "codex-turn")
+            self.assertEqual(params["sessionId"], "th_fake_11111")
+        # the wire decision used the approved command (turn id was the only
+        # identity the request omitted)
+        responses = {entry["method"]: entry["response"].get("result")
+                     for entry in diag["server_responses"]}
+        self.assertEqual(responses["item/commandExecution/requestApproval"],
+                         {"decision": "accept"})
+
+    def test_authority_without_identity_slots_still_runs(self):
+        # SimpleContractAuthority defines neither session_id nor note_turn:
+        # the driver's identity binding must be a no-op for it, not a crash.
+        authority = SimpleContractAuthority(["cat TASK.md"], ["OUT.md"])
+        self.assertFalse(hasattr(authority, "session_id"))
+        self.assertFalse(hasattr(authority, "note_turn"))
+        receipt, _root, _diag = self._drive("default", authority=authority)
+        self.assertEqual(receipt["outcome"], "delivered")
+        self.assertEqual(receipt["final_message"], "done summary")
+        # ...and no binding slot was invented on it by the driver
+        self.assertFalse(hasattr(authority, "session_id"))
 
 
 if __name__ == "__main__":

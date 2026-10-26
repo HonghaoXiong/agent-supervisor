@@ -149,6 +149,27 @@ czs run --packet .czs/work/task-001/rework.json \
 
 只能续接此配置状态目录已登记、进程已退出、工作副本一致的会话。不要随意选择 GUI 会话或迁移原生会话数据库。超时或失败后先检查保留证据及已发生的副作用，再决定返工；不要把重试当作撤销。
 
+## 三方编排 hub（czs-hub）
+
+hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode_supervisor.hub_server`），提供 health / list_workers / list_sessions / read_context / list_skills / delegate 六个工具。delegate 只执行人工经 `register_contract` 预先登记的合同（`state_dir/hub/contracts/`）；MCP 暴露不等于批准。每个 worker 有两种执行模式（合同可选 `mode` 字段，缺省取各 worker 的第一档，旧合同语义不变）：
+
+| worker | mode | 通道 | 写路径 |
+| --- | --- | --- | --- |
+| zcode | `cold`（默认） | 每任务一个 app-server 进程（czs protocol executor） | `allowed_files` + 精确命令，完整审批 |
+| zcode | `resident` | 共享常驻进程上的隔离会话（`zcode_resident`） | 同 cold |
+| codex | `exec`（默认） | `codex exec -s read-only` 单发 + `--output-schema` | 禁止：`allowed_files` 与 `commands` 必须 `[]` |
+| codex | `app-server` | 常驻 app-server + 审批回调（`approvalPolicy=untrusted`） | 仅 `sandbox: "workspace-write"` 下经批准的精确命令 |
+
+写路径规则与理由（全部为真机验证事实，证据 `out/tri-agent-p1-20261026`）：
+
+1. codex `exec` 模式没有审批回调：workspace-write 沙箱内操作不经审批自动执行——所以 exec 模式永远只读，写任务必须注册为 `app-server` 模式。
+2. codex `app-server` + `approvalPolicy=untrusted` 每条命令都发审批回调（批准→accept 执行、未批准→decline 拒绝）；但文件审批 `item/fileChange/requestApproval` 的 schema 无逐文件字段、桥只能整体 decline——Write 工具不可用，写只能经批准的精确命令，且（`allowed_files` 或 `commands` 非空的）写任务必须显式声明 `sandbox: "workspace-write"`（read-only 任务保持默认 `read-only`）。
+3. ZCode 冷启与常驻两模式都完整支持 `allowed_files` + 精确命令（czs 生产语义），无额外限制。
+
+`output_schema` 是 exec 入口的 `--output-schema` 专用机制：codex+exec 必填（严格模式递归校验不变），codex+app-server 拒收（该模式返回 `final_message` 文本），zcode 不消费该字段。
+
+运行期形态：zcode `resident` 与 codex `app-server` 共享实例在首个相应 delegate 时懒加载启动、整个 server 生命周期复用、进程退出时 best-effort close——这是常驻模式的核心收益（实测 zcode setup 延迟 604ms 冷启 → 94ms 首次 / 68ms 稳态）。app-server delegate 之间用一把锁保守串行（client 的 `run_task` 并发语义未验证，留待后续验证项），同一 workspace 仍受跨厂商 advisory lock 约束；resident 侧并发由常驻进程自身的会话隔离与 workspace 锁承担。合同字段与校验规则详见 `src/zcode_supervisor/contracts.py` 模块文档。
+
 ## 远程任务：提交与回收分开
 
 本仓库不内置 SSH 账户、集群地址或任意远程执行接口。针对目标环境准备两份经审查的固定执行器，分别加入两个任务包的精确命令列表。

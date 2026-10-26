@@ -15,9 +15,10 @@ import tempfile
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 from zcode_supervisor import contracts, hub_server as H
+from zcode_supervisor.authority import Authority
 from zcode_supervisor.codex_driver import CodexRunReceipt
 from zcode_supervisor.runtime import Config
 
@@ -270,7 +271,8 @@ class DelegateRejectionTests(HubFixture):
         with self.assertRaises(H.HubError) as caught:
             self.delegate("sneaky")
         self.assertEqual(caught.exception.code, "unknown-contract")
-        self.assertIn("write path is out of P0 scope", caught.exception.detail)
+        self.assertIn("codex exec mode has no approval callback",
+                      caught.exception.detail)
 
     def test_disabled_worker_is_refused_with_remaining_workers(self):
         self.register(self.codex_contract())
@@ -386,6 +388,332 @@ class DelegateZcodeTests(HubFixture):
                           "db_path": str(db_path)})
         self.assertEqual(result["evidence_dir"],
                          str(self.work_root / "hub-tasks" / result["task_id"]))
+
+
+class DelegateZcodeResidentTests(HubFixture):
+    """zcode+resident dispatch: contract -> czs packet on the shared resident."""
+
+    def setUp(self):
+        super().setUp()
+        self.command = {"id": "list-files", "command": "/bin/ls",
+                        "max_uses": 1, "max_timeout_ms": 120000, "required": True}
+
+    class FakeResident:
+        def __init__(self):
+            self.starts = 0
+            self.stops = 0
+            self.packets = []
+
+        async def start(self):
+            self.starts += 1
+
+        async def stop(self):
+            self.stops += 1
+
+        async def run_packet(self, packet_path, out, *, timeout_s, resume=None):
+            self.packets.append({"packet_path": Path(packet_path),
+                                 "out": Path(out), "timeout_s": timeout_s,
+                                 "resume": resume})
+            return {"delivery_ok": True, "session_id": "sess_res1",
+                    "outcome": "delivered", "changed_files": ["OUT.md"],
+                    "execution_problems": []}
+
+    def delegate_resident(self, contract_id, resident):
+        return asyncio.run(H.delegate_impl(
+            self.config, self.evidence_root, contract_id,
+            {"agent": "codex-control", "session_id": "sess_ctrl1"},
+            codex_path=str(self.fake_codex),
+            resident_factory=lambda: resident))
+
+    def test_resident_delegate_converts_contract_into_packet(self):
+        resident = self.FakeResident()
+        self.register(self.zcode_contract(
+            mode="resident", allowed_files=["OUT.md"],
+            commands=[self.command], prompt="Write OUT.md then stop."))
+        result = self.delegate_resident("hub-zcode-1", resident)
+        self.assertEqual(result["worker"], "zcode")
+        self.assertEqual(result["outcome"], "delivered")
+        self.assertTrue(result["delivery_ok"])
+        self.assertEqual(result["changed_files"], ["OUT.md"])
+        self.assertEqual(result["problems"], [])
+        self.assertEqual(result["session_locator"],
+                         {"agent": "zcode", "session_id": "sess_res1"})
+        # the packet handed to run_packet carries the contract payload
+        self.assertEqual(len(resident.packets), 1)
+        call = resident.packets[0]
+        self.assertEqual(call["timeout_s"], 60)
+        self.assertIsNone(call["resume"])
+        packet = json.loads(call["packet_path"].read_text())
+        self.assertEqual(packet["workspace"], str(self.workspace))
+        self.assertEqual(packet["prompt"], "Write OUT.md then stop.")
+        self.assertEqual(packet["allowed_files"], ["OUT.md"])
+        self.assertEqual(packet["commands"], [self.command])
+        self.assertEqual(packet["model"], {"providerId": "glm",
+                                           "modelId": "glm-5.3"})
+        self.assertEqual(packet["trusted_hashes"], {})
+        # packet lives under the hub evidence tree, run.json under work_root
+        self.assertEqual(call["packet_path"],
+                         self.evidence_root / "tasks" / result["task_id"] / "packet.json")
+        self.assertEqual(call["out"],
+                         self.work_root / "hub-tasks" / result["task_id"] / "run.json")
+        record = json.loads((self.state_dir / "hub" / "tasks" /
+                             f"{result['task_id']}.json").read_text())
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["outcome"], "delivered")
+        self.assertEqual(record["session_locator"],
+                         {"agent": "zcode", "session_id": "sess_res1"})
+
+    def test_resident_singleton_starts_once_and_serves_repeated_delegates(self):
+        resident = self.FakeResident()
+        self.register(self.zcode_contract(mode="resident"))
+        workers = H.ResidentWorkers(self.config, self.evidence_root,
+                                    resident_factory=lambda: resident)
+        for expected_session in ("sess_res1", "sess_res1"):
+            result = asyncio.run(H.delegate_impl(
+                self.config, self.evidence_root, "hub-zcode-1",
+                {"agent": "a", "session_id": "s"},
+                codex_path=str(self.fake_codex), workers=workers))
+            self.assertEqual(result["outcome"], expected_session and "delivered")
+            self.assertEqual(result["session_locator"]["session_id"], expected_session)
+        self.assertEqual(resident.starts, 1)  # one shared start, reused
+        self.assertEqual(len(resident.packets), 2)
+
+    def test_resident_start_failure_is_a_runner_error_task(self):
+        class BrokenResident:
+            async def start(self):
+                raise RuntimeError("resident boot failed")
+
+        self.register(self.zcode_contract(mode="resident"))
+        result = asyncio.run(H.delegate_impl(
+            self.config, self.evidence_root, "hub-zcode-1",
+            {"agent": "a", "session_id": "s"},
+            codex_path=str(self.fake_codex),
+            resident_factory=BrokenResident))
+        self.assertEqual(result["outcome"], "runner-error")
+        self.assertIn("RuntimeError: resident boot failed", result["error"])
+        record = json.loads((self.state_dir / "hub" / "tasks" /
+                             f"{result['task_id']}.json").read_text())
+        self.assertEqual(record["status"], "failed")
+        self.assertEqual(record["outcome"], "runner-error")
+
+    def test_explicit_cold_mode_keeps_the_injected_cold_runner(self):
+        captured = {}
+
+        async def fake_cold_runner(config, task_id, contract, timeout_s):
+            captured["contract"] = contract
+            return {"delivery_ok": True, "session_id": "sess_cold1",
+                    "execution_problems": [], "changed_files": [],
+                    "outcome": "delivered", "run_path": None, "db_path": None}
+
+        self.register(self.zcode_contract(mode="cold"))
+        result = self.delegate("hub-zcode-1", runner=fake_cold_runner,
+                               worker="zcode")
+        self.assertEqual(result["outcome"], "delivered")
+        self.assertEqual(captured["contract"]["mode"], "cold")
+
+
+class DelegateCodexAppServerTests(HubFixture):
+    """codex+app-server dispatch: real Authority + shared client + lock."""
+
+    def setUp(self):
+        super().setUp()
+        self.command = {"id": "list-files", "command": "/bin/ls",
+                        "max_uses": 1, "max_timeout_ms": 120000, "required": True}
+
+    class FakeClient:
+        def __init__(self):
+            self.starts = 0
+            self.closes = 0
+
+        async def start(self):
+            self.starts += 1
+            return {"userAgent": "fake-appserver"}
+
+        async def close(self):
+            self.closes += 1
+
+    def appserver_contract(self, **overrides):
+        contract = self.codex_contract(mode="app-server", sandbox="workspace-write",
+                                       allowed_files=["OUT.md"],
+                                       commands=[self.command], **overrides)
+        del contract["output_schema"]  # exec-only mechanism
+        return contract
+
+    def test_appserver_delegate_builds_real_authority_and_passes_policy(self):
+        captured = {}
+
+        class FakeDriver:
+            def __init__(self, client):
+                captured["client"] = client
+
+            async def run_task(self, authority, workspace, prompt, *, model=None,
+                               sandbox="read-only", approval_policy="on-request",
+                               timeout_s=600):
+                captured.update({"authority": authority, "workspace": workspace,
+                                 "prompt": prompt, "model": model,
+                                 "sandbox": sandbox,
+                                 "approval_policy": approval_policy,
+                                 "timeout_s": timeout_s})
+                return {"outcome": "delivered", "thread_id": "th_app1",
+                        "turn_id": "turn_app1", "final_message": "done text",
+                        "command_items": [{"command": "/bin/ls", "exit_code": 0,
+                                           "status": "completed"}],
+                        "approvals": [{"method": "item/commandExecution/requestApproval",
+                                       "decision": "allow"}]}
+
+        client = self.FakeClient()
+        self.register(self.appserver_contract())
+        real_inventory = H.inventory
+        with patch("zcode_supervisor.hub_server.inventory",
+                   side_effect=lambda ws: real_inventory(ws)) as inventory_spy:
+            result = asyncio.run(H.delegate_impl(
+                self.config, self.evidence_root, "hub-codex-1",
+                {"agent": "codex-control", "session_id": "sess_ctrl1"},
+                codex_path=str(self.fake_codex),
+                appserver_factory=lambda: client,
+                appserver_driver_factory=lambda c: FakeDriver(c)))
+        self.assertEqual(inventory_spy.call_count, 1)  # frozen pre-run inventory
+        authority = captured["authority"]
+        self.assertIsInstance(authority, Authority)  # real Authority, not a stub
+        self.assertEqual(authority.allowed, {"OUT.md"})
+        packet = json.loads(authority.packet_path.read_text())
+        self.assertEqual(packet["workspace"], str(self.workspace))
+        self.assertEqual(packet["allowed_files"], ["OUT.md"])
+        self.assertEqual(packet["commands"], [self.command])
+        self.assertEqual(packet["model"], {"model": "gpt-5-codex"})
+        # driver contract: untrusted approvals, contract sandbox, model name
+        self.assertIs(captured["client"], client)
+        self.assertEqual(captured["workspace"], self.workspace)
+        self.assertEqual(captured["prompt"], "Read TASK.md and answer.")
+        self.assertEqual(captured["approval_policy"], "untrusted")
+        self.assertEqual(captured["sandbox"], "workspace-write")
+        self.assertEqual(captured["model"], "gpt-5-codex")
+        self.assertEqual(captured["timeout_s"], 60.0)
+        # result/locator mapping
+        self.assertEqual(result["worker"], "codex")
+        self.assertEqual(result["outcome"], "delivered")
+        self.assertEqual(result["session_locator"],
+                         {"agent": "codex", "thread_id": "th_app1", "path": None})
+        self.assertEqual(result["thread_id"], "th_app1")
+        self.assertEqual(result["final_message"], "done text")
+        self.assertEqual(result["command_items"][0]["command"], "/bin/ls")
+        self.assertEqual(result["approvals"][0]["decision"], "allow")
+        # per-task receipt copy lands next to the packet in the evidence tree
+        task_dir = self.evidence_root / "tasks" / result["task_id"]
+        receipt = json.loads((task_dir / "appserver-receipt.json").read_text())
+        self.assertEqual(receipt["thread_id"], "th_app1")
+        record = json.loads((self.state_dir / "hub" / "tasks" /
+                             f"{result['task_id']}.json").read_text())
+        self.assertEqual(record["status"], "completed")
+        self.assertEqual(record["result"]["final_message"], "done text")
+
+    def test_concurrent_appserver_delegates_serialize_on_shared_client(self):
+        tracker = {"active": 0, "peak": 0}
+
+        class TrackingDriver:
+            def __init__(self, client):
+                pass
+
+            async def run_task(self, authority, workspace, prompt, **kwargs):
+                tracker["active"] += 1
+                tracker["peak"] = max(tracker["peak"], tracker["active"])
+                await asyncio.sleep(0.03)  # force interleave windows
+                tracker["active"] -= 1
+                return {"outcome": "delivered", "thread_id": "th_ser",
+                        "final_message": None, "command_items": [], "approvals": []}
+
+        client = self.FakeClient()
+        self.register(self.appserver_contract())
+        workers = H.ResidentWorkers(
+            self.config, self.evidence_root, codex_path=str(self.fake_codex),
+            appserver_factory=lambda: client,
+            appserver_driver_factory=lambda c: TrackingDriver(c))
+
+        async def two_at_once():
+            return await asyncio.gather(*[
+                H.delegate_impl(self.config, self.evidence_root, "hub-codex-1",
+                                {"agent": "a", "session_id": "s"},
+                                codex_path=str(self.fake_codex), workers=workers)
+                for _ in range(2)])
+
+        results = asyncio.run(two_at_once())
+        self.assertEqual(tracker["peak"], 1)  # P2 conservative serialization
+        self.assertEqual(client.starts, 1)     # one shared client start
+        self.assertEqual([r["outcome"] for r in results],
+                         ["delivered", "delivered"])
+
+    def test_appserver_client_start_failure_is_a_runner_error_task(self):
+        class BrokenClient:
+            async def start(self):
+                raise RuntimeError("appserver boot failed")
+
+        self.register(self.appserver_contract())
+        result = asyncio.run(H.delegate_impl(
+            self.config, self.evidence_root, "hub-codex-1",
+            {"agent": "a", "session_id": "s"},
+            codex_path=str(self.fake_codex),
+            appserver_factory=BrokenClient))
+        self.assertEqual(result["outcome"], "runner-error")
+        self.assertIn("appserver boot failed", result["error"])
+
+    def test_explicit_exec_mode_keeps_the_exec_runner_path(self):
+        self.register(self.codex_contract(mode="exec"))
+        self.make_rollout("thread-hub-1")
+        result = self.delegate("hub-codex-1")
+        # the exec branch maps structured/schema fields the app-server branch
+        # never produces — proof the original path ran
+        self.assertEqual(result["structured"], {"answer": "ok"})
+        self.assertTrue(result["session_locator"]["path"].endswith(
+            "rollout-20261024T120000-thread-hub-1.jsonl"))
+
+    def test_appserver_instance_resolves_codex_path_from_discovery(self):
+        import asyncio
+        from zcode_supervisor import hub_server as H
+        async def scenario():
+            workers = H.ResidentWorkers(self.config, self.evidence_root, codex_path=None)
+            with patch.object(H, "_fallback_codex", return_value={"path": "/usr/local/bin/fake-codex"}) \
+                 as fallback, \
+                 patch("zcode_supervisor.codex_appserver.CodexAppServerClient") as client_cls:
+                client_cls.return_value.start = AsyncMock()
+                instance = await workers.appserver_instance()
+                client_cls.assert_called_once_with(
+                    "/usr/local/bin/fake-codex", self.evidence_root / "appserver")
+                self.assertIs(instance, client_cls.return_value)
+                self.assertTrue(fallback.called)
+        asyncio.run(scenario())
+
+    def test_appserver_failed_start_uses_fresh_evidence_dir_on_retry(self):
+        import asyncio
+        from zcode_supervisor import hub_server as H
+        async def scenario():
+            workers = H.ResidentWorkers(self.config, self.evidence_root, codex_path=None)
+            with patch.object(H, "_fallback_codex", return_value={"path": "/usr/local/bin/fake-codex"}), \
+                 patch("zcode_supervisor.codex_appserver.CodexAppServerClient") as client_cls:
+                first = client_cls.return_value
+                first.start = AsyncMock(side_effect=RuntimeError("boom"))
+                with self.assertRaises(RuntimeError):
+                    await workers.appserver_instance()
+                second = client_cls.return_value
+                second.start = AsyncMock()
+                instance = await workers.appserver_instance()
+                calls = client_cls.call_args_list
+                self.assertEqual(calls[0].args[1].name, "appserver")
+                self.assertEqual(calls[1].args[1].name, "appserver-2")
+                self.assertIs(instance, second)
+        asyncio.run(scenario())
+
+    def test_appserver_without_codex_path_and_factory_is_unavailable(self):
+        self.register(self.appserver_contract())
+        # Hermetic: without this patch the fallback discovery would find the
+        # real machine codex bundle and dispatch a REAL app-server.
+        with patch("zcode_supervisor.hub_server._fallback_codex",
+                   return_value={"installed": False, "path": None}), \
+                self.assertRaises(H.HubError) as caught:
+            asyncio.run(H.delegate_impl(
+                self.config, self.evidence_root, "hub-codex-1",
+                {"agent": "a", "session_id": "s"},
+                codex_runner=self.default_fake_codex()))
+        self.assertEqual(caught.exception.code, "worker-unavailable")
 
 
 class ReadContextTests(HubFixture):
