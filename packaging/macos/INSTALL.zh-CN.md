@@ -15,7 +15,7 @@
 如果双击未能启动，可在终端运行（路径换成解压目录）：
 
 ```sh
-bash "/absolute/path/zcode-supervisor-0.1.3/Install.command"
+bash "/absolute/path/zcode-supervisor-0.1.4/Install.command"
 ```
 
 安装器不需要 sudo，不下载解释器，不复制登录、provider 配置或历史任务，不发模型请求。
@@ -26,13 +26,14 @@ bash "/absolute/path/zcode-supervisor-0.1.3/Install.command"
 只检查、不安装：
 
 ```sh
-bash "/absolute/path/zcode-supervisor-0.1.3/Check.command"
+bash "/absolute/path/zcode-supervisor-0.1.4/Check.command"
 ```
 
 安装完毕，Codex 会为这台机器初始化独立的 `~/zcode-work/.czs/` 并运行 `doctor`。
 新版统一诊断会检查所需 Codex 插件命令、解释器、Node、ZCode 指纹和能力边界；每项失败有
 稳定错误码与修复建议。首次初始化使用诊断找到的 Node 绝对路径，避免 Finder 与终端 PATH 不同。
-当前只接受 **CLI 0.16.9 的两个已审 SHA256**，版本号相同也不能代替指纹。
+当前只接受已审指纹清单内的 ZCode CLI SHA256（清单见 docs/COMPATIBILITY.md，现含 CLI 0.16.9 两个与
+0.17.0 两个指纹），版本号相同也不能代替指纹。
 如果这台 Mac 的 ZCode 已更新，doctor 可能拒绝执行；应提交新指纹供兼容性复核，不能直接加白名单。
 ZCode 自己的登录与模型选择留在当地；本基线不保证强制固定 provider/model，也不接管正在使用的 GUI 聊天。
 
@@ -64,7 +65,7 @@ ZCode 自己的登录与模型选择留在当地；本基线不保证强制固�
 4. 用生成的实际 run JSON 再汇总一次（替换两个绝对路径）：
 
    ```sh
-   bash "/absolute/path/zcode-supervisor-0.1.3/Validate.command" --receipt "/absolute/local/task/run-1.json"
+   bash "/absolute/path/zcode-supervisor-0.1.4/Validate.command" --receipt "/absolute/local/task/run-1.json"
    ```
 
 把桌面的最新验证 JSON 发回当前 Codex 聊天。报告仅包含环境与本插件状态、任务结果摘要，
@@ -80,7 +81,7 @@ ZCode 自己的登录与模型选择留在当地；本基线不保证强制固�
 工程基线经过冻结 Git 索引测试与边界回放；严格全 actor 模型请求前置预算门仍不支持，子技能实际消费
 与成本未被证明的部分仍记 unknown。实际 Codex 公平成本对照未进行，不能把 GLM 探索结果称为 Codex 收益。
 交付检查不等于功能或科学方法验收，权限 broker 也不是 OS 沙箱。
-插件发行版为 0.1.3，包内已验收执行核心仍为 0.1.0；二者分别显示，执行核心指纹没有因安装器更新改变。
+插件发行版为 0.1.4，包内已验收执行核心仍为 0.1.0；二者分别显示，执行核心指纹没有因安装器更新改变。
 
 这是独立维护的适配器，不是 ZCode 官方插件。插件格式与本地 marketplace 使用
 [OpenAI 官方插件打包文档](https://developers.openai.com/plugins/build/plugins)；

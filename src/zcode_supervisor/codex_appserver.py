@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -49,6 +50,9 @@ V1_EXEC_APPROVAL = 'execCommandApproval'
 V1_PATCH_APPROVAL = 'applyPatchApproval'
 V2_COMMAND_APPROVAL = 'item/commandExecution/requestApproval'
 V2_FILE_APPROVAL = 'item/fileChange/requestApproval'
+# Bounded wait for the published live turn id before deciding an approval
+# that omits its own; see ApprovalBridge.needs_turn_identity.
+_TURN_IDENTITY_WAIT_S = 5.0
 V2_PERMISSIONS_APPROVAL = 'item/permissions/requestApproval'
 V2_TOOL_INPUT = 'item/tool/requestUserInput'
 MCP_ELICITATION = 'mcpServer/elicitation/request'
@@ -169,8 +173,10 @@ class CodexAppServerClient:
 
         Server requests are offered to handlers in registration order and the
         first non-None dict becomes the wire response; all-None falls through
-        to the -32601 refusal. A raising handler counts as None — a broken
-        subscriber never kills the read loop or starves later subscribers.
+        to the -32601 refusal. Handlers may be coroutine functions (or return
+        any awaitable): each answer is awaited before the next subscriber is
+        consulted. A raising handler counts as None — a broken subscriber
+        never kills the read loop or starves later subscribers.
         Returns an idempotent unsubscribe callable.
         """
         self._request_handlers.append(fn)
@@ -312,6 +318,8 @@ class CodexAppServerClient:
             for handler in list(self._request_handlers):
                 try:
                     response = handler(method, params)
+                    if inspect.isawaitable(response):
+                        response = await response
                 except Exception:
                     response = None  # a broken subscriber never kills the loop
                 if response is not None:
@@ -446,6 +454,28 @@ class ApprovalBridge:
             if isinstance(candidate, str) and candidate:
                 return candidate
         return self.turn_id or 'codex-turn'
+
+    _APPROVAL_METHODS = frozenset((V1_EXEC_APPROVAL, V2_COMMAND_APPROVAL,
+                                   V1_PATCH_APPROVAL, V2_FILE_APPROVAL))
+
+    @classmethod
+    def needs_turn_identity(cls, method, params):
+        """True when handle() would fall back to the live turn id here.
+
+        The driver waits for the published turn id before dispatching such a
+        request: without the wait, an approval that omits turnId can be
+        decided before the turn/start response is processed — Python 3.11's
+        wait_for resolves through an extra done-callback hop, so a same-stream
+        approval dispatched by create_task can overtake the awaiting driver —
+        which hands the authority the 'codex-turn' placeholder and fails
+        closed wrongly.
+        """
+        if method not in cls._APPROVAL_METHODS or not isinstance(params, dict):
+            return False
+        for candidate in (params.get('turnId'), params.get('turn_id')):
+            if isinstance(candidate, str) and candidate:
+                return False
+        return True
 
     def _ask(self, method, worker, params, summary, tool_name, tool_input, hint=None):
         """One authority.decide round trip plus worker_response shaping."""
@@ -660,6 +690,7 @@ class CodexAppServerDriver:
         bridge = ApprovalBridge(authority, None)
         handler_errors = []  # subscriber exceptions: recorded, never propagated
         terminal = {}
+        turn_known = asyncio.Event()
 
         def publish_turn(turn_id):
             """Propagate the live turn id to the bridge and the authority.
@@ -680,6 +711,7 @@ class CodexAppServerDriver:
             note_turn = getattr(authority, 'note_turn', None)
             if callable(note_turn):
                 note_turn(turn_id)
+            turn_known.set()
 
         def on_notification(method, params):
             if not isinstance(method, str) or not isinstance(params, dict):
@@ -725,10 +757,24 @@ class CodexAppServerDriver:
                 return mine is None or conversation == mine
             return True
 
-        def request_handler(method, params):
-            """Thread-filtered bridge dispatch for the subscriber model."""
+        async def request_handler(method, params):
+            """Thread-filtered bridge dispatch for the subscriber model.
+
+            Async so the dispatch can first wait for the live turn id when
+            the approval omits its own (needs_turn_identity): deciding
+            immediately can race the turn/start continuation and leak the
+            placeholder identity. On timeout the decision proceeds exactly
+            as before — fail closed, never hang the wire request.
+            """
             if not owns_request(params):
                 return None  # another concurrent task's thread owns it
+            if (bridge.turn_id is None
+                    and ApprovalBridge.needs_turn_identity(method, params)):
+                try:
+                    await asyncio.wait_for(turn_known.wait(),
+                                           _TURN_IDENTITY_WAIT_S)
+                except asyncio.TimeoutError:
+                    pass  # no live turn id in bounds: fail closed as before
             try:
                 return bridge.handle(method, params)
             except Exception as error:

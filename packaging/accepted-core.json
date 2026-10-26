@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "acceptance": "2026-10-26 acceptance: tri-agent hub P0-P3 (MCP control plane, codex exec + concurrent app-server drivers with approval bridge, resident zcode multi-session driver, contract modes with write-path rules, tri-probe/health fail-closed routing, permission bypass probes, bench); 592 tests pass; live evidence under underworld2 out/tri-agent-p0-20261025, -p1-20261026, -p2-20261026, -p3-20261026",
+  "acceptance": "2026-10-26b acceptance: tri-agent hub P0-P3 (MCP control plane, codex exec + concurrent app-server drivers with approval bridge, resident zcode multi-session driver, contract modes with write-path rules, tri-probe/health fail-closed routing, permission bypass probes, bench); 594 tests pass on Python 3.11 and 3.13 (hub extra mcp>=2.3,<3 installed); turnId-less approvals now wait for the published turn id (fixes the Python 3.11 wait_for ordering race where the placeholder identity reached the authority); live evidence under underworld2 out/tri-agent-p0-20261025, -p1-20261026, -p2-20261026, -p3-20261026",
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
@@ -30,8 +30,8 @@
     },
     "src/zcode_supervisor/codex_appserver.py": {
       "mode": "100644",
-      "blob": "ca76fb55ef2d5c2e365dcd0b08fe01de4dc7f97c",
-      "sha256": "26bf10e9238a9fec95d2c222d00f4032d4373a8644c22498a91c0d37aee3a787"
+      "blob": "3059d62337b3109f407ce684ab72b5dfc124394d",
+      "sha256": "e3c8e2866bc95d945bfc2decd2b7d9932bf4f3c1bfd4dca364b7c680c094a725"
     },
     "src/zcode_supervisor/codex_driver.py": {
       "mode": "100644",

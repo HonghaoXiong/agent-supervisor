@@ -264,6 +264,23 @@ class PureUnitTests(unittest.TestCase):
             {"toolName": "Write",
              "input": {"file_path": "/tmp/ws/OTHER.md", "content": ""}})["decision"], "deny")
 
+    def test_needs_turn_identity_predicates(self):
+        # Only approval-family methods without a wire turnId need the gate.
+        for method in ("execCommandApproval",
+                       "item/commandExecution/requestApproval",
+                       "item/fileChange/requestApproval"):
+            self.assertTrue(ApprovalBridge.needs_turn_identity(method, {}))
+            self.assertTrue(ApprovalBridge.needs_turn_identity(
+                method, {"turnId": ""}))
+            self.assertFalse(ApprovalBridge.needs_turn_identity(
+                method, {"turnId": "turn_x"}))
+            self.assertFalse(ApprovalBridge.needs_turn_identity(
+                method, {"turn_id": "turn_x"}))
+        self.assertFalse(ApprovalBridge.needs_turn_identity(
+            "totally/unknownMethod", {}))
+        self.assertFalse(ApprovalBridge.needs_turn_identity(
+            "execCommandApproval", None))
+
 
 class FakeAppServerTests(unittest.TestCase):
     def _prepare(self):
@@ -499,6 +516,43 @@ class FakeAppServerTests(unittest.TestCase):
             env={"FAKE_APPSERVER_MODE": mode,
                  "FAKE_APPSERVER_DIAG": str(diag_path),
                  "FAKE_APPSERVER_SECRET": SECRET})
+
+    def test_async_request_handlers_are_awaited_in_order(self):
+        # The driver's dispatch is an async handler; _reverse must await
+        # awaitable answers instead of leaking a coroutine to the wire or
+        # skipping the subscriber. An async observer returning None must be
+        # consulted (registration order) while the sync owner still answers.
+        root, fake, diag_path = self._prepare()
+
+        async def go():
+            client = self._client(root, fake, diag_path, "default")
+            try:
+                await client.start()
+                seen = []
+
+                async def observer(method, params):
+                    seen.append(method)
+                    await asyncio.sleep(0)  # force a real suspension
+                    return None  # observer only: never claims a request
+
+                client.add_request_handler(observer)
+                receipt = await CodexAppServerDriver(client).run_task(
+                    SimpleContractAuthority(["cat TASK.md"], []),
+                    root / "ws", "go", timeout_s=8)
+                return receipt, seen
+            finally:
+                await client.close()
+
+        receipt, seen = asyncio.run(go())
+        self.assertEqual(receipt["outcome"], "delivered")
+        self.assertEqual(receipt["final_message"], "done summary")
+        self.assertIn("item/commandExecution/requestApproval", seen)
+        # the approval was still answered on the wire by the sync owner
+        responses = {entry["method"]: entry["response"].get("result")
+                     for entry in json.loads(diag_path.read_text())
+                     ["server_responses"]}
+        self.assertEqual(responses["item/commandExecution/requestApproval"],
+                         {"decision": "accept"})
 
     def test_concurrent_run_tasks_isolate_threads_on_shared_client(self):
         # "dual" fake: two concurrent run_task calls on ONE client, with the

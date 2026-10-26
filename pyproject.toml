@@ -12,6 +12,7 @@ license-files = ["LICENSE", "THIRD_PARTY_NOTICES.md"]
 requires-python = ">=3.11"
 authors = [{name = "HonghaoXiong"}]
 dependencies = []
+optional-dependencies = {hub = ["mcp>=2.3,<3"]}
 classifiers = [
   "Development Status :: 3 - Alpha",
   "Programming Language :: Python :: 3",

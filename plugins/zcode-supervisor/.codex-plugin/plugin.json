@@ -1,6 +1,6 @@
 {
   "name": "zcode-supervisor",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Delegate bounded tasks from Codex to local ZCode and independently review execution evidence.",
   "author": {"name": "HonghaoXiong"},
   "license": "Apache-2.0",
