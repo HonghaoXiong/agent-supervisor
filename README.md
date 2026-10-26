@@ -1,8 +1,8 @@
-# zcode-supervisor
+# agent-supervisor
 
 通过 ZCode 官方 app-server 协议，让 Codex 派发有明确范围的任务，由 ZCode 实现，再由 Codex 根据实际文件、审批和执行证据验收。
 
-Python 包名为 `codex-zcode-supervisor`，命令为 `czs`；也可使用 `python -m zcode_supervisor`。这是独立的协作适配器，不是 ZCode 官方产品，也不是 [AkiGarage/ZCode-supervisor](https://github.com/AkiGarage/ZCode-supervisor) 的同版本发行。
+Python 包名为 `codex-zcode-supervisor`（仓库名 agent-supervisor），命令为 `czs`；也可使用 `python -m zcode_supervisor`。这是独立的协作适配器，不是 ZCode 官方产品，也不是 [AkiGarage/ZCode-supervisor](https://github.com/AkiGarage/ZCode-supervisor) 的同版本发行。
 
 当前能力包括：
 
@@ -25,8 +25,8 @@ Python 包名为 `codex-zcode-supervisor`，命令为 `czs`；也可使用 `pyth
 需要 Python 3.11+、Node.js、已安装且能正常登录使用的 ZCode。私有仓库访问使用自己的 GitHub 登录或 SSH 配置；不要把 token 放进 URL。
 
 ```bash
-gh repo clone HonghaoXiong/zcode-supervisor
-cd zcode-supervisor
+gh repo clone HonghaoXiong/agent-supervisor
+cd agent-supervisor
 uv tool install .
 ```
 

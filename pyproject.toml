@@ -22,7 +22,7 @@ classifiers = [
 czs = "zcode_supervisor.cli:main"
 
 [project.urls]
-Repository = "https://github.com/HonghaoXiong/zcode-supervisor"
+Repository = "https://github.com/HonghaoXiong/agent-supervisor"
 
 [tool.setuptools.packages.find]
 where = ["src"]
