@@ -1,6 +1,6 @@
 {
   "schema_version": 1,
-  "acceptance": "2026-10-26 acceptance: tri-agent hub P0+P1 (MCP control plane with human-registered contracts, codex exec + app-server drivers with approval bridge, resident zcode multi-session driver, tri-probe/health fail-closed routing, permission bypass probes, bench); 565 tests pass; live evidence under underworld2 out/tri-agent-p0-20261025 and out/tri-agent-p1-20261026",
+  "acceptance": "2026-10-26 acceptance: tri-agent hub P0-P3 (MCP control plane, codex exec + concurrent app-server drivers with approval bridge, resident zcode multi-session driver, contract modes with write-path rules, tri-probe/health fail-closed routing, permission bypass probes, bench); 592 tests pass; live evidence under underworld2 out/tri-agent-p0-20261025, -p1-20261026, -p2-20261026, -p3-20261026",
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
@@ -30,8 +30,8 @@
     },
     "src/zcode_supervisor/codex_appserver.py": {
       "mode": "100644",
-      "blob": "99588f9be1ba17ced00b445ac0da3352aec96366",
-      "sha256": "7de4b17d01096ca6fb4bf073960296e7c33717c6a6b6eeb39dc623b9ae81b8bf"
+      "blob": "ca76fb55ef2d5c2e365dcd0b08fe01de4dc7f97c",
+      "sha256": "26bf10e9238a9fec95d2c222d00f4032d4373a8644c22498a91c0d37aee3a787"
     },
     "src/zcode_supervisor/codex_driver.py": {
       "mode": "100644",
@@ -45,8 +45,8 @@
     },
     "src/zcode_supervisor/contracts.py": {
       "mode": "100644",
-      "blob": "bbb8469706cbb878d76a19accbbc786a46a37e62",
-      "sha256": "0b39bfe0f5a3d7615482373e4c1b75d50b020c8e9734f32c45d29df6ceda8f2f"
+      "blob": "6a3d53f5e20a7c4352d0a20c8e0b19b678a7c141",
+      "sha256": "7a6bf9ec72c4b81653495613ae04ad8cd0cef3fa8731a2f6a1c15c90b79d54bd"
     },
     "src/zcode_supervisor/digest.py": {
       "mode": "100644",
@@ -65,8 +65,8 @@
     },
     "src/zcode_supervisor/hub_server.py": {
       "mode": "100644",
-      "blob": "3b883cf186fe42bdc32d32113e2bf080c8e7e848",
-      "sha256": "e68fbc481a70c1003272ca911da16bbca35cfe75c64d41beb21b99195c9a7da1"
+      "blob": "e210ebe06d0d225aaa73a5e2a2152ef95bd5e48f",
+      "sha256": "ad561de139bee36faed835be8f8a5f30e2dcf265496a6826ced4ed4f9f3a8539"
     },
     "src/zcode_supervisor/mcp_readonly.py": {
       "mode": "100644",

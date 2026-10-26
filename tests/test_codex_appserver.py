@@ -14,6 +14,7 @@ import unittest
 from pathlib import Path
 
 from zcode_supervisor.codex_appserver import (
+    ApprovalBridge,
     AppServerError,
     CodexAppServerClient,
     CodexAppServerDriver,
@@ -36,6 +37,9 @@ SECRET = os.environ.get("FAKE_APPSERVER_SECRET", "no-secret-set")
 THREAD = "th_fake_11111"
 TURN = "turn_fake_1"
 observed = {"mode": MODE, "server_responses": [], "interrupt": None}
+# "dual" mode: two concurrent threads on one client. thread ids are pinned
+# by the thread/start cwd (wsA/wsB) so each driver maps to its own thread.
+DUAL = {"threads": [], "turns": [], "fired": False}
 
 
 def send(frame):
@@ -125,6 +129,38 @@ def run_turn():
                             "turn": {"id": TURN, "status": "completed"}})
 
 
+def dual_sequence():
+    # Interleaved two-thread turn, fired once BOTH turns started:
+    # T1 approval, T2 approval, T1 item/completed, T2 item/completed,
+    # T1 agent message, T2 agent message, T1 turn/completed, T2 turn/completed.
+    t1, t2 = DUAL["threads"][0], DUAL["threads"][1]
+
+    def approval(item, thread, command):
+        return {"threadId": thread, "turnId": "turn_" + thread,
+                "itemId": item, "startedAtMs": 1, "kind": "command",
+                "cwd": "/ws", "command": command,
+                "availableDecisions": ["accept", "decline"]}
+
+    ask("srv-d1", "item/commandExecution/requestApproval",
+        approval("item_A", t1, "/bin/zsh -lc 'cat A.md'"))
+    ask("srv-d2", "item/commandExecution/requestApproval",
+        approval("item_B", t2, "/bin/zsh -lc 'cat B.md'"))
+    for thread, command in ((t1, "cat A.md"), (t2, "cat B.md")):
+        note("item/completed", {"threadId": thread, "turnId": "turn_" + thread,
+                                "completedAtMs": 10,
+                                "item": {"type": "commandExecution",
+                                         "command": command, "exitCode": 0,
+                                         "status": "completed"}})
+    for thread, text in ((t1, "done A"), (t2, "done B")):
+        note("item/completed", {"threadId": thread, "turnId": "turn_" + thread,
+                                "completedAtMs": 11,
+                                "item": {"type": "agentMessage", "text": text}})
+    for thread in (t1, t2):
+        note("turn/completed", {"threadId": thread,
+                                "turn": {"id": "turn_" + thread,
+                                         "status": "completed"}})
+
+
 for line in sys.stdin:
     frame = json.loads(line)
     method = frame.get("method")
@@ -137,8 +173,14 @@ for line in sys.stdin:
                          "userAgent": "fake-appserver/0.164"}})
     elif method == "thread/start":
         observed["thread_params"] = params
+        thread = THREAD
+        if MODE == "dual":
+            thread = ("th_dual_A" if str(params.get("cwd", "")).endswith("wsA")
+                      else "th_dual_B")
+            if thread not in DUAL["threads"]:
+                DUAL["threads"].append(thread)
         send({"id": frame["id"],
-              "result": {"thread": {"id": THREAD},
+              "result": {"thread": {"id": thread},
                          "approvalPolicy": params.get("approvalPolicy"),
                          "approvalsReviewer": params.get("approvalsReviewer"),
                          "cwd": params.get("cwd"),
@@ -147,16 +189,36 @@ for line in sys.stdin:
                          "sandbox": params.get("sandbox")}})
     elif method == "turn/start":
         observed["turn_params"] = params
-        send({"id": frame["id"], "result": {"turn": {"id": TURN,
-                                                     "status": "inProgress"}}})
-        run_turn()
+        if MODE == "dual":
+            thread = params.get("threadId")
+            if thread not in DUAL["turns"]:
+                DUAL["turns"].append(thread)
+            send({"id": frame["id"], "result": {"turn": {"id": "turn_" + str(thread),
+                                                         "status": "inProgress"}}})
+            if len(DUAL["turns"]) == 2 and not DUAL["fired"]:
+                DUAL["fired"] = True
+                dual_sequence()
+        else:
+            send({"id": frame["id"], "result": {"turn": {"id": TURN,
+                                                         "status": "inProgress"}}})
+            run_turn()
     elif method == "thread/read":
-        send({"id": frame["id"],
-              "result": {"thread": {"id": THREAD, "turns": [
-                  {"id": TURN, "status": "completed",
-                   "items": [{"type": "agentMessage",
-                              "text": "done summary"}]}]},
-                         "readState": {}}})
+        if MODE == "dual":
+            thread = str(params.get("threadId"))
+            send({"id": frame["id"],
+                  "result": {"thread": {"id": thread, "turns": [
+                      {"id": "turn_" + thread, "status": "completed",
+                       "items": [{"type": "agentMessage",
+                                  "text": ("done A" if thread.endswith("A")
+                                           else "done B")}]}]},
+                      "readState": {}}})
+        else:
+            send({"id": frame["id"],
+                  "result": {"thread": {"id": THREAD, "turns": [
+                      {"id": TURN, "status": "completed",
+                       "items": [{"type": "agentMessage",
+                                  "text": "done summary"}]}]},
+                      "readState": {}}})
     elif method == "turn/interrupt":
         observed["interrupt"] = params
         send({"id": frame["id"], "result": {}})
@@ -428,6 +490,185 @@ class FakeAppServerTests(unittest.TestCase):
         self.assertEqual(receipt["final_message"], "done summary")
         # ...and no binding slot was invented on it by the driver
         self.assertFalse(hasattr(authority, "session_id"))
+
+    # -- P3 subscriber model -------------------------------------------------
+
+    def _client(self, root, fake, diag_path, mode):
+        return CodexAppServerClient(
+            str(fake), root / "evidence",
+            env={"FAKE_APPSERVER_MODE": mode,
+                 "FAKE_APPSERVER_DIAG": str(diag_path),
+                 "FAKE_APPSERVER_SECRET": SECRET})
+
+    def test_concurrent_run_tasks_isolate_threads_on_shared_client(self):
+        # "dual" fake: two concurrent run_task calls on ONE client, with the
+        # two threads' approvals/notifications interleaved by the server.
+        # Each task's authority approves only its own command, so any
+        # cross-thread routing shows up as a deny in the wrong receipt.
+        root, fake, diag_path = self._prepare()
+        (root / "wsA").mkdir()
+        (root / "wsB").mkdir()
+
+        async def go():
+            client = self._client(root, fake, diag_path, "dual")
+            try:
+                await client.start()
+                driver = CodexAppServerDriver(client)
+                receipts = await asyncio.gather(
+                    driver.run_task(SimpleContractAuthority(["cat A.md"], []),
+                                    root / "wsA", "task A", timeout_s=10),
+                    driver.run_task(SimpleContractAuthority(["cat B.md"], []),
+                                    root / "wsB", "task B", timeout_s=10))
+                leftover = (len(client._request_handlers),
+                            len(client._notification_handlers))
+            finally:
+                await client.close()
+            return receipts, leftover
+
+        (receipt_a, receipt_b), leftover = asyncio.run(go())
+        for receipt, thread, message in ((receipt_a, "th_dual_A", "done A"),
+                                         (receipt_b, "th_dual_B", "done B")):
+            self.assertEqual(receipt["outcome"], "delivered")
+            self.assertEqual(receipt["thread_id"], thread)
+            self.assertEqual(receipt["final_message"], message)
+            self.assertEqual([record["decision"] for record in receipt["approvals"]],
+                             ["allow"])
+            self.assertEqual(receipt["approvals"][0]["params"]["threadId"], thread)
+        # both subscriptions were released when the tasks ended
+        self.assertEqual(leftover, (0, 0))
+        # wire: each approval was ACCEPTED — i.e. answered by the handler of
+        # its own thread (a swapped handler would have denied the command)
+        responses = {entry["id"]: entry["response"].get("result")
+                     for entry in json.loads(diag_path.read_text())["server_responses"]}
+        self.assertEqual(responses["srv-d1"], {"decision": "accept"})
+        self.assertEqual(responses["srv-d2"], {"decision": "accept"})
+
+    def test_run_task_unsubscribes_its_handlers_on_completion(self):
+        root, fake, diag_path = self._prepare()
+
+        async def go():
+            client = self._client(root, fake, diag_path, "default")
+            try:
+                await client.start()
+                probe_seen = []
+
+                def probe_request(method, params):
+                    probe_seen.append(("request", method))
+                    return None  # observer only: never claims a request
+
+                def probe_notification(method, params):
+                    probe_seen.append(("notification", method))
+
+                client.add_request_handler(probe_request)
+                client.add_notification_handler(probe_notification)
+                receipt = await CodexAppServerDriver(client).run_task(
+                    SimpleContractAuthority(["cat TASK.md"], ["OUT.md"]),
+                    root / "ws", "go", timeout_s=8)
+                leftover = (list(client._request_handlers),
+                            list(client._notification_handlers))
+            finally:
+                await client.close()
+            return receipt, leftover, probe_seen
+
+        receipt, leftover, probe_seen = asyncio.run(go())
+        self.assertEqual(receipt["outcome"], "delivered")
+        # exactly the two probes survive: the driver unsubscribed its pair
+        self.assertEqual([len(handlers) for handlers in leftover], [1, 1])
+        self.assertEqual(leftover[0][0].__name__, "probe_request")
+        self.assertEqual(leftover[1][0].__name__, "probe_notification")
+        # the probes really were subscribed during the run (broadcast proof)
+        self.assertTrue(any(kind == "request" for kind, _ in probe_seen))
+        self.assertTrue(any(kind == "notification" for kind, _ in probe_seen))
+
+    def test_compat_single_slot_properties_stay_exclusive(self):
+        # Legacy single-user usage: assigning on_server_request/
+        # on_notification registers ONE exclusive subscription (clearing all
+        # others) and the getter returns the last assigned callable.
+        root, fake, diag_path = self._prepare()
+
+        async def go():
+            client = self._client(root, fake, diag_path, "default")
+            self.assertIsNone(client.on_server_request)
+            self.assertIsNone(client.on_notification)
+            try:
+                await client.start()
+                probe_requests, probe_notes = [], []
+
+                def probe_request(method, params):
+                    probe_requests.append(method)
+                    return None
+
+                def probe_notification(method, params):
+                    probe_notes.append(method)
+
+                client.add_request_handler(probe_request)
+                client.add_notification_handler(probe_notification)
+                bridge = ApprovalBridge(
+                    SimpleContractAuthority(["cat TASK.md"], []), "th_fake_11111")
+                client.on_server_request = bridge.handle  # exclusive: drops probe
+                recorded_notes = []
+
+                def record_notification(method, params):
+                    recorded_notes.append(method)
+
+                client.on_notification = record_notification
+                self.assertEqual(client.on_server_request, bridge.handle)
+                self.assertEqual(client.on_notification, record_notification)
+                thread = (await client.request("thread/start", {
+                    "cwd": str(root / "ws"), "sandbox": "read-only",
+                    "approvalPolicy": "on-request", "approvalsReviewer": "user",
+                    "ephemeral": False}))["thread"]["id"]
+                await client.request("turn/start", {
+                    "threadId": thread,
+                    "input": [{"type": "text", "text": "go"}]})
+                for _ in range(200):  # the fake runs the turn inline
+                    if "turn/completed" in recorded_notes:
+                        break
+                    await asyncio.sleep(0.02)
+                client.on_server_request = None  # None clears the slot again
+                self.assertIsNone(client.on_server_request)
+            finally:
+                await client.close()
+            return probe_requests, probe_notes, recorded_notes, bridge.decisions
+
+        probe_requests, probe_notes, recorded_notes, decisions = asyncio.run(go())
+        self.assertEqual(probe_requests, [])   # cleared by the exclusive assignment
+        self.assertEqual(probe_notes, [])
+        self.assertIn("turn/completed", recorded_notes)  # compat slot fired
+        self.assertTrue(any(record["decision"] == "allow" for record in decisions))
+
+    def test_raising_subscriber_never_breaks_dispatch_or_read_loop(self):
+        # A broken subscriber counts as "not handled": later subscribers still
+        # answer, notifications still broadcast, and the read loop survives.
+        root, fake, diag_path = self._prepare()
+
+        async def go():
+            client = self._client(root, fake, diag_path, "default")
+            try:
+                await client.start()
+
+                def boom(method, params):
+                    raise RuntimeError("subscriber exploded")
+
+                client.add_request_handler(boom)
+                client.add_notification_handler(boom)
+                receipt = await CodexAppServerDriver(client).run_task(
+                    SimpleContractAuthority(["cat TASK.md"], ["OUT.md"]),
+                    root / "ws", "go", timeout_s=8)
+            finally:
+                await client.close()
+            return receipt
+
+        receipt = asyncio.run(go())
+        self.assertEqual(receipt["outcome"], "delivered")
+        self.assertEqual(receipt["final_message"], "done summary")
+        # the driver's handler (registered after the raiser) still answered
+        responses = {entry["method"]: entry["response"].get("result")
+                     for entry in json.loads(diag_path.read_text())["server_responses"]}
+        self.assertEqual(responses["item/commandExecution/requestApproval"],
+                         {"decision": "accept"})
+        # the foreign raiser is not the driver's handler: no handler_errors
+        self.assertNotIn("handler_errors", receipt)
 
 
 if __name__ == "__main__":

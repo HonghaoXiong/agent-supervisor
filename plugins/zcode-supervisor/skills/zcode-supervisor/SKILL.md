@@ -85,6 +85,11 @@ UNSUPPORTED rather than launch and kill after observing extra requests. Child
 cost or exact Skill consumption that is absent from evidence remains unknown.
 The optional evidence MCP is read-only and does not execute ZCode tasks.
 
+The tri-agent orchestration hub (`czs-hub`, also in `docs/USAGE.md`) exposes a
+contract-gated MCP control plane: any installed agent can delegate read or
+write tasks to the other installed workers through human-registered
+contracts, with per-command approvals and conservative session readback.
+
 Keep a minimal external handoff for long-running coordination. At phase changes
 or material context pressure, use the host's supported context maintenance or a
 new coordinator with explicit handoff. Do not interrupt a busy user GUI, silently

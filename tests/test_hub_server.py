@@ -12,6 +12,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from dataclasses import dataclass
 from pathlib import Path
@@ -199,6 +200,14 @@ class HealthAndWorkersTests(HubFixture):
         self.assertEqual(workers["dsh"]["status"], "absent")
         self.assertIn("degraded routing does not guarantee worker equivalence",
                       view["routing_note"])
+
+    def test_health_reports_structured_write_capability(self):
+        view = H.health_impl(self.config, str(self.fake_codex))
+        self.assertEqual(view["write_capability"], {
+            "zcode": "cold+resident (contract files + exact commands)",
+            "codex_exec": "read-only only (no approval channel)",
+            "codex_app_server": "write via untrusted per-command approvals"})
+        self.assertNotIn("read_only_p0", view)  # flat P0 flag retired
 
     def test_health_json_view_is_served_with_defaults_fallback(self):
         self.write_health({"codex": {"enabled": False, "status": "error",
@@ -513,7 +522,7 @@ class DelegateZcodeResidentTests(HubFixture):
 
 
 class DelegateCodexAppServerTests(HubFixture):
-    """codex+app-server dispatch: real Authority + shared client + lock."""
+    """codex+app-server dispatch: real Authority + shared client + gate."""
 
     def setUp(self):
         super().setUp()
@@ -607,40 +616,116 @@ class DelegateCodexAppServerTests(HubFixture):
         self.assertEqual(record["status"], "completed")
         self.assertEqual(record["result"]["final_message"], "done text")
 
-    def test_concurrent_appserver_delegates_serialize_on_shared_client(self):
-        tracker = {"active": 0, "peak": 0}
+    def test_concurrent_appserver_delegates_overlap_by_default(self):
+        # 2026-10-26 P3: the shared app-server client runs concurrent
+        # delegates; the default gate is a no-op. Two DISTINCT workspaces are
+        # required — the per-workspace advisory lock still serializes writes
+        # to one workspace across vendors.
+        entries = []
+        release = asyncio.Event()
+        windows = []  # (workspace, entered_at, exited_at) monotonic triples
 
-        class TrackingDriver:
+        class OverlapDriver:
+            def __init__(self, client):
+                pass
+
+            async def run_task(self, authority, workspace, prompt, *, model=None,
+                               sandbox="read-only", approval_policy="on-request",
+                               timeout_s=600):
+                entered_at = time.monotonic()
+                entries.append(workspace)
+                await release.wait()  # hold the window open until both are in
+                windows.append((workspace, entered_at, time.monotonic()))
+                return {"outcome": "delivered", "thread_id": "th_ov",
+                        "final_message": None, "command_items": [], "approvals": []}
+
+        client = self.FakeClient()
+        ws_b = self.work_root / "task-ws-b"
+        ws_b.mkdir()
+        self.register(self.appserver_contract())
+        self.register(self.appserver_contract(contract_id="hub-codex-b",
+                                              workspace=str(ws_b)))
+        workers = H.ResidentWorkers(
+            self.config, self.evidence_root, codex_path=str(self.fake_codex),
+            appserver_factory=lambda: client,
+            appserver_driver_factory=lambda c: OverlapDriver(c))
+
+        async def two_at_once():
+            tasks = [asyncio.create_task(H.delegate_impl(
+                self.config, self.evidence_root, contract_id,
+                {"agent": "a", "session_id": "s"},
+                codex_path=str(self.fake_codex), workers=workers))
+                for contract_id in ("hub-codex-1", "hub-codex-b")]
+
+            async def wait_for_both():
+                while len(entries) < 2:
+                    await asyncio.sleep(0.01)
+            # both delegates must be inside run_task at the same time; under
+            # the old P2 lock this wait would deadlock into the timeout
+            await asyncio.wait_for(wait_for_both(), 5)
+            self.assertEqual(len(entries), 2)  # both in flight simultaneously
+            release.set()
+            return await asyncio.gather(*tasks)
+
+        results = asyncio.run(two_at_once())
+        self.assertEqual([r["outcome"] for r in results],
+                         ["delivered", "delivered"])
+        self.assertEqual(client.starts, 1)  # one shared client start
+        # belt and braces: the recorded execution windows overlap
+        self.assertLess(max(w[1] for w in windows), min(w[2] for w in windows))
+
+    def test_appserver_concurrency_one_restores_serial_gate(self):
+        # Rollback path: appserver_concurrency=1 makes delegates queue (the
+        # P2 serial semantics), so run_task windows never overlap.
+        entries = []
+        release = asyncio.Event()
+        windows = []
+
+        class SerialDriver:
             def __init__(self, client):
                 pass
 
             async def run_task(self, authority, workspace, prompt, **kwargs):
-                tracker["active"] += 1
-                tracker["peak"] = max(tracker["peak"], tracker["active"])
-                await asyncio.sleep(0.03)  # force interleave windows
-                tracker["active"] -= 1
+                entered_at = time.monotonic()
+                entries.append(workspace)
+                await release.wait()
+                windows.append((workspace, entered_at, time.monotonic()))
                 return {"outcome": "delivered", "thread_id": "th_ser",
                         "final_message": None, "command_items": [], "approvals": []}
 
         client = self.FakeClient()
+        ws_b = self.work_root / "task-ws-b"
+        ws_b.mkdir()
         self.register(self.appserver_contract())
+        self.register(self.appserver_contract(contract_id="hub-codex-b",
+                                              workspace=str(ws_b)))
         workers = H.ResidentWorkers(
             self.config, self.evidence_root, codex_path=str(self.fake_codex),
             appserver_factory=lambda: client,
-            appserver_driver_factory=lambda c: TrackingDriver(c))
+            appserver_driver_factory=lambda c: SerialDriver(c),
+            appserver_concurrency=1)
 
-        async def two_at_once():
-            return await asyncio.gather(*[
-                H.delegate_impl(self.config, self.evidence_root, "hub-codex-1",
-                                {"agent": "a", "session_id": "s"},
-                                codex_path=str(self.fake_codex), workers=workers)
-                for _ in range(2)])
+        async def queued():
+            tasks = [asyncio.create_task(H.delegate_impl(
+                self.config, self.evidence_root, contract_id,
+                {"agent": "a", "session_id": "s"},
+                codex_path=str(self.fake_codex), workers=workers))
+                for contract_id in ("hub-codex-1", "hub-codex-b")]
 
-        results = asyncio.run(two_at_once())
-        self.assertEqual(tracker["peak"], 1)  # P2 conservative serialization
-        self.assertEqual(client.starts, 1)     # one shared client start
+            async def wait_for_first():
+                while not entries:
+                    await asyncio.sleep(0.01)
+            await asyncio.wait_for(wait_for_first(), 5)
+            await asyncio.sleep(0.05)  # the second delegate must NOT enter
+            self.assertEqual(len(entries), 1)
+            release.set()
+            return await asyncio.gather(*tasks)
+
+        results = asyncio.run(queued())
         self.assertEqual([r["outcome"] for r in results],
                          ["delivered", "delivered"])
+        ordered = sorted(windows, key=lambda w: w[1])
+        self.assertLessEqual(ordered[0][2], ordered[1][1])  # no overlap
 
     def test_appserver_client_start_failure_is_a_runner_error_task(self):
         class BrokenClient:

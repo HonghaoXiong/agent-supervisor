@@ -128,6 +128,15 @@ class CodexAppServerClient:
     table keyed by request id, and reverse (server->client) request dispatch.
     All frames, both directions, are appended (redacted) to
     ``evidence_dir/appserver-frames.jsonl``.
+
+    Server requests and notifications dispatch to a multi-subscriber model
+    (2026-10-26 P3): concurrent run_task calls each register their own
+    thread-filtered handlers via :meth:`add_request_handler` /
+    :meth:`add_notification_handler` instead of overwriting one another's
+    single-slot callback. The historical ``on_server_request`` /
+    ``on_notification`` attributes remain as exclusive compat wrappers
+    (assignment clears every other subscription, preserving the single-user
+    P2 semantics).
     """
 
     def __init__(self, codex_path, evidence_dir: Path, *, transport='stdio', env=None):
@@ -142,14 +151,91 @@ class CodexAppServerClient:
         self.process = None
         self.reader = None
         self.tasks = []
-        self.on_server_request = None  # (method, params) -> response dict | None
-        self.on_notification = None    # (method, params) -> None
+        self._request_handlers = []       # fn(method, params) -> response | None
+        self._notification_handlers = []  # fn(method, params) -> None
+        self._exclusive_request = None    # last value assigned via the property
+        self._exclusive_notification = None
         self.frames_path = self.evidence_dir / FRAMES_FILENAME
         self.stderr_path = self.evidence_dir / STDERR_FILENAME
         self.frames = None
         self.stderr = None
         self.closing = False
         self.initialize_result = None
+
+    # -- subscriber registration (P3) ----------------------------------------
+
+    def add_request_handler(self, fn):
+        """Subscribe ``fn(method, params) -> response dict | None``.
+
+        Server requests are offered to handlers in registration order and the
+        first non-None dict becomes the wire response; all-None falls through
+        to the -32601 refusal. A raising handler counts as None — a broken
+        subscriber never kills the read loop or starves later subscribers.
+        Returns an idempotent unsubscribe callable.
+        """
+        self._request_handlers.append(fn)
+
+        def unsubscribe():
+            try:
+                self._request_handlers.remove(fn)
+            except ValueError:
+                pass
+        return unsubscribe
+
+    def add_notification_handler(self, fn):
+        """Subscribe ``fn(method, params) -> None``; notifications broadcast.
+
+        Every notification reaches every handler; handler exceptions are
+        swallowed by the dispatch loop. Returns an idempotent unsubscribe
+        callable.
+        """
+        self._notification_handlers.append(fn)
+
+        def unsubscribe():
+            try:
+                self._notification_handlers.remove(fn)
+            except ValueError:
+                pass
+        return unsubscribe
+
+    # -- compat single-slot wrappers (P2 semantics) ---------------------------
+
+    @property
+    def on_server_request(self):
+        """Last callable assigned through this property (None when never set).
+
+        Assignment registers ONE exclusive subscription and clears every
+        other request handler, so legacy single-user code keeps its
+        owns-everything behavior.
+        """
+        return self._exclusive_request
+
+    @on_server_request.setter
+    def on_server_request(self, fn):
+        if fn is not None and not callable(fn):
+            raise TypeError('on_server_request must be callable or None')
+        self._request_handlers.clear()
+        self._exclusive_request = fn
+        if fn is not None:
+            self._request_handlers.append(fn)
+
+    @property
+    def on_notification(self):
+        """Last callable assigned through this property (None when never set).
+
+        Assignment registers one exclusive subscription and clears every other
+        notification handler; see :attr:`on_server_request`.
+        """
+        return self._exclusive_notification
+
+    @on_notification.setter
+    def on_notification(self, fn):
+        if fn is not None and not callable(fn):
+            raise TypeError('on_notification must be callable or None')
+        self._notification_handlers.clear()
+        self._exclusive_notification = fn
+        if fn is not None:
+            self._notification_handlers.append(fn)
 
     async def start(self) -> dict:
         """Spawn the process, start the read loop, and run one initialize.
@@ -223,11 +309,13 @@ class CodexAppServerClient:
             params = {}
         try:
             response = None
-            if callable(self.on_server_request):
+            for handler in list(self._request_handlers):
                 try:
-                    response = self.on_server_request(method, params)
+                    response = handler(method, params)
                 except Exception:
-                    response = None  # an unknown request shape never kills the loop
+                    response = None  # a broken subscriber never kills the loop
+                if response is not None:
+                    break  # first non-None answer wins
             if response is None:
                 await self.send({'id': rid, 'error': {
                     'code': -32601, 'message': f'Unsupported server request: {method}'}})
@@ -258,9 +346,9 @@ class CodexAppServerClient:
                     task.add_done_callback(self._reverse_done)
                 elif 'method' in frame:
                     self.notifications.append(frame)
-                    if callable(self.on_notification):
+                    for handler in list(self._notification_handlers):
                         try:
-                            self.on_notification(frame.get('method'), frame.get('params'))
+                            handler(frame.get('method'), frame.get('params'))
                         except Exception:
                             pass
                 elif frame.get('id') in self.pending:
@@ -570,7 +658,7 @@ class CodexAppServerDriver:
                    'evidence': {'frames': str(self.client.frames_path),
                                 'thread_read': str(evidence_dir / THREAD_READ_FILENAME)}}
         bridge = ApprovalBridge(authority, None)
-        self.client.on_server_request = bridge.handle
+        handler_errors = []  # subscriber exceptions: recorded, never propagated
         terminal = {}
 
         def publish_turn(turn_id):
@@ -614,7 +702,50 @@ class CodexAppServerDriver:
                 turn = params.get('turn')
                 terminal['turn'] = turn if isinstance(turn, dict) else {}
 
-        self.client.on_notification = on_notification
+        def owns_request(params):
+            """Does this server request belong to THIS task's thread?
+
+            P3 concurrency filter on the shared client: params carrying a
+            ``threadId`` are claimed only by the task owning that thread;
+            v1-shaped approval requests carry ``conversationId`` (the same
+            identity) instead, and requests carrying no identity field at all
+            cannot be attributed — they are handled (single-task behavior is
+            unchanged: an own threadId always matches once thread/start
+            returned, and threadId-bearing requests cannot arrive before it).
+            """
+            if not isinstance(params, dict):
+                return True
+            mine = receipt['thread_id']
+            for key in ('threadId', 'thread_id'):
+                thread = params.get(key)
+                if isinstance(thread, str) and thread:
+                    return thread == mine
+            conversation = params.get('conversationId')
+            if isinstance(conversation, str) and conversation:
+                return mine is None or conversation == mine
+            return True
+
+        def request_handler(method, params):
+            """Thread-filtered bridge dispatch for the subscriber model."""
+            if not owns_request(params):
+                return None  # another concurrent task's thread owns it
+            try:
+                return bridge.handle(method, params)
+            except Exception as error:
+                handler_errors.append(
+                    f'{method}: {type(error).__name__}: {error}'[:200])
+                return None
+
+        def notification_handler(method, params):
+            try:
+                on_notification(method, params)
+            except Exception as error:
+                handler_errors.append(
+                    f'notification {method}: {type(error).__name__}: {error}'[:200])
+
+        unsubscribe_request = self.client.add_request_handler(request_handler)
+        unsubscribe_notification = \
+            self.client.add_notification_handler(notification_handler)
         processed = 0
 
         def drain_terminal():
@@ -685,7 +816,18 @@ class CodexAppServerDriver:
                 ValueError, KeyError, TypeError) as error:
             receipt['outcome'] = receipt.get('outcome') or 'failed'
             receipt['error'] = str(error) or type(error).__name__
+        finally:
+            # P3 subscriber hygiene: this task's handlers leave the shared
+            # client the moment its turn ends (or fails), so no later task —
+            # and no reuse of this driver — inherits a stale thread filter.
+            unsubscribe_request()
+            unsubscribe_notification()
 
+        if handler_errors:
+            # Subscriber exceptions were contained above; they are evidence,
+            # never a crash of the read loop or of a sibling task.
+            receipt['handler_errors'] = handler_errors
+            receipt.setdefault('error', '; '.join(handler_errors)[:300])
         receipt['command_items'], agent_texts, receipt['token_usage'] = \
             self._collect(receipt['thread_id'])
         receipt['final_message'] = agent_texts[-1] if agent_texts else None

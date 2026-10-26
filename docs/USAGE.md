@@ -168,7 +168,7 @@ hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode
 
 `output_schema` 是 exec 入口的 `--output-schema` 专用机制：codex+exec 必填（严格模式递归校验不变），codex+app-server 拒收（该模式返回 `final_message` 文本），zcode 不消费该字段。
 
-运行期形态：zcode `resident` 与 codex `app-server` 共享实例在首个相应 delegate 时懒加载启动、整个 server 生命周期复用、进程退出时 best-effort close——这是常驻模式的核心收益（实测 zcode setup 延迟 604ms 冷启 → 94ms 首次 / 68ms 稳态）。app-server delegate 之间用一把锁保守串行（client 的 `run_task` 并发语义未验证，留待后续验证项），同一 workspace 仍受跨厂商 advisory lock 约束；resident 侧并发由常驻进程自身的会话隔离与 workspace 锁承担。合同字段与校验规则详见 `src/zcode_supervisor/contracts.py` 模块文档。
+运行期形态：zcode `resident` 与 codex `app-server` 共享实例在首个相应 delegate 时懒加载启动、整个 server 生命周期复用、进程退出时 best-effort close——这是常驻模式的核心收益（实测 zcode setup 延迟 604ms 冷启 → 94ms 首次 / 68ms 稳态）。app-server delegate 默认**并发**（2026-10-26 P3 起客户端为多订阅者模型，按 threadId 路由审批与通知、任务结束即退订；如需回退串行设 `appserver_concurrency=1`），同一 workspace 仍受跨厂商 advisory lock 约束；resident 侧并发由常驻进程自身的会话隔离与 workspace 锁承担。合同字段与校验规则详见 `src/zcode_supervisor/contracts.py` 模块文档。
 
 ## 远程任务：提交与回收分开
 

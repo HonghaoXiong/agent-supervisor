@@ -12,7 +12,7 @@
 python3 tools/build_macos_plugin.py --output dist
 ```
 
-产物为 `dist/zcode-supervisor-macos-0.1.2.zip`、SHA256 和同名版本解压树。
+产物为 `dist/zcode-supervisor-macos-0.1.3.zip`、SHA256 和同名版本解压树。
 只复制显式列出的源、许可证、模板和文档；不打包 `.czs`、out、模型/provider/认证配置、
 CLI bundle、工作日志、原项目输入或个人 skills 库。运行证据属于每台机器的独立私有目录。
 
@@ -20,13 +20,13 @@ CLI bundle、工作日志、原项目输入或个人 skills 库。运行证据�
 安装器先校验完整文件清单，再复制到版本化目录，调用 `codex plugin marketplace add` 与
 `codex plugin add`。没有直接覆写 Codex config.toml，也不覆盖已存在的其他 marketplace。
 插件缓存由 Codex 自己管理；升级时保留旧版本目录和任务证据。
-0.1.2（沿用 0.1.1 的升级事务机制）将来源切换、插件安装、完整缓存核验及回执作为一个升级事务处理；后续失败时恢复
+0.1.3（沿用既有升级事务机制）将来源切换、插件安装、完整缓存核验及回执作为一个升级事务处理；后续失败时恢复
 已验证的旧来源与已启用插件，单独报告恢复失败。旧插件禁用或状态不明时前置拒绝切换，
 不改变用户的禁用偏好。缓存拒绝多余、缺失、字节不同或符号链接成员，仅普通 Finder 元数据例外。
 
 `Check.command` 和安装器共用标准库诊断，检查依赖及所需 Codex 插件子命令，输出稳定错误码、
 修复建议与 supported/unsupported/unknown 能力表。已安装技能也可使用包内 `scripts/diagnostics.py`。
-插件版本 0.1.2 与执行核心版本 0.1.0 分列，核心仍来自同一组已验收 Git blobs（0.1.2 起纳入固定模型选择的 packet.model 字段）。
+插件版本 0.1.3 与执行核心版本 0.1.0 分列，核心仍来自同一组已验收 Git blobs（0.1.3 起随包携带三方编排 hub：tri-probe/常驻驱动/合同库/MCP 控制面）。
 
 `Validate.command` 只初始化 Codex app-server 并查询技能目录，过滤报告为本插件信息，不发送
 thread/turn 或 ZCode 模型请求。可用 `--receipt` 汇总目标机器另行授权的小任务，原始证据留在当地。

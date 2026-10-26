@@ -15,7 +15,7 @@
 如果双击未能启动，可在终端运行（路径换成解压目录）：
 
 ```sh
-bash "/absolute/path/zcode-supervisor-0.1.2/Install.command"
+bash "/absolute/path/zcode-supervisor-0.1.3/Install.command"
 ```
 
 安装器不需要 sudo，不下载解释器，不复制登录、provider 配置或历史任务，不发模型请求。
@@ -26,7 +26,7 @@ bash "/absolute/path/zcode-supervisor-0.1.2/Install.command"
 只检查、不安装：
 
 ```sh
-bash "/absolute/path/zcode-supervisor-0.1.2/Check.command"
+bash "/absolute/path/zcode-supervisor-0.1.3/Check.command"
 ```
 
 安装完毕，Codex 会为这台机器初始化独立的 `~/zcode-work/.czs/` 并运行 `doctor`。
@@ -64,7 +64,7 @@ ZCode 自己的登录与模型选择留在当地；本基线不保证强制固�
 4. 用生成的实际 run JSON 再汇总一次（替换两个绝对路径）：
 
    ```sh
-   bash "/absolute/path/zcode-supervisor-0.1.2/Validate.command" --receipt "/absolute/local/task/run-1.json"
+   bash "/absolute/path/zcode-supervisor-0.1.3/Validate.command" --receipt "/absolute/local/task/run-1.json"
    ```
 
 把桌面的最新验证 JSON 发回当前 Codex 聊天。报告仅包含环境与本插件状态、任务结果摘要，
@@ -80,7 +80,7 @@ ZCode 自己的登录与模型选择留在当地；本基线不保证强制固�
 工程基线经过冻结 Git 索引测试与边界回放；严格全 actor 模型请求前置预算门仍不支持，子技能实际消费
 与成本未被证明的部分仍记 unknown。实际 Codex 公平成本对照未进行，不能把 GLM 探索结果称为 Codex 收益。
 交付检查不等于功能或科学方法验收，权限 broker 也不是 OS 沙箱。
-插件发行版为 0.1.2，包内已验收执行核心仍为 0.1.0；二者分别显示，执行核心指纹没有因安装器更新改变。
+插件发行版为 0.1.3，包内已验收执行核心仍为 0.1.0；二者分别显示，执行核心指纹没有因安装器更新改变。
 
 这是独立维护的适配器，不是 ZCode 官方插件。插件格式与本地 marketplace 使用
 [OpenAI 官方插件打包文档](https://developers.openai.com/plugins/build/plugins)；

@@ -22,9 +22,11 @@ the required host plugin commands and reports stable check codes and remedies,
 with authentication and unavailable guarantees kept unknown/unsupported.
 Use the detected absolute Node path in `init --node`, including when launched
 from Finder with a different PATH. `diagnostics.py --node-path` returns it locally
-without adding it to a shareable report. Plugin 0.1.2 retains core runtime
+without adding it to a shareable report. Plugin 0.1.3 retains core runtime
 0.1.0 and includes fixed-model packet support (`model` field with explicit
-providerId/modelId, optional reasoningLevel; see `docs/USAGE.md`).
+providerId/modelId, optional reasoningLevel) plus the tri-agent orchestration
+hub (contract-gated MCP control plane, resident workers, per-command
+approvals; see `docs/USAGE.md`).
 
 The generated example is at `<directory>/.czs/work/example/packet.json`:
 

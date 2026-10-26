@@ -16,8 +16,10 @@ agent) drives over MCP. Shape:
   writes to one workspace stay serialized across vendors;
 * **Resident singletons** — one resident ZCode process and one codex
   app-server client serve every delegate for the server lifetime (lazy start
-  on first use, best-effort close at shutdown); app-server delegates
-  serialize behind one lock (P2 conservative);
+  on first use, best-effort close at shutdown); app-server delegates run
+  concurrently on the shared client behind thread-filtered approval
+  subscriptions (2026-10-26 P3; ``appserver_concurrency=1`` restores the P2
+  serial gate);
 * **Credentials stay with each vendor** — the hub never reads or writes
   auth.json, API keys, or any credential file;
 * **MCP exposure is not approval** — ``delegate`` only runs a contract a human
@@ -298,7 +300,13 @@ def health_impl(config, codex_path=None) -> dict:
         **({"health_file_error": resolution["health_file_error"]}
            if "health_file_error" in resolution else {}),
         "routing_note": ROUTING_NOTE,
-        "read_only_p0": True,
+        # Structured per-path write capability (replaces the flat P0
+        # read_only_p0 flag; no external consumer of the old key exists).
+        "write_capability": {
+            "zcode": "cold+resident (contract files + exact commands)",
+            "codex_exec": "read-only only (no approval channel)",
+            "codex_app_server": "write via untrusted per-command approvals",
+        },
     }
 
 
@@ -571,15 +579,18 @@ class ResidentWorkers:
 
     Concurrency: the resident ZCode process isolates sessions itself and
     keeps per-workspace locks, so concurrent ``run_packet`` calls on the
-    shared instance are allowed; ``CodexAppServerClient.run_task``
-    concurrency on one client is unverified, so every app-server delegate is
-    serialized behind one :class:`asyncio.Lock` (P2 conservative; the
-    concurrency semantics are a P3 validation item).
+    shared instance are allowed; app-server delegates run concurrently on the
+    shared :class:`~codex_appserver.CodexAppServerClient` since the
+    2026-10-26 P3 subscriber-isolation work (each ``run_task`` registers
+    thread-filtered request/notification subscriptions and unsubscribes on
+    completion). ``appserver_concurrency`` tunes the delegate gate: ``0``
+    (default) is unlimited concurrency, ``>0`` caps it with a semaphore, and
+    ``1`` restores the P2 serial gate as the rollback path.
     """
 
     def __init__(self, config, evidence_root, *, codex_path=None,
                  resident_factory=None, appserver_factory=None,
-                 appserver_driver_factory=None):
+                 appserver_driver_factory=None, appserver_concurrency=0):
         self.config = config
         self.evidence_root = Path(evidence_root)
         self.codex_path = codex_path
@@ -588,10 +599,32 @@ class ResidentWorkers:
         self.appserver_driver_factory = appserver_driver_factory
         self.resident = None
         self.appserver = None
+        # 2026-10-26 P3: concurrent app-server delegates unlocked after the
+        # main controller's live validation; set appserver_concurrency=1 to
+        # roll back to the P2 serial gate (semaphore(1) below). >1 caps
+        # concurrency. USAGE.md's serial-dispatch wording is pending a
+        # main-controller doc pass.
+        self.appserver_concurrency = max(0, int(appserver_concurrency))
+        self._appserver_semaphore = (
+            asyncio.Semaphore(self.appserver_concurrency)
+            if self.appserver_concurrency else None)
+        # Retained object for attribute compatibility with the P2 layout;
+        # the delegate path no longer acquires it — the semaphore (or no
+        # gate at all) above is the live concurrency policy.
         self.appserver_lock = asyncio.Lock()
         # Serializes lazy creation only (double-checked); run-level
         # concurrency policy is per-worker-kind as documented above.
         self.instance_lock = asyncio.Lock()
+
+    def appserver_gate(self):
+        """Async context manager around one app-server ``run_task``.
+
+        Unlimited when ``appserver_concurrency`` is 0, a semaphore of that
+        size otherwise (1 = the P2 serial rollback gate).
+        """
+        if self._appserver_semaphore is not None:
+            return self._appserver_semaphore
+        return contextlib.nullcontext()
 
     async def resident_instance(self):
         """Start once (lazily), then reuse: the shared ResidentZCode driver."""
@@ -670,6 +703,7 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                         zcode_runner=None, codex_runner=None,
                         resident_factory=None, appserver_factory=None,
                         appserver_driver_factory=None,
+                        appserver_concurrency=0,
                         workers=None) -> dict:
     """Execute one registered contract on its worker; async coroutine.
 
@@ -715,7 +749,8 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             config, evidence_root, codex_path=codex_path,
             resident_factory=resident_factory,
             appserver_factory=appserver_factory,
-            appserver_driver_factory=appserver_driver_factory)
+            appserver_driver_factory=appserver_driver_factory,
+            appserver_concurrency=appserver_concurrency)
     resolution = resolve_worker_health(config, codex_path)
     entry = resolution["workers"].get(worker, {})
     remaining = sorted(
@@ -799,11 +834,13 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                 authority = Authority(packet, packet_path, before)
                 client = await workers.appserver_instance()
                 driver = workers.appserver_driver(client)
-                # P2 conservative serialization: run_task concurrency on one
-                # shared app-server client is unverified (P3 validates), so
-                # app-server delegates queue behind the server-lifetime lock.
-                # The per-workspace advisory lock still applies inside it.
-                async with workers.appserver_lock:
+                # 2026-10-26 P3: delegates run concurrently on the shared
+                # client — thread-filtered subscriptions (codex_appserver)
+                # isolate approvals per task. The gate is a no-op unless the
+                # workers holder was built with appserver_concurrency>0
+                # (1 = P2 serial rollback); docs pending a main-controller
+                # pass. The per-workspace advisory lock still applies inside.
+                async with workers.appserver_gate():
                     with common.workspace_lock(Path(contract["workspace"]),
                                                Path(config.state_dir)):
                         receipt = await _invoke(
@@ -1032,7 +1069,7 @@ def _tools() -> list[dict]:
 def build_server(config, evidence_root: Path, *, codex_path=None,
                  zcode_runner=None, codex_runner=None, codex_home=None,
                  resident_factory=None, appserver_factory=None,
-                 appserver_driver_factory=None):
+                 appserver_driver_factory=None, appserver_concurrency=0):
     """Wire the six hub tools onto one MCP lowlevel server.
 
     ``codex_runner`` / ``zcode_runner`` are injection points for tests; the
@@ -1043,9 +1080,11 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
     delegate; production defaults are
     :class:`zcode_resident.ResidentZCode` and
     :class:`codex_appserver.CodexAppServerClient` /
-    :class:`~codex_appserver.CodexAppServerDriver`); the shared holder is
-    attached as ``server.czs_workers`` so :func:`serve` can close it at
-    shutdown.
+    :class:`~codex_appserver.CodexAppServerDriver`);
+    ``appserver_concurrency`` configures the app-server delegate gate (0 =
+    unlimited, 1 = P2 serial rollback; see :class:`ResidentWorkers`). The
+    shared holder is attached as ``server.czs_workers`` so :func:`serve` can
+    close it at shutdown.
     """
     from mcp.server import Server
     import mcp.types as types
@@ -1054,7 +1093,8 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
     workers = ResidentWorkers(
         config, evidence_root, codex_path=codex_path,
         resident_factory=resident_factory, appserver_factory=appserver_factory,
-        appserver_driver_factory=appserver_driver_factory)
+        appserver_driver_factory=appserver_driver_factory,
+        appserver_concurrency=appserver_concurrency)
 
     def error_result(code: str, detail: str) -> types.CallToolResult:
         """Uniform tool-error surface: is_error result with a JSON body.
