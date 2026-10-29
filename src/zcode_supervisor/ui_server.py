@@ -40,6 +40,7 @@ import stat
 import uuid
 from pathlib import Path
 
+from . import ui_registry
 from .ui_events import HUB_STREAM_ID  # noqa: F401 - protocol documentation
 from .ui_journal import UiJournal, _SubscriptionError
 from .ui_projection import _env_enabled
@@ -354,9 +355,16 @@ class UiEventServer:
     """Owns the secure UDS listener and per-connection read loops."""
 
     def __init__(self, journal: UiJournal, *, socket_path=None,
-                 state_dir=None, heartbeat_s: float = 15.0):
+                 state_dir=None, heartbeat_s: float = 15.0,
+                 register_service: bool = False):
         self.journal = journal
         self.heartbeat_s = float(heartbeat_s)
+        # one-click discovery (ui_registry): only the gated production
+        # path (start_ui_service, i.e. CZS_UI_EVENTS on) turns this on —
+        # direct constructions (bench, tests) never touch ~/.czs
+        self.register_service = bool(register_service)
+        self._registry_entry = None
+        self._registry_task = None
         if socket_path is None:
             if state_dir is None:
                 raise ValueError("socket_path or state_dir is required")
@@ -472,8 +480,53 @@ class UiEventServer:
         except OSError as error:
             await self.close()
             raise UiTransportError(f"socket mode failed: {error}") from error
+        if self.register_service:
+            self._register_service()
+
+    # -- discovery registry (one-click app; entirely best-effort) ---------------
+    def _register_service(self) -> None:
+        """Publish this server in ``~/.czs/ui-registry.json``.
+
+        A registry failure never touches the UI service itself — the
+        socket stays up for explicit-path clients; discovery simply
+        cannot see this instance.
+        """
+        try:
+            self._registry_entry = ui_registry.register(self.socket_path)
+        except (OSError, ValueError):
+            self._registry_entry = None
+            return
+        self._registry_task = asyncio.create_task(self._registry_heartbeat())
+
+    async def _registry_heartbeat(self) -> None:
+        """Re-assert our entry every HEARTBEAT_S (started_at preserved).
+
+        Doubles as self-heal: an entry lost to a concurrent registry
+        write reappears on the next beat.
+        """
+        while True:
+            await asyncio.sleep(ui_registry.HEARTBEAT_S)
+            entry = self._registry_entry
+            if entry is None:
+                return
+            try:
+                self._registry_entry = ui_registry.refresh(entry)
+            except (OSError, ValueError):
+                pass  # best-effort: the next beat retries
+
+    def _unregister_service(self) -> None:
+        if self._registry_entry is not None:
+            with contextlib.suppress(OSError):
+                ui_registry.unregister(self._registry_entry["pid"])
+            self._registry_entry = None
 
     async def close(self) -> None:
+        if self._registry_task is not None:
+            self._registry_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await self._registry_task
+            self._registry_task = None
+        self._unregister_service()
         if self._server is not None:
             self._server.close()
             await self._server.wait_closed()
@@ -514,7 +567,8 @@ async def start_ui_service(*, state_dir, emitter=None, journal=None,
     if journal is None:
         journal = UiJournal(emitter)
     server = UiEventServer(journal, state_dir=state_dir,
-                           heartbeat_s=heartbeat_s)
+                           heartbeat_s=heartbeat_s,
+                           register_service=True)
     try:
         await server.start()
     except UiTransportError:

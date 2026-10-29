@@ -637,13 +637,27 @@ class UiServiceWiringTests(unittest.IsolatedAsyncioTestCase):
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         state = secure_dir(Path(temporary.name))
+        # registry isolation: the enabled service registers into
+        # ~/.czs/ui-registry.json by default — pin it into the temp dir
+        # so this test never touches (or depends on) the real one
+        registry_file = Path(temporary.name) / "ui-registry.json"
         with unittest.mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CZS_UI_EVENTS", None)
+            os.environ["CZS_UI_REGISTRY"] = str(registry_file)
             service = await ui_server.start_ui_service(state_dir=state)
             self.assertIsNone(service)
-        with unittest.mock.patch.dict(os.environ, {"CZS_UI_EVENTS": "1"}):
+            self.assertFalse(registry_file.exists())
+        with unittest.mock.patch.dict(os.environ, {"CZS_UI_EVENTS": "1",
+                                                   "CZS_UI_REGISTRY":
+                                                       str(registry_file)}):
             service = await ui_server.start_ui_service(state_dir=state)
             self.assertIsNotNone(service)
+            # one-click discovery: the gated service registered itself,
+            # and close() removes the entry again (best-effort)
+            from zcode_supervisor import ui_registry
+            live = ui_registry.read_registry(path=registry_file)
+            self.assertEqual([entry["socket"] for entry in live],
+                             [os.path.abspath(service.socket_path)])
             try:
                 self.assertTrue(service.socket_path.exists())
                 # the journal shares the DEFAULT emitter's projection — the
@@ -664,6 +678,8 @@ class UiServiceWiringTests(unittest.IsolatedAsyncioTestCase):
                 await client.close()
             finally:
                 await service.close()
+            self.assertEqual(
+                ui_registry.read_registry(path=registry_file), [])
 
     async def test_service_failure_leaves_ui_unavailable_only(self):
         # a path that cannot ever bind: the service reports None instead of

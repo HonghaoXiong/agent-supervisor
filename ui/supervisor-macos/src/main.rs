@@ -31,6 +31,7 @@
 //! draw-pass completion mark only; without a renderer/compositor
 //! present probe, end-to-end latency stays honestly "unavailable".
 
+pub mod discovery;
 pub mod ipc;
 pub mod model;
 pub mod probe;
@@ -40,17 +41,19 @@ use eframe::egui;
 use std::sync::mpsc::Receiver;
 use std::time::Instant;
 
+use discovery::DiscoveryOutcome;
 use ipc::{Frame, UiClient, CHANNEL_BOUND};
 use model::Reducer;
 use probe::PresentProbe;
 use view::Filter;
 
-/// Where the hub's owner-only socket lives (default P1.1 layout).
-const DEFAULT_SOCKET: &str = ".czs/state/ui-events.sock";
 const VISIBLE_ROWS: usize = 40;
 /// Gap markers rendered per frame (the stored vec is bounded at
 /// `model::MAX_GAP_MARKERS`; the view shows a summary beyond this).
 const VISIBLE_GAP_MARKERS: usize = 8;
+/// Main status line while no hub is discoverable (one-click attach:
+/// keep rescanning instead of showing a raw connect error).
+const WAITING_STATUS: &str = "waiting for a supervisor hub… (auto-attach on)";
 
 /// The eframe application state.
 pub struct SupervisorApp {
@@ -60,7 +63,27 @@ pub struct SupervisorApp {
     pub selected: Option<String>,
     pub status_line: String,
     offset: usize,
-    socket: String,
+    /// Current/last connect target (public: integration tests assert
+    /// which hub a round actually connected to).
+    pub socket: String,
+    /// True when the current reconnect target was pinned by an explicit
+    /// `connect()` call (tests / scripted paths): reconnects retry that
+    /// exact socket instead of re-running discovery.
+    socket_manual: bool,
+    /// Registry-derived label of the CONNECTED hub (project dir name);
+    /// `None` for env / CWD-fallback / manual connections.
+    pub hub_label: Option<String>,
+    /// Live registry entries as of the last discovery round (drives the
+    /// cycle-to-next-hub control; empty unless registry-discovered).
+    pub hub_candidates: Vec<discovery::HubEntry>,
+    /// Hub-cycling target: the socket the next round should prefer.
+    preferred_socket: Option<String>,
+    /// No hub discoverable right now: bounded rescan posture.
+    pub waiting: bool,
+    /// Discovery round injectable for deterministic tests; `None` uses
+    /// the real env → registry → CWD resolution (`discovery::discover`).
+    pub discover_fn:
+        Option<Box<dyn Fn() -> DiscoveryOutcome + Send>>,
     ui_client: Option<UiClient>,
     /// Bounded reconnect schedule: attempt count + earliest next try
     /// (public: the lifecycle tests assert the disconnect→reconnect
@@ -88,9 +111,15 @@ impl Default for SupervisorApp {
             receiver: None,
             filter: Filter::default(),
             selected: None,
-            status_line: "not connected".into(),
+            status_line: WAITING_STATUS.into(),
             offset: 0,
-            socket: DEFAULT_SOCKET.into(),
+            socket: String::new(),
+            socket_manual: false,
+            hub_label: None,
+            hub_candidates: Vec::new(),
+            preferred_socket: None,
+            waiting: true,
+            discover_fn: None,
             ui_client: None,
             reconnect_attempts: 0,
             reconnect_at: None,
@@ -102,11 +131,26 @@ impl Default for SupervisorApp {
 }
 
 impl SupervisorApp {
-    /// Connect + baseline + subscribe (the whole standard startup).
-    /// No task id required anywhere. A hello with `v != 1` is refused
-    /// outright (repair1 #4: version drift may not feed the reducer).
+    /// Connect + baseline + subscribe against an explicitly given
+    /// socket: pins it as the reconnect target (legacy/test entry —
+    /// production startup goes through `reconnect_round` discovery).
     pub fn connect(&mut self, socket_path: &str) -> Result<(), String> {
+        self.connect_source(socket_path, true, None, Vec::new())
+    }
+
+    /// The shared connect path. `manual` pins the socket for retries;
+    /// `hub_label`/`candidates` describe a registry-discovered hub.
+    fn connect_source(
+        &mut self,
+        socket_path: &str,
+        manual: bool,
+        hub_label: Option<String>,
+        candidates: Vec<discovery::HubEntry>,
+    ) -> Result<(), String> {
         self.socket = socket_path.to_string(); // reconnect target
+        self.socket_manual = manual;
+        self.hub_label = hub_label;
+        self.hub_candidates = candidates;
         let (mut client, hello) =
             UiClient::connect(socket_path).map_err(|e| e.0)?;
         self.reducer.note_hello();
@@ -149,7 +193,13 @@ impl SupervisorApp {
         self.receiver = Some(receiver);
         self.ui_client = Some(client);
         self.reducer.mark_live();
-        self.status_line = format!("connected: {} tasks", states.len());
+        self.waiting = false;
+        self.status_line = match &self.hub_label {
+            Some(label) => {
+                format!("connected: {} tasks · hub: {label}", states.len())
+            }
+            None => format!("connected: {} tasks", states.len()),
+        };
         // baseline events (event-page replay) may carry tracked ids
         self.probe.observe(&self.reducer, self.journal_enqueued_ns);
         Ok(())
@@ -202,9 +252,23 @@ impl SupervisorApp {
                 return;
             }
             self.reconnect_at = None;
+            self.reconnect_round(now);
+        }
+    }
+
+    /// One full discovery round + connect attempt: env → registry → CWD
+    /// fallback (re-resolved EVERY round, so a hub that changed project
+    /// or socket is followed automatically). A manual pin (explicit
+    /// `connect`) retries that exact socket instead. With no hub
+    /// anywhere the app enters the bounded waiting rescan.
+    pub fn reconnect_round(&mut self, now: Instant) {
+        if self.socket_manual && !self.socket.is_empty() {
             let socket = self.socket.clone();
-            match self.connect(&socket) {
-                Ok(()) => self.reconnect_attempts = 0,
+            match self.connect_source(&socket, true, None, Vec::new()) {
+                Ok(()) => {
+                    self.reconnect_attempts = 0;
+                    self.waiting = false;
+                }
                 Err(error) => {
                     self.reducer.apply_reset();
                     self.reconnect_attempts += 1;
@@ -219,7 +283,102 @@ impl SupervisorApp {
                     );
                 }
             }
+            return;
         }
+        let target: Option<(String, Option<String>)> =
+            match self.run_discovery() {
+                DiscoveryOutcome::Env(path) => {
+                    self.hub_candidates.clear();
+                    Some((path, None))
+                }
+                DiscoveryOutcome::Registry(live) => {
+                    let index = discovery::choose_index(
+                        &live,
+                        self.preferred_socket.as_deref(),
+                    );
+                    self.preferred_socket = None; // consumed this round
+                    let chosen = live[index].clone();
+                    let label =
+                        discovery::project_name(&chosen.project_root);
+                    self.hub_candidates = live;
+                    Some((chosen.socket, label))
+                }
+                DiscoveryOutcome::Fallback(path) => {
+                    self.hub_candidates.clear();
+                    Some((path, None))
+                }
+                DiscoveryOutcome::None => None,
+            };
+        let Some((socket, label)) = target else {
+            // nothing anywhere: waiting posture, bounded rescan
+            self.waiting = true;
+            self.hub_candidates.clear();
+            self.hub_label = None;
+            self.status_line = WAITING_STATUS.into();
+            self.reconnect_attempts += 1;
+            self.reconnect_at = Some(
+                now + discovery::rescan_backoff(self.reconnect_attempts),
+            );
+            return;
+        };
+        let candidates = std::mem::take(&mut self.hub_candidates);
+        match self.connect_source(
+            &socket,
+            false,
+            label.clone(),
+            candidates,
+        ) {
+            Ok(()) => {
+                self.reconnect_attempts = 0;
+                self.waiting = false;
+            }
+            Err(error) => {
+                // the discovered hub vanished mid-round (or refused):
+                // keep the auto-attach posture and rescan bounded
+                self.reducer.apply_reset();
+                self.waiting = true;
+                self.reconnect_attempts += 1;
+                self.reconnect_at = Some(
+                    now + discovery::rescan_backoff(
+                        self.reconnect_attempts,
+                    ),
+                );
+                self.status_line = format!(
+                    "{WAITING_STATUS} ({error})"
+                );
+            }
+        }
+    }
+
+    /// The injected-or-real discovery round (tests pin deterministic
+    /// outcomes; production reads env / registry / CWD).
+    fn run_discovery(&self) -> DiscoveryOutcome {
+        match &self.discover_fn {
+            Some(injected) => injected(),
+            None => discovery::discover(),
+        }
+    }
+
+    /// Minimal multi-hub switch (no list popup): advance to the next
+    /// live registry entry and reconnect to it immediately. The
+    /// voluntary switch reuses the observed-disconnect bookkeeping so
+    /// the projection goes stale and re-baselines from the new hub.
+    pub fn cycle_hub(&mut self) {
+        if self.hub_candidates.len() < 2 {
+            return;
+        }
+        let next = discovery::next_index(
+            &self.hub_candidates,
+            &self.socket,
+        );
+        self.preferred_socket =
+            Some(self.hub_candidates[next].socket.clone());
+        self.reducer.apply_reset();
+        self.receiver = None;
+        self.ui_client = None; // Drop joins the (already exited) reader
+        self.reconnect_attempts = 0;
+        self.reconnect_at = Some(Instant::now());
+        self.status_line = "switching hub…".into();
     }
 }
 
@@ -253,6 +412,26 @@ impl eframe::App for SupervisorApp {
         egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status_line);
+                // one-click multi-hub: the registry label is a button
+                // while alternatives exist — click cycles to the next
+                // live hub (minimal switch, no list popup)
+                if self.hub_candidates.len() > 1 {
+                    let label = self
+                        .hub_label
+                        .clone()
+                        .unwrap_or_else(|| "?".into());
+                    if ui
+                        .selectable_label(
+                            false,
+                            format!("hub: {label} (click to switch)"),
+                        )
+                        .clicked()
+                    {
+                        self.cycle_hub();
+                    }
+                } else if let Some(label) = &self.hub_label {
+                    ui.label(format!("hub: {label}"));
+                }
                 let banners = view::banners(&self.reducer.projection);
                 if banners.stale {
                     ui.colored_label(egui::Color32::RED, "stale/reconnecting");
@@ -376,8 +555,6 @@ impl eframe::App for SupervisorApp {
 }
 
 fn main() -> eframe::Result<()> {
-    let socket = std::env::var("CZS_UI_SOCKET")
-        .unwrap_or_else(|_| DEFAULT_SOCKET.into());
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0]),
@@ -391,14 +568,11 @@ fn main() -> eframe::Result<()> {
             // probe first: the baseline connect's event replay is
             // observed by `connect` itself
             app.probe = PresentProbe::from_env();
-            app.socket = socket.clone();
-            if let Err(error) = app.connect(&socket) {
-                app.status_line =
-                    view::safe_error("transport_unavailable", &error);
-                app.reducer.apply_reset();
-                app.reconnect_at =
-                    Some(Instant::now() + ipc::reconnect_backoff(1));
-            }
+            // one-click startup: one full discovery round (env →
+            // registry → CWD). Found → connect immediately; nothing
+            // anywhere → the waiting rescan takes over and auto-attaches
+            // when a hub appears (CZS_UI_SOCKET remains a hard override)
+            app.reconnect_round(Instant::now());
             Ok(Box::new(app))
         }),
     )
