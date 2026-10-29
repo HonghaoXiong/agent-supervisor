@@ -8,12 +8,15 @@ import asyncio
 import copy
 import io
 import json
+import time
 from contextlib import redirect_stdout
 from pathlib import Path
 from types import SimpleNamespace
 import tempfile
 import unittest
+from unittest import mock
 
+from zcode_supervisor import protocol
 from zcode_supervisor import zcode_resident as resident_module
 from zcode_supervisor.authority import Authority, inventory
 from zcode_supervisor.zcode_resident import (ResidentError, ResidentZCode,
@@ -60,8 +63,13 @@ class FakeServer:
 
     def emit(self, client, sid, turn, type_, payload):
         self.seq += 1
-        client.events.append({'type': type_, 'sessionId': sid, 'turnId': turn,
-                              'seq': self.seq, 'payload': payload})
+        event = {'type': type_, 'sessionId': sid, 'turnId': turn,
+                 'seq': self.seq, 'payload': payload}
+        router = getattr(client, '_event_router', None)
+        if router is not None:  # P2.2 routed doubles publish instead
+            router.publish(event)
+        else:
+            client.events.append(event)
 
     async def script(self, client, sid, input_id):
         """One dispatched turn: started, optional receipts/tool/permission, completed."""
@@ -473,6 +481,322 @@ class FailureModeTests(ResidentFixture):
         self.assertIn('fixture failure', result['error'])
         self.assertEqual(self.server.stops, ['sess_A'])
         self.assertEqual(self.registry_records()['sess_A']['state'], 'lost')
+
+
+class SharedClientLateResponseTests(ResidentFixture):
+    """P0.2 at the resident level: one REAL ProtocolClient shared by packets.
+
+    A's session/create is sent on the wire, locally times out, and its late
+    response then arrives while packet B is still waiting on the same client:
+    the late frame must be consumed as known-late (no client failure, no
+    replay) and B must still complete. RED on the unchanged tree: the late
+    frame raises Unmatched protocol response and fails B's pending request.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.config.command = lambda: ['fixture-node', 'cli.cjs']
+        self.config.environment = lambda: {'FIXTURE': '1'}
+        self.sent = []
+        self.cursor = 0
+        self.child = mock.Mock()
+        self.child.pid = 4242
+        self.child.returncode = None  # live process double
+        self.child.stdout = asyncio.StreamReader()
+        self.child.stdin = mock.Mock()
+        self.child.stdin.write = lambda data: self.sent.append(json.loads(data.decode()))
+        self.child.stdin.drain = mock.AsyncMock(return_value=None)
+        self.child.wait = mock.AsyncMock(return_value=0)
+
+        def factory(workspace, output, permission, config):
+            return protocol.ProtocolClient(workspace, output, permission, config)
+
+        self.resident = ResidentZCode(self.config, self.root / 'work',
+                                      client_factory=factory)
+        with mock.patch.object(protocol.asyncio, 'create_subprocess_exec',
+                               new=mock.AsyncMock(return_value=self.child)):
+            await self.resident.start()
+
+    async def asyncTearDown(self):
+        await self.resident.stop()
+        await super().asyncTearDown()
+
+    def feed(self, *frames):
+        for frame in frames:
+            self.child.stdout.feed_data((json.dumps(frame) + '\n').encode())
+
+    def respond(self, request_frame, result):
+        self.feed({'id': request_frame['id'], 'result': result})
+
+    async def next_frame(self, timeout_s=5.0):
+        deadline = time.monotonic() + timeout_s
+        while len(self.sent) <= self.cursor:
+            if time.monotonic() > deadline:
+                raise AssertionError(f'no frame arrived beyond {self.cursor}: '
+                                     f'{self.sent}')
+            await asyncio.sleep(0.005)
+        frame = self.sent[self.cursor]
+        self.cursor += 1
+        return frame
+
+    async def test_late_create_response_is_consumed_while_b_still_waits(self):
+        client = self.resident.client
+        wire_path = client.output.with_suffix('.events.jsonl')
+        task_a = asyncio.create_task(self.resident.run_packet(
+            self.packet('pa', self.workspace('wsA')), self.root / 'work' / 'runA.json',
+            timeout_s=0.25))
+        create_a = await self.next_frame()
+        self.assertEqual(create_a['method'], 'session/create')
+        task_b = asyncio.create_task(self.resident.run_packet(
+            self.packet('pb', self.workspace('wsB')), self.root / 'work' / 'runB.json',
+            timeout_s=30))
+        create_b = await self.next_frame()
+        self.assertEqual(create_b['method'], 'session/create')
+        result_a = await task_a  # A times out locally; no session was created
+        self.assertEqual(result_a['outcome'], 'timeout')
+        self.assertNotIn('session_id', result_a)
+        # A's late create response arrives while B is still pending on host-2.
+        self.respond(create_a, {'session': {'sessionId': 'sess_A'}})
+        await asyncio.sleep(0.02)
+        self.assertFalse(client.failure, client.failure)
+        # B completes normally on the same, un-failed client.
+        self.respond(create_b, {'session': {'sessionId': 'sess_B'}})
+        subscribe = await self.next_frame()
+        self.assertEqual(subscribe['method'], 'session/subscribe')
+        self.respond(subscribe, {'eventSeq': 0})
+        send = await self.next_frame()
+        self.assertEqual(send['method'], 'session/send')
+        self.respond(send, {})
+        self.feed({'method': 'session/event', 'params': {
+            'type': 'turn.started', 'sessionId': 'sess_B', 'turnId': 'turn_B1',
+            'seq': 1, 'payload': {'inputId': send['params']['inputId']}}})
+        self.feed({'method': 'session/event', 'params': {
+            'type': 'turn.completed', 'sessionId': 'sess_B', 'turnId': 'turn_B1',
+            'seq': 2, 'payload': {'resultType': 'success'}}})
+        read = await self.next_frame()
+        self.assertEqual(read['method'], 'session/read')
+        self.respond(read, {'session': {'status': 'idle'},
+                            'runtime': {'pendingRequestIds': []}})
+        result_b = await asyncio.wait_for(task_b, 10)
+        self.assertTrue(result_b['delivery_ok'], result_b)
+        self.assertEqual(result_b['session_id'], 'sess_B')
+        self.assertIsNone(client.failure)
+        # No automatic replay: exactly one session/create per packet, and the
+        # late frame is recorded as evidence instead of a resend.
+        creates = [frame for frame in self.sent
+                   if frame.get('method') == 'session/create']
+        self.assertEqual(len(creates), 2)
+        evidence = [json.loads(line) for line in
+                    wire_path.read_text().splitlines() if line.strip()]
+        lates = [line for line in evidence if 'late_response_to' in line]
+        self.assertEqual([line['late_response_to'] for line in lates],
+                         [create_a['id']])
+
+
+class RoutedEventRouterTests(ResidentFixture):
+    """P2.2: CZS_EVENT_ROUTER=incremental on the resident path."""
+
+    def make_routed_resident(self):
+        from zcode_supervisor.protocol import EventRouter
+
+        class RoutedFakeClient(FakeClient):
+            def __init__(self, *args):
+                super().__init__(*args)
+                self._event_router = None
+
+            def subscribe_events(self, session_id, start_seq):
+                if self._event_router is None:
+                    self._event_router = EventRouter(
+                        key_of=lambda e: e.get('sessionId'),
+                        seq_of=lambda e: e.get('seq'))
+                return self._event_router.subscribe(session_id, start_seq)
+
+        def factory(ws, out, permission, config):
+            return RoutedFakeClient(self.server, ws, out, permission, config)
+
+        resident = ResidentZCode(self.config, self.root / 'work',
+                                 client_factory=factory)
+        self.residents.append(resident)
+        return resident
+
+    def setUp(self):
+        super().setUp()
+        self.residents = []
+        self._original_client = None
+
+    async def asyncTearDown(self):
+        for resident in self.residents:
+            await resident.stop()
+        await super().asyncTearDown()
+
+    def _packet(self, name, ws):
+        path = self.root / 'packets' / f'{name}.json'
+        (self.root / 'packets').mkdir(exist_ok=True)
+        path.write_text(json.dumps({'workspace': str(ws), 'prompt': 'work',
+                                    'allowed_files': []}))
+        return path
+
+    async def test_routed_run_delivers_and_releases_retention(self):
+        import os
+        resident = self.make_routed_resident()
+        await resident.start()
+        ws = self.workspace('routed')
+        (ws / 'frozen.txt').write_text('f\n')
+        packet = self._packet('routed', ws)
+        with mock.patch.dict(os.environ,
+                             {'CZS_EVENT_ROUTER': 'incremental'}):
+            result = await resident.run_packet(
+                packet, self.root / 'work' / 'routed.json', timeout_s=8)
+        self.assertTrue(result['delivery_ok'])
+        self.assertEqual(result['outcome'], 'delivered')
+        client = resident.client
+        # the task-owned frames were released after evidence finalization
+        self.assertEqual(client._event_router.metrics(),
+                         {'active_subscriptions': 0, 'retained_frames': 0})
+        # nothing accumulated in the legacy store while routed
+        self.assertEqual(client.events, [])
+
+    async def test_rekey_window_frames_reach_the_routed_consumer(self):
+        """G1 (repair1 E): own-session frames batched INSIDE the
+        session/subscribe response must reach the routed consumer with
+        the same delivered set as legacy — outcome/problems identical."""
+        import os
+
+        outcomes = {}
+        problems = {}
+        delivered = {}
+        from unittest import mock as _mock
+        from zcode_supervisor.protocol import BoundedSubscription
+        original_release = BoundedSubscription.release
+        for mode in ('legacy', 'incremental'):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                for name in ('work', 'state', 'cache', 'packets'):
+                    (root / name).mkdir()
+                server = FakeServer()
+                clients = []
+                from zcode_supervisor.protocol import EventRouter
+
+                class RoutedClient(FakeClient):
+                    # N1 (repair2): FakeClient.request self-handles every
+                    # method — the window must fire HERE, in the same
+                    # scheduling slice that resolves session/subscribe,
+                    # with the ghost frame ABOVE the returned floor.
+                    def __init__(self, *args):
+                        super().__init__(*args)
+                        self._event_router = None
+
+                    def subscribe_events(self, session_id, start_seq):
+                        if self._event_router is None:
+                            self._event_router = EventRouter(
+                                key_of=lambda e: e.get('sessionId'),
+                                seq_of=lambda e: e.get('seq'))
+                        return self._event_router.subscribe(
+                            session_id, start_seq)
+
+                    async def request(self, method, params):
+                        if method == 'session/subscribe':
+                            floor = server.seq
+                            server.emit(self, params['sessionId'],
+                                        'turn_ghost', 'tool.updated',
+                                        {'kind': 'result',
+                                         'toolCallId': 'ghost',
+                                         'result': {'success': True}})
+                            return {'eventSeq': floor}
+                        return await super().request(method, params)
+
+                def factory(ws, out, permission, cfg):
+                    client = RoutedClient(server, ws, out, permission, cfg)
+                    clients.append(client)
+                    return client
+
+                resident = ResidentZCode(
+                    SimpleNamespace(work_root=root / 'work',
+                                    state_dir=root / 'state',
+                                    cache_dir=root / 'cache', notify=False),
+                    root / 'work', client_factory=factory)
+                await resident.start()
+                histories = []
+                released_capture = (lambda sub:
+                                    histories.append(
+                                        [f.get('seq')
+                                         for _s, f in sub.history])
+                                    or original_release(sub))
+                try:
+                    ws = root / 'work' / 'w'
+                    ws.mkdir()
+                    (ws / 'frozen.txt').write_text('f\n')
+                    packet = root / 'packets' / 'w.json'
+                    packet.write_text(json.dumps(
+                        {'workspace': str(ws), 'prompt': 'work',
+                         'allowed_files': []}))
+                    with _mock.patch.dict(
+                            os.environ, {'CZS_EVENT_ROUTER': mode}), \
+                            _mock.patch.object(BoundedSubscription,
+                                               'release', released_capture):
+                        result = await resident.run_packet(
+                            packet, root / 'work' / 'w.json', timeout_s=8)
+                    outcomes[mode] = (result['outcome'],
+                                      result['delivery_ok'])
+                    problems[mode] = result.get('execution_problems')
+                    if mode == 'legacy':
+                        delivered[mode] = [
+                            e.get('seq') for e in clients[0].events
+                            if e.get('seq', 0) > 0]
+                    else:
+                        delivered[mode] = histories[0] if histories else []
+                finally:
+                    await resident.stop()
+        # identical outcome/problems through the window AND identical
+        # delivered sets (legacy store filter vs routed history)
+        self.assertEqual(outcomes['legacy'], outcomes['incremental'])
+        self.assertEqual(problems['legacy'], problems['incremental'])
+        self.assertEqual(sorted(delivered['legacy']),
+                         sorted(delivered['incremental']))
+        # the window really fired: the ghost (seq 1, above the floor of a
+        # fresh session) plus the turn pair and both model receipts —
+        # a silent no-window run would deliver only [2, 3, 4, 5]
+        self.assertEqual(sorted(delivered['legacy']), [1, 2, 3, 4, 5])
+
+
+    async def test_routed_backlog_overflow_fails_the_task_not_a_gap(self):
+        import os
+        from zcode_supervisor import protocol as protocol_module
+
+        class BurstServer(FakeServer):
+            async def script(self, client, sid, input_id):
+                turn = f'turn_{sid}_1'
+                # a synchronous burst: three publishes before the consumer
+                # can drain once, with the bound patched down to one
+                for payload in ({'inputId': input_id},
+                                {'type': 'model_request_started'},
+                                {'type': 'model_request_completed'}):
+                    type_ = ('turn.started' if 'inputId' in payload
+                             else 'session.updated')
+                    self.emit(client, sid, turn, type_, payload)
+                await asyncio.sleep(0.05)
+                self.emit(client, sid, turn, 'turn.completed',
+                          {'resultType': 'success'})
+
+        self.server.__class__ = BurstServer
+        resident = self.make_routed_resident()
+        await resident.start()
+        ws = self.workspace('overflow')
+        (ws / 'frozen.txt').write_text('f\n')
+        packet = self._packet('overflow', ws)
+        with mock.patch.dict(os.environ,
+                             {'CZS_EVENT_ROUTER': 'incremental'}), \
+                mock.patch.object(protocol_module, 'EVENT_ROUTER_BOUND', 1):
+            result = await resident.run_packet(
+                packet, self.root / 'work' / 'overflow.json', timeout_s=8)
+        self.assertFalse(result['delivery_ok'])
+        self.assertIn('event subscription backlog overflowed',
+                      str(result.get('error')))
+        # P0.1 cleanup ran: the session was stopped and marked lost
+        self.assertTrue(self.server.stops)
+        records = self.registry_records()
+        lost = [r for r in records.values() if r.get('state') == 'lost']
+        self.assertTrue(lost)
 
 
 class CliTests(unittest.TestCase):

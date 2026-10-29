@@ -1,0 +1,51 @@
+{
+  "version": "comm-faults-v1",
+  "description": "P0.0 communication fault fixtures: deterministic scenarios the fixture child (tests/fixtures/ui/fake_server.py) can arm via argv --fault/--fault-delay or the bench/set-fault request. Consumed by the P0.1 deadline/cleanup tests; P0.0 pins the modes, verifies arming, and exercises blocked-drain for real (OS pipe backpressure gates the client drain). No model calls, no network.",
+  "scenarios": [
+    {
+      "id": "blocked-drain",
+      "description": "the child stops reading stdin for delay_s: the OS pipe fills and a large client write genuinely blocks inside drain() (verified by the clock-section blocked_drain probe)",
+      "fake_server_fault": {
+        "mode": "block-drain",
+        "delay_s": 2.0
+      }
+    },
+    {
+      "id": "delayed-start",
+      "description": "the first reply after spawn is delayed, modeling slow initialize / session-create startup",
+      "fake_server_fault": {
+        "mode": "delay-first",
+        "delay_s": 5.0
+      }
+    },
+    {
+      "id": "delayed-turn-start",
+      "description": "turn events are delayed after session/send or turn/start while the drain loop polls",
+      "fake_server_fault": {
+        "mode": "delay-turn",
+        "delay_s": 5.0
+      }
+    },
+    {
+      "id": "cancel-mid-poll",
+      "description": "the turn never completes (intermediate events keep streaming); the caller cancels while the event-drain poll loop waits",
+      "fake_server_fault": {
+        "mode": "never-complete"
+      }
+    },
+    {
+      "id": "cancel-after-send",
+      "description": "session/send is accepted but completion is withheld; cancellation lands after dispatch",
+      "fake_server_fault": {
+        "mode": "never-complete"
+      }
+    },
+    {
+      "id": "initialize-no-reply",
+      "description": "initialize is accepted but never answered; proves the caller-side start bound (bench_fake_appserver start_timeout)",
+      "fake_server_fault": {
+        "mode": "silent-initialize"
+      }
+    }
+  ]
+}

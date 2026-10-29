@@ -52,12 +52,14 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import contextlib
 import inspect
 import json
 import os
 import re
 import shutil
+import stat
 import sys
 import time
 import uuid
@@ -68,7 +70,10 @@ from types import SimpleNamespace
 from . import __version__, common, contracts
 from .authority import Authority, inventory
 from .codex_driver import locate_rollout, run_readonly
+from .deadline import CallBudget
 from .session_reader import read_context as read_session_context
+from . import ui_projection
+from . import worker_health
 
 __all__ = [
     "HubError",
@@ -350,6 +355,166 @@ def _append_index(config, entry: dict) -> None:
         os.fsync(stream.fileno())
 
 
+# P2.4: synchronous index/SQLite/disk reads ride a DEDICATED bounded
+# executor (2 workers) behind a UI/read request semaphore (4) — the MCP
+# event loop never blocks on them, and concurrent reads are capped.
+_READ_EXECUTOR_WORKERS = 2
+_READ_CONCURRENCY = 4
+_read_executor: concurrent.futures.ThreadPoolExecutor | None = None
+_read_semaphore_state: tuple[object, asyncio.Semaphore] | None = None
+
+
+def read_executor_pool() -> concurrent.futures.ThreadPoolExecutor:
+    """The process-wide bounded executor for hub read paths (lazy)."""
+    global _read_executor
+    if _read_executor is None:
+        _read_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=_READ_EXECUTOR_WORKERS,
+            thread_name_prefix='czs-hub-read')
+    return _read_executor
+
+
+def shutdown_read_executor(wait: bool = True) -> None:
+    """Close the bounded read executor (idempotent; for tests/shutdown)."""
+    global _read_executor, _read_semaphore_state
+    pool, _read_executor = _read_executor, None
+    _read_semaphore_state = None
+    if pool is not None:
+        pool.shutdown(wait=wait)
+
+
+async def _offload_read(func, *args):
+    """Run one synchronous read on the bounded pool under the semaphore.
+
+    repair1 F-D: the semaphore is PER-RUNNING-LOOP (lazily re-created
+    when a different event loop competes — asyncio primitives bind to
+    their first waiting loop; a process-level one breaks any second
+    loop lifetime, e.g. repeated asyncio.run in one process).
+    Concurrency within one loop stays capped at _READ_CONCURRENCY.
+    """
+    global _read_semaphore_state
+    loop = asyncio.get_running_loop()
+    if _read_semaphore_state is None \
+            or _read_semaphore_state[0] is not loop:
+        _read_semaphore_state = (loop, asyncio.Semaphore(_READ_CONCURRENCY))
+    semaphore = _read_semaphore_state[1]
+    async with semaphore:
+        return await loop.run_in_executor(
+            read_executor_pool(), func, *args)
+
+
+# P2.4-repair1 F-C: the OLD readers used str.splitlines(), which splits
+# on \n \r \r\n \v \f \x1c \x1d \x1e \x85 \u2028 \u2029 — a plain
+# text-mode line iteration only splits on \n/\r/\r\n. These helpers
+# stream the file in bounded chunks through an incremental decoder and
+# split on the FULL splitlines set, so exotic separators keep the old
+# record boundaries (and malformed classifications).
+_LINE_SEPARATORS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
+
+
+def _split_segments(text, _scanned=0):
+    """Split ``text[ _scanned: ]`` on the str.splitlines set — single
+    pass, LINEAR in the NEW bytes only (repair2 R1).
+
+    ``_scanned`` is the prefix length already known separator-free
+    (only a trailing lone ``\r`` can pair into ``\r\n`` across a
+    chunk boundary, so at most one character of history matters);
+    callers must keep that dangling trailing ``\r`` OUT of the scanned
+    prefix (see _scan_new) or it stops acting as a separator.
+    Returns ``(segments, tail_wait)``: complete lines plus the
+    remainder that cannot yet be emitted.
+    """
+    segments = []
+    rest = text
+    start = _scanned
+    while True:
+        cut = None
+        for index in range(start, len(rest)):
+            if rest[index] in _LINE_SEPARATORS:
+                cut = index
+                break
+        if cut is None:
+            break
+        if rest[cut] == "\r":
+            if cut + 1 == len(rest):
+                break  # may become \r\n with the next chunk
+            if rest[cut + 1] == "\n":
+                segments.append(rest[:cut])
+                rest = rest[cut + 2:]
+                start = 0
+                continue
+        segments.append(rest[:cut])
+        rest = rest[cut + 1:]
+        start = 0
+    return segments, rest
+
+
+def _scan_new(buffer, scanned):
+    """Split ``buffer`` continuing from ``scanned`` (see
+    _split_segments); returns (segments, rest, new_scanned)."""
+    segments, rest = _split_segments(buffer, scanned)
+    if segments:
+        return segments, rest, 0
+    # repair3 R3/N6: with no segment emitted, a DANGLING trailing \r
+    # (the "may become \r\n" break) must stay OUT of the scanned
+    # prefix — it still acts as a separator (or pairs into \r\n) once
+    # the next chunk arrives. Folding it into the scanned prefix made
+    # it inert and glued records across the chunk boundary.
+    if rest.endswith("\r"):
+        return segments, rest, len(rest) - 1
+    return segments, rest, len(rest)
+
+
+def _splitlines_streaming(path, chunk_bytes=256 * 1024):
+    """Yield lines of ``path`` split on the str.splitlines separator set.
+
+    Admission mirrors common.read_regular exactly: O_NOFOLLOW open,
+    fstat S_ISREG + st_nlink == 1 (single-link), errors wrapped as
+    ValueError with the SAME message shapes. The fd is closed on every
+    failure path including an os.fdopen raise (repair1 F-B).
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise ValueError(
+            f"Cannot read ordinary file {path}: {error.strerror}") from error
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+            raise ValueError(f"Expected an ordinary single-link file: {path}")
+        import codecs
+        decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
+        # repair2 R1: the pending buffer keeps its already-scanned
+        # prefix length, so each chunk scans ONLY its new bytes (the
+        # quadratic re-scan/concat of the repair1 shape is gone); the
+        # buffer is compacted only when a segment is actually emitted
+        pending = ""
+        scanned = 0
+        while True:
+            chunk = os.read(fd, chunk_bytes)
+            if not chunk:
+                break
+            pending += decoder.decode(chunk)
+            segments, rest, scanned = _scan_new(pending, scanned)
+            if segments:
+                pending = rest
+                yield from segments
+        # EOF: flush the decoder, then emit the remainder (a trailing
+        # separator would leave a final empty segment — drop it; a lone
+        # trailing \r IS a separator for splitlines and was already
+        # flushed by the sentinel split)
+        pending += decoder.decode(b"", True)
+        segments, _tail, _ = _scan_new(pending + "\n", scanned)
+        if segments and segments[-1] == "":
+            segments.pop()
+        yield from segments
+    finally:
+        try:
+            os.close(fd)
+        except OSError:
+            pass
+
+
 def list_sessions_impl(config, worker=None, cursor=0, limit=SESSIONS_PAGE_DEFAULT) -> dict:
     """Page through hub-dispatched tasks (index.jsonl only)."""
     if worker is not None and worker not in ("codex", "zcode", "dsh"):
@@ -360,34 +525,48 @@ def list_sessions_impl(config, worker=None, cursor=0, limit=SESSIONS_PAGE_DEFAUL
             or not 1 <= limit <= SESSIONS_PAGE_MAX:
         raise HubError("invalid-argument",
                        f"limit must be an integer in 1..{SESSIONS_PAGE_MAX}")
-    records: list[dict] = []
+    page: list[dict] = []
+    matched = 0
     malformed = 0
     index_path = _tasks_dir(config) / "index.jsonl"
     if index_path.is_file():
+        # P2.4: line-streamed index read — total/malformed/filter/paging
+        # semantics are IDENTICAL to the former whole-buffer scan; only
+        # the page window is ever held in memory. repair1 F-A/F-C: the
+        # read_regular admission (O_NOFOLLOW + fstat single-link) and
+        # the full str.splitlines separator set are preserved by the
+        # shared helper; errors carry read_regular's exact message
+        # shapes (ValueError text, same as the old code path).
         try:
-            lines = common.read_regular(index_path).decode("utf-8", "replace").splitlines()
-        except (OSError, ValueError) as error:
+            for line in _splitlines_streaming(index_path):
+                if not line.strip():
+                    continue
+                try:
+                    record = json.loads(line)
+                except json.JSONDecodeError:
+                    malformed += 1
+                    continue
+                if not isinstance(record, dict):
+                    malformed += 1
+                    continue
+                if worker is not None and record.get("worker") != worker:
+                    continue
+                # cursor/limit window against the filtered stream
+                if cursor <= matched < cursor + limit:
+                    page.append(record)
+                matched += 1
+        except ValueError as error:
             raise HubError("index-unreadable", str(error)) from error
-        for line in lines:
-            if not line.strip():
-                continue
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                malformed += 1
-                continue
-            if not isinstance(record, dict):
-                malformed += 1
-                continue
-            records.append(record)
-    if worker is not None:
-        records = [r for r in records if r.get("worker") == worker]
-    page = records[cursor:cursor + limit]
-    more = cursor + len(page) < len(records)
+        except OSError as error:
+            raise HubError(
+                "index-unreadable",
+                f"Cannot read ordinary file {index_path}: "
+                f"{error.strerror}") from error
+    more = cursor + len(page) < matched
     return {
         "hub_tool_version": HUB_TOOL_VERSION,
         "sessions": page,
-        "total": len(records),
+        "total": matched,
         "returned": len(page),
         "cursor": cursor,
         "malformed_index_lines": malformed,
@@ -463,12 +642,14 @@ def list_skills_impl(worker, roots=None) -> dict:
 # --------------------------------------------------------------------------
 
 async def default_zcode_runner(config, task_id: str, contract: dict,
-                               timeout_s=None) -> dict:
+                               timeout_s=None, ui_emitter=None) -> dict:
     """Translate the contract into a czs packet and run protocol.execute.
 
     The packet is written under ``work_root/hub-tasks/<task_id>/`` (outside the
     frozen workspace), the run evidence lands next to it, and the summary
-    fields are read back from run.json.
+    fields are read back from run.json. P0.4 round 2: ``ui_emitter`` (the hub
+    passes it only on the production runner) links the cold Authority's
+    approval projection and the child's awaited-exit projection.
     """
     from math import ceil
 
@@ -492,10 +673,17 @@ async def default_zcode_runner(config, task_id: str, contract: dict,
     # quiet=True: protocol.execute's final run-summary print must stay off
     # this process's stdout — under the hub's stdio MCP transport, stdout is
     # the wire (see _invoke for the binding-timing justification).
+    # test doubles may predate the P0.4 parameter; pass it only when the
+    # target accepts it (the production execute always does)
+    try:
+        execute_params = inspect.signature(protocol.execute).parameters
+    except (TypeError, ValueError):
+        execute_params = {}
     await protocol.execute(
         SimpleNamespace(packet=str(packet_path), out=str(out_path),
                         resume=None, timeout=timeout, quiet=True),
-        config)
+        config,
+        **({"ui_emitter": ui_emitter} if "ui_emitter" in execute_params else {}))
     run: dict = {}
     if out_path.is_file():
         try:
@@ -541,6 +729,30 @@ async def _invoke(runner, *args, **kwargs):
         if inspect.iscoroutinefunction(runner):
             return await runner(*args, **kwargs)
         return await asyncio.to_thread(runner, *args, **kwargs)
+
+
+async def _start_appserver_client(client, budget):
+    """Start one app-server client on the delegate's budget (P0.1 spec-I5).
+
+    The production ``CodexAppServerClient.start`` accepts the budget OBJECT,
+    so the lazy initialize and the delegate's run_task share ONE primary
+    window. Injected test doubles without the parameter fall back to the
+    numeric bound and then to their own start — the production path never
+    silently gets a second full budget.
+    """
+    if budget is None:
+        await _invoke(client.start)
+        return
+    try:
+        params = inspect.signature(client.start).parameters
+    except (TypeError, ValueError):
+        params = {}
+    if "budget" in params:
+        await _invoke(client.start, budget=budget)
+    elif "initialize_timeout" in params:
+        await _invoke(client.start, initialize_timeout=budget.wait_s(cap=120))
+    else:
+        await _invoke(client.start)
 
 
 def _field(source, name: str, default=None):
@@ -590,13 +802,18 @@ class ResidentWorkers:
 
     def __init__(self, config, evidence_root, *, codex_path=None,
                  resident_factory=None, appserver_factory=None,
-                 appserver_driver_factory=None, appserver_concurrency=0):
+                 appserver_driver_factory=None, appserver_concurrency=0,
+                 ui_emitter=None):
         self.config = config
         self.evidence_root = Path(evidence_root)
         self.codex_path = codex_path
         self.resident_factory = resident_factory
         self.appserver_factory = appserver_factory
         self.appserver_driver_factory = appserver_driver_factory
+        # P0.4: optional sideband UI emitter — shared-worker process-exit
+        # projections and per-task driver projections; None keeps the
+        # pre-P0.4 behaviour exactly.
+        self.ui_emitter = ui_emitter
         self.resident = None
         self.appserver = None
         # 2026-10-26 P3: concurrent app-server delegates unlocked after the
@@ -615,6 +832,55 @@ class ResidentWorkers:
         # Serializes lazy creation only (double-checked); run-level
         # concurrency policy is per-worker-kind as documented above.
         self.instance_lock = asyncio.Lock()
+        # P0.3: one generation gate per shared worker kind. get_or_start
+        # keeps the single-start invariant under one lock; a dead generation
+        # (evidence-based health, see settle_*) is invalidated so the NEXT
+        # delegate starts a fresh one — never mid-task, never replayed.
+        self._resident_gate = worker_health.WorkerGeneration(
+            factory=self._new_resident)
+        self._appserver_gate = worker_health.WorkerGeneration(
+            factory=self._new_appserver, starter=self._start_appserver)
+
+    def _new_resident(self):
+        if self.resident_factory is not None:
+            return self.resident_factory()
+        from .zcode_resident import ResidentZCode
+        if self.ui_emitter is not None:
+            return ResidentZCode(self.config, self.evidence_root,
+                                 ui_emitter=self.ui_emitter)
+        return ResidentZCode(self.config, self.evidence_root)
+
+    def _new_appserver(self):
+        if self.appserver_factory is not None:
+            return self.appserver_factory()
+        from .codex_appserver import CodexAppServerClient
+        # codex_path may be unset here while the exec path resolves
+        # discovery lazily; resolve it the same way instead of spawning a
+        # literal None (live 2026-10-26: FileNotFoundError 'None', then
+        # FileExistsError on the retried 'x'-mode evidence files).
+        resolved = self.codex_path
+        if not resolved:
+            fallback = _fallback_codex(None)
+            resolved = fallback.get("path") if isinstance(fallback, dict) else None
+        if not resolved:
+            raise HubError(
+                "worker-unavailable",
+                "codex app-server dispatch needs a codex binary: "
+                "pass codex_path or install Codex")
+        # one fresh evidence dir per construction attempt so a failed start
+        # never poisons the retry with FileExists
+        self._appserver_attempts = getattr(self, "_appserver_attempts", 0) + 1
+        subdir = ("appserver" if self._appserver_attempts == 1
+                  else f"appserver-{self._appserver_attempts}")
+        if self.ui_emitter is not None:
+            return CodexAppServerClient(
+                resolved, self.evidence_root / subdir,
+                exit_event_sink=ui_projection.make_exit_sink(
+                    self.ui_emitter, "shared-app-server", "codex"))
+        return CodexAppServerClient(resolved, self.evidence_root / subdir)
+
+    async def _start_appserver(self, instance, budget=None):
+        await _start_appserver_client(instance, budget)
 
     def appserver_gate(self):
         """Async context manager around one app-server ``run_task``.
@@ -628,61 +894,69 @@ class ResidentWorkers:
 
     async def resident_instance(self):
         """Start once (lazily), then reuse: the shared ResidentZCode driver."""
-        if self.resident is None:
-            async with self.instance_lock:
-                if self.resident is None:
-                    if self.resident_factory is not None:
-                        instance = self.resident_factory()
-                    else:
-                        from .zcode_resident import ResidentZCode
-                        instance = ResidentZCode(self.config, self.evidence_root)
-                    await _invoke(instance.start)
-                    self.resident = instance
-        return self.resident
+        return (await self.resident_generation())['instance']
 
-    async def appserver_instance(self):
+    async def resident_generation(self):
+        """``{'instance', 'generation'}`` for the P0.3 post-delegate gate."""
+        current = await self._resident_gate.get_or_start()
+        self.resident = current['instance']  # P2 layout compat
+        return current
+
+    async def appserver_instance(self, budget=None):
         """Start once (lazily), then reuse: the shared app-server client.
 
         The client keeps its own evidence tree under ``evidence_root/appserver``
         (frames/stderr for the whole server lifetime); per-task packets and
         receipt copies land under ``evidence_root/tasks/<task_id>/``.
-        """
-        if self.appserver is None:
-            async with self.instance_lock:
-                if self.appserver is None:
-                    if self.appserver_factory is not None:
-                        client = self.appserver_factory()
-                    else:
-                        from .codex_appserver import CodexAppServerClient
-                        # codex_path may be unset here while the exec path
-                        # resolves discovery lazily; resolve it the same way
-                        # instead of spawning a literal None (live 2026-10-26:
-                        # FileNotFoundError 'None', then FileExistsError on
-                        # the retried 'x'-mode evidence files).
-                        resolved = self.codex_path
-                        if not resolved:
-                            fallback = _fallback_codex(None)
-                            resolved = fallback.get("path") if isinstance(fallback, dict) else None
-                        if not resolved:
-                            raise HubError(
-                                "worker-unavailable",
-                                "codex app-server dispatch needs a codex binary: "
-                                "pass codex_path or install Codex")
-                        # one fresh evidence dir per construction attempt so a
-                        # failed start never poisons the retry with FileExists
-                        self._appserver_attempts = getattr(self, "_appserver_attempts", 0) + 1
-                        subdir = ("appserver" if self._appserver_attempts == 1
-                                  else f"appserver-{self._appserver_attempts}")
-                        client = CodexAppServerClient(
-                            resolved, self.evidence_root / subdir)
-                    await _invoke(client.start)
-                    self.appserver = client
-        return self.appserver
 
-    def appserver_driver(self, client):
+        P0.1 (review spec-I5): the FIRST delegate's :class:`CallBudget`
+        bounds the lazy initialize — the SAME object that delegate's
+        run_task runs on. P0.3: the lazy start lives inside the generation
+        gate, so a dead generation is replaced on the NEXT delegate while
+        live generations keep the single-start invariant.
+        """
+        return (await self.appserver_generation(budget=budget))['instance']
+
+    async def appserver_generation(self, budget=None):
+        """``{'instance', 'generation'}`` for the P0.3 post-delegate gate."""
+        current = await self._appserver_gate.get_or_start(budget=budget)
+        self.appserver = current['instance']  # P2 layout compat
+        return current
+
+    async def settle_resident(self, info):
+        """P0.3 health gate after one resident delegate (see _settle)."""
+        return await self._settle(self._resident_gate, info)
+
+    async def settle_appserver(self, info):
+        """P0.3 health gate after one app-server delegate (see _settle)."""
+        return await self._settle(self._appserver_gate, info)
+
+    @staticmethod
+    async def _settle(gate, info):
+        """Evidence-check the instance THIS delegate used.
+
+        An unhealthy shared worker (client failure, ended reader, or a real
+        observed returncode — never a merely finished task) is invalidated
+        now with a bounded old-generation close, so the NEXT delegate starts
+        a fresh generation. The current task's outcome is never replayed or
+        rewritten; a stale settle from an already-replaced generation is a
+        no-op inside ``WorkerGeneration.invalidate``.
+        """
+        health = worker_health.instance_health(info['instance'])
+        if not health['healthy']:
+            await gate.invalidate(info['generation'], health)
+        return health
+
+    def appserver_driver(self, client, task_id=None):
+        """Build one app-server driver (P0.4: project onto ``task_id``'s
+        stream when a UI emitter is configured; injected factories and the
+        no-emitter path keep the exact pre-P0.4 shape)."""
         if self.appserver_driver_factory is not None:
             return self.appserver_driver_factory(client)
         from .codex_appserver import CodexAppServerDriver
+        if self.ui_emitter is not None and task_id is not None:
+            return CodexAppServerDriver(client, ui_emitter=self.ui_emitter,
+                                        task_id=task_id)
         return CodexAppServerDriver(client)
 
     async def close(self):
@@ -704,7 +978,8 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                         resident_factory=None, appserver_factory=None,
                         appserver_driver_factory=None,
                         appserver_concurrency=0,
-                        workers=None) -> dict:
+                        workers=None,
+                        ui_emitter=None, ui_initiator_resolver=None) -> dict:
     """Execute one registered contract on its worker; async coroutine.
 
     Dispatch follows the contract's ``(worker, mode)`` pair: zcode ``cold``
@@ -744,13 +1019,23 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
 
     worker = contract["worker"]
     mode = contract.get("mode") or ("cold" if worker == "zcode" else "exec")
+    # P0.4 sideband UI projection (never part of the delegate result): the
+    # default emitter is env-gated and OFF by default (rollback switch
+    # CZS_UI_EVENTS=0); the default initiator resolver has no trusted
+    # registry, so initiator identity stays unverified in v1 production.
+    emitter = ui_emitter if ui_emitter is not None \
+        else ui_projection.default_emitter()
+    initiator_resolver = ui_initiator_resolver \
+        if ui_initiator_resolver is not None \
+        else ui_projection.default_initiator_resolver()
     if workers is None:
         workers = ResidentWorkers(
             config, evidence_root, codex_path=codex_path,
             resident_factory=resident_factory,
             appserver_factory=appserver_factory,
             appserver_driver_factory=appserver_driver_factory,
-            appserver_concurrency=appserver_concurrency)
+            appserver_concurrency=appserver_concurrency,
+            ui_emitter=emitter)
     resolution = resolve_worker_health(config, codex_path)
     entry = resolution["workers"].get(worker, {})
     remaining = sorted(
@@ -805,18 +1090,84 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         "created": _now(),
     }
     _write_task_record(_task_record_path(config, task_id), record)
+    # P0.4 sideband: the running record is readable — project task.accepted
+    # and only then the hub-stream announcement referencing it (failures are
+    # recorded inside the emitter and never reach the delegate result).
+    ui_projection.project_task_accepted(
+        emitter, initiator_resolver, task_id=task_id, worker=worker,
+        mode=mode, contract_id=contract["contract_id"],
+        contract_digest=digest, created_at=record["created"],
+        initiator=initiator)
 
     error_text: str | None = None
+    error_code: str | None = None  # exception TYPE name (trusted enumeration)
     locator: dict | None = None
     result_payload: dict = {}
     outcome = "runner-error"
     status = "failed"
+    # P0.3: which shared generation this delegate ran on (for the post-run
+    # health gate); None until the delegate actually obtained one.
+    used: tuple[str, dict] | None = None
+
+    async def _settle_shared():
+        """P0.3 review I2: cancellation-safe post-run health gate.
+
+        Runs on normal completion, runner errors AND cancellation, so a dead
+        generation is never left cached. A settle failure is suppressed and
+        can never mask the first result or a pending cancellation; a cancel
+        absorbed by the bounded retirement close is re-raised by
+        WorkerGeneration.invalidate and passes through untouched
+        (CancelledError is a BaseException, not caught by suppress).
+        """
+        if used is not None:
+            with contextlib.suppress(Exception):
+                await (workers.settle_appserver(used[1])
+                       if used[0] == "appserver"
+                       else workers.settle_resident(used[1]))
+
+    def _write_records():
+        """I1/I2: the task records survive every path — normal, runner-error
+        and cancellation — and are never rewritten into a success return."""
+        duration = round(time.monotonic() - started, 3)
+        record.update({
+            "status": status,
+            "outcome": outcome,
+            "session_locator": locator,
+            "evidence_dir": str(evidence_dir),
+            "duration_s": duration,
+            "updated": _now(),
+            **({"error": error_text} if error_text else {}),
+            "result": result_payload,
+        })
+        _write_task_record(_task_record_path(config, task_id), record)
+        _append_index(config, {
+            "ts": _now(),
+            "task_id": task_id,
+            "worker": worker,
+            "status": status,
+            "outcome": outcome,
+            "contract_id": contract["contract_id"],
+        })
+        # P0.4 sideband: terminal records written — project task.completed
+        # (safe fields only; the result payload stays in the records).
+        ui_projection.project_task_completed(
+            emitter, task_id=task_id, worker=worker, mode=mode,
+            status=status, outcome=outcome,
+            delivery_ok=result_payload.get("delivery_ok"),
+            duration_ms=round((time.monotonic() - started) * 1000, 3),
+            error_code=error_code, session_locator=locator)
+
     try:
         if worker == "codex":
             model = contract.get("model")
             model_name = model.get("model") if isinstance(model, dict) else None
             common.ensure_directory(evidence_dir)
             if mode == "app-server":
+                # P0.1 review spec-I5: ONE CallBudget for the whole delegate —
+                # the lazy app-server start (first delegate only) and this
+                # delegate's run_task share the same primary window; the
+                # synchronous preflight/inventory work here consumes it too.
+                delegate_budget = CallBudget(contract["max_timeout_ms"] / 1000)
                 # Real contract Authority against a frozen pre-run inventory:
                 # every approval the bridge relays is decided by this packet,
                 # never by the model's own claims.
@@ -831,25 +1182,44 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                 packet_path = evidence_dir / "packet.json"
                 common.write_json(packet_path, packet)
                 before = inventory(Path(contract["workspace"]))
+                # P0.4 round 2: codex approval events project at the
+                # ApprovalBridge (the APPLIED post-worker_response decision,
+                # with the requested variant); the Authority itself stays
+                # unwired here so nothing is emitted twice.
                 authority = Authority(packet, packet_path, before)
-                client = await workers.appserver_instance()
-                driver = workers.appserver_driver(client)
+                generation = await workers.appserver_generation(budget=delegate_budget)
+                used = ("appserver", generation)
+                client = generation["instance"]
+                driver = workers.appserver_driver(client, task_id)
                 # 2026-10-26 P3: delegates run concurrently on the shared
                 # client — thread-filtered subscriptions (codex_appserver)
                 # isolate approvals per task. The gate is a no-op unless the
                 # workers holder was built with appserver_concurrency>0
                 # (1 = P2 serial rollback); docs pending a main-controller
                 # pass. The per-workspace advisory lock still applies inside.
+                run_kwargs = {
+                    "model": model_name,
+                    "sandbox": contract.get("sandbox") or "read-only",
+                    "approval_policy": "untrusted",
+                    "timeout_s": contract["max_timeout_ms"] / 1000,
+                }
+                try:
+                    accepts_budget = "budget" in inspect.signature(
+                        driver.run_task).parameters
+                except (TypeError, ValueError):
+                    accepts_budget = False
+                if accepts_budget:
+                    # production drivers: the SAME budget object the lazy
+                    # start used (injected doubles without the parameter keep
+                    # their own timeout handling)
+                    run_kwargs["budget"] = delegate_budget
                 async with workers.appserver_gate():
                     with common.workspace_lock(Path(contract["workspace"]),
                                                Path(config.state_dir)):
                         receipt = await _invoke(
                             driver.run_task, authority,
                             Path(contract["workspace"]), contract["prompt"],
-                            model=model_name,
-                            sandbox=contract.get("sandbox") or "read-only",
-                            approval_policy="untrusted",
-                            timeout_s=contract["max_timeout_ms"] / 1000)
+                            **run_kwargs)
                 receipt = receipt if isinstance(receipt, dict) else {}
                 if receipt:
                     # best-effort per-task copy; the task outcome stands
@@ -873,6 +1243,19 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             else:
                 # Same per-workspace advisory lock as the czs executor: one
                 # workspace is never driven by two vendors at once.
+                exec_kwargs = {}
+                if emitter.enabled:
+                    try:
+                        runner_params = inspect.signature(
+                            codex_runner).parameters
+                    except (TypeError, ValueError):
+                        runner_params = {}
+                    if "exit_event_sink" in runner_params:
+                        # P0.4 round 2: cold child exit projection (the
+                        # driver observes only a real awaited wait)
+                        exec_kwargs["exit_event_sink"] = \
+                            ui_projection.make_exit_sink(
+                                emitter, "cold", "codex")
                 with common.workspace_lock(Path(contract["workspace"]),
                                            Path(config.state_dir)):
                     receipt = await _invoke(
@@ -880,7 +1263,7 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                         Path(contract["workspace"]), contract["prompt"],
                         contract["output_schema"], evidence_dir,
                         timeout_s=contract["max_timeout_ms"] / 1000,
-                        model=model_name)
+                        model=model_name, **exec_kwargs)
                 outcome = str(_field(receipt, "outcome", "failed"))
                 thread_id = _field(receipt, "thread_id")
                 locator = None
@@ -907,7 +1290,9 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             packet_dir = evidence_dir
             common.write_json(packet_dir / "packet.json", _zcode_packet(contract))
             timeout_s = max(1, ceil(contract["max_timeout_ms"] / 1000))
-            resident = await workers.resident_instance()
+            generation = await workers.resident_generation()
+            used = ("resident", generation)
+            resident = generation["instance"]
             run = await _invoke(resident.run_packet, packet_dir / "packet.json",
                                 task_dir / "run.json", timeout_s=timeout_s)
             run = run if isinstance(run, dict) else {}
@@ -931,7 +1316,13 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             from math import ceil
 
             timeout_s = max(1, ceil(contract["max_timeout_ms"] / 1000))
-            run = await _invoke(zcode_runner, config, task_id, contract, timeout_s)
+            cold_kwargs = {}
+            if zcode_runner is default_zcode_runner and emitter.enabled:
+                # production cold path only: injected test runners keep
+                # their exact pre-P0.4 call shape
+                cold_kwargs["ui_emitter"] = emitter
+            run = await _invoke(zcode_runner, config, task_id, contract,
+                                timeout_s, **cold_kwargs)
             run = run if isinstance(run, dict) else {}
             outcome = (run.get("outcome")
                        if isinstance(run.get("outcome"), str) and run.get("outcome")
@@ -954,29 +1345,28 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             status = "completed"
     except Exception as error:  # noqa: BLE001 - a runner crash is a task outcome
         error_text = f"{type(error).__name__}: {error}"[:500]
+        error_code = type(error).__name__
         outcome = "runner-error"
         status = "failed"
-
-    duration = round(time.monotonic() - started, 3)
-    record.update({
-        "status": status,
-        "outcome": outcome,
-        "session_locator": locator,
-        "evidence_dir": str(evidence_dir),
-        "duration_s": duration,
-        "updated": _now(),
-        **({"error": error_text} if error_text else {}),
-        "result": result_payload,
-    })
-    _write_task_record(_task_record_path(config, task_id), record)
-    _append_index(config, {
-        "ts": _now(),
-        "task_id": task_id,
-        "worker": worker,
-        "status": status,
-        "outcome": outcome,
-        "contract_id": contract["contract_id"],
-    })
+    except asyncio.CancelledError:
+        # P0.3 review I2: an outer cancel during the run. The shared
+        # generation still settles and the task records are still written
+        # (the finally below) — the evidence of what already happened is
+        # preserved — but the cancellation itself always propagates; a
+        # cancelled delegate never returns a result.
+        error_text = error_text or "delegate cancelled"
+        error_code = error_code or "CancelledError"
+        outcome = "runner-error"
+        status = "failed"
+        raise
+    finally:
+        # I2: settle first (cancellation-safe, never masking the first
+        # result), then the records — the records survive even when settle
+        # re-raises a cancel that arrived during the bounded close (I1).
+        try:
+            await _settle_shared()
+        finally:
+            _write_records()
     result = {
         "hub_tool_version": HUB_TOOL_VERSION,
         "task_id": task_id,
@@ -984,7 +1374,7 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         "outcome": outcome,
         "session_locator": locator,
         "evidence_dir": str(evidence_dir),
-        "duration_s": duration,
+        "duration_s": round(time.monotonic() - started, 3),
         **result_payload,
     }
     if error_text:
@@ -1094,7 +1484,8 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
         config, evidence_root, codex_path=codex_path,
         resident_factory=resident_factory, appserver_factory=appserver_factory,
         appserver_driver_factory=appserver_driver_factory,
-        appserver_concurrency=appserver_concurrency)
+        appserver_concurrency=appserver_concurrency,
+        ui_emitter=ui_projection.default_emitter())
 
     def error_result(code: str, detail: str) -> types.CallToolResult:
         """Uniform tool-error surface: is_error result with a JSON body.
@@ -1126,14 +1517,18 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
             elif name == "list_workers":
                 value = list_workers_impl(config, codex_path)
             elif name == "list_sessions":
-                value = list_sessions_impl(
+                # P2.4: bounded offload — never blocks the MCP loop
+                value = await _offload_read(
+                    list_sessions_impl,
                     config, arguments.get("worker"),
                     arguments.get("cursor", 0),
                     arguments.get("limit", SESSIONS_PAGE_DEFAULT))
             elif name == "read_context":
-                value = read_context_impl(
+                value = await _offload_read(
+                    read_context_impl,
                     config, arguments.get("task_id"),
-                    arguments.get("offset", 0), arguments.get("max_items", 30))
+                    arguments.get("offset", 0),
+                    arguments.get("max_items", 30))
             elif name == "list_skills":
                 value = list_skills_impl(arguments.get("worker"))
             elif name == "delegate":
@@ -1168,6 +1563,17 @@ async def serve(config, evidence_root: Path, **injectables) -> None:
 
     server = build_server(config, Path(evidence_root), **injectables)
     workers = getattr(server, "czs_workers", None)
+    # P1.1: the read-only UI event surface — created ONLY when CZS_UI_EVENTS
+    # is explicitly enabled. It attaches to the SAME default projection
+    # emitter (no second task state) and any failure leaves the UI simply
+    # unavailable: the control plane, approvals and evidence are untouched.
+    ui_server = None
+    try:
+        from .ui_server import start_ui_service
+        ui_server = await start_ui_service(
+            state_dir=Path(config.state_dir))
+    except Exception:  # noqa: BLE001 - UI availability never blocks the hub
+        ui_server = None
     try:
         async with stdio_server() as (read_stream, write_stream):
             await server.run(read_stream, write_stream,
@@ -1175,6 +1581,9 @@ async def serve(config, evidence_root: Path, **injectables) -> None:
     finally:
         # Best-effort close of the resident singletons (never started, or
         # already dead, are both fine).
+        if ui_server is not None:
+            with contextlib.suppress(Exception):
+                await ui_server.close()
         if workers is not None:
             await workers.close()
 

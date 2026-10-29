@@ -118,25 +118,32 @@ class SchemaTests(unittest.TestCase):
         self.assertEqual(answer["pluginAgentModelSelectionOverrides"], {})
 
 
+def build_authority(owner, orch=None, tmp=None):
+    """Build an orchestrated Authority whose tmp cleanup is owned by the
+    RUNNING test (registering cleanup on a throwaway TestCase instance
+    leaked the TemporaryDirectory)."""
+    import tempfile
+    tmp = tmp or tempfile.TemporaryDirectory()
+    workspace = Path(tmp.name) / "workspace"
+    workspace.mkdir()
+    packet_path = Path(tmp.name) / "packet.json"
+    full = packet(O.validate_orchestration(orch) if orch else None)
+    full["workspace"] = str(workspace)
+    packet_path.write_text(__import__("json").dumps(full))
+    owner.addCleanup(tmp.cleanup)
+    authority = Authority(full, packet_path, {"OUT.md": "hash0"})
+    authority.session_id = "sess_parent"
+    authority.turn_id = "turn_main"
+    if authority.orchestration:
+        authority.note_turn("turn_main")
+    return authority
+
+
 class OrchestrationAuthorityTests(unittest.TestCase):
     """Child-origin permission decisions on top of the accepted Authority."""
 
     def make(self, orch=None, tmp=None):
-        import tempfile
-        tmp = tmp or tempfile.TemporaryDirectory()
-        workspace = Path(tmp.name) / "workspace"
-        workspace.mkdir()
-        packet_path = Path(tmp.name) / "packet.json"
-        full = packet(O.validate_orchestration(orch) if orch else None)
-        full["workspace"] = str(workspace)
-        packet_path.write_text(__import__("json").dumps(full))
-        self.addCleanup(tmp.cleanup)
-        authority = Authority(full, packet_path, {"OUT.md": "hash0"})
-        authority.session_id = "sess_parent"
-        authority.turn_id = "turn_main"
-        if authority.orchestration:
-            authority.note_turn("turn_main")
-        return authority
+        return build_authority(self, orch=orch, tmp=tmp)
 
     _seq = 0
 
@@ -333,7 +340,7 @@ class OrchestrationEvidenceAdmissionTests(unittest.TestCase):
     def authority_with_child(self):
         import json as jsonlib
         import tempfile
-        authority = OrchestrationAuthorityTests().make({**VALID_AGENTS, **VALID_WORKFLOW})
+        authority = build_authority(self, {**VALID_AGENTS, **VALID_WORKFLOW})
         authority.note_turn("turn_main")
         authority.note_event({"type": "subagent_spawned", "payload": {
             "agentId": "agent_a", "childSessionId": "sess_child_a",
@@ -464,7 +471,7 @@ class BaselineAndChildGuardTests(unittest.TestCase):
         self.assertTrue(any("reports failure or is malformed" in p for p in problems))
 
     def test_child_request_with_wrong_parent_session_denied_and_stopped_child_denied(self):
-        authority = OrchestrationAuthorityTests().make({**VALID_AGENTS})
+        authority = build_authority(self, {**VALID_AGENTS})
         authority.note_event({"type": "subagent_spawned", "payload": {
             "agentId": "a", "childSessionId": "sess_child_a", "parentToolCallId": "tc",
             "subagentType": "audit-reader"}})

@@ -124,7 +124,14 @@ def _message_entry(row, parts) -> dict:
             value = data.get(key)
             if isinstance(value, str):
                 entry[key] = value
-    texts: list[str] = []
+    # P2.4: the concatenated text is accumulated with a HARD ceiling of
+    # TEXT_LIMIT+1 characters (anything beyond only sets the seen-extra
+    # flag) — the output is byte-identical to the former join-then-
+    # truncate, but a session with huge parts no longer buffers them.
+    buffer: list[str] = []
+    buffered = 0
+    seen_extra = False
+    had_text = False
     counts: Counter = Counter()
     for part in parts:
         try:
@@ -136,12 +143,23 @@ def _message_entry(row, parts) -> dict:
         if (isinstance(part_data, dict) and isinstance(part_type, str)
                 and part_type in TEXT_PART_TYPES
                 and isinstance(part_data.get("text"), str)):
-            texts.append(part_data["text"])
+            had_text = True
+            if seen_extra:
+                continue
+            text = part_data["text"]
+            room = (TEXT_LIMIT + 1) - buffered
+            if len(text) > room:
+                buffer.append(text[:max(room, 0)])
+                buffered += max(room, 0)
+                seen_extra = True
+            else:
+                buffer.append(text)
+                buffered += len(text)
     entry["part_types"] = dict(counts)
-    if texts:
-        full_text = "".join(texts)
+    if had_text:  # matches the old `if texts:` even for empty strings
+        full_text = "".join(buffer)
         entry["text"] = full_text[:TEXT_LIMIT]
-        entry["text_truncated"] = len(full_text) > TEXT_LIMIT
+        entry["text_truncated"] = len(full_text) > TEXT_LIMIT or seen_extra
     return entry
 
 

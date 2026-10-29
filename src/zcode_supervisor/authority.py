@@ -7,6 +7,7 @@ drivers — the ZCode app-server today, Codex approval callbacks in P1 — share
 one policy core. protocol.py re-exports every moved name; new code must
 import from this module, not protocol.
 """
+import contextlib
 import hashlib
 import math
 import re
@@ -14,7 +15,7 @@ import stat
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from .common import read_regular
+from .common import read_regular, sha256_regular
 
 
 def inventory(workspace):
@@ -34,7 +35,7 @@ def inventory(workspace):
         if total > 256 * 1024**2 or len(result) >= 5000:
             raise ValueError('Input exceeds 256 MiB / 5000 files')
         result[path.relative_to(workspace).as_posix()] = {
-            'sha256': hashlib.sha256(read_regular(path)).hexdigest(),
+            'sha256': sha256_regular(path),
             'mode': stat.S_IMODE(info.st_mode)}
     return result
 
@@ -69,13 +70,19 @@ def runtime_owned(name):
 
 class Authority:
     """One-turn authority loaded from a supervisor-owned immutable packet."""
-    def __init__(self, packet, packet_path, before):
+    def __init__(self, packet, packet_path, before, ui_emit=None):
         self.packet = packet
         self.packet_path = packet_path
-        self.packet_hash = hashlib.sha256(read_regular(packet_path)).hexdigest()
+        self.packet_hash = sha256_regular(packet_path)
         self.workspace = Path(packet['workspace']).resolve()
         self.before = before
         self.allowed = set(packet['allowed_files'])
+        # P0.4 read-only decision projection hook (sideband): called at the
+        # decision point with a minimal safe record (ids, bindings, decision)
+        # — never with tool input or reason text. The callable must never
+        # raise (ui_projection.authority_hook guarantees it); a None hook (the
+        # default, e.g. the frozen cold protocol path) changes nothing.
+        self.ui_emit = ui_emit
         self.session_id = None
         self.turn_id = None
         self.seen = set()
@@ -112,6 +119,8 @@ class Authority:
         # replays (subscription callback AND the event-drain loop both feed
         # note_event) never sample a second time to adopt later bytes.
         self.launch_results_observed = set()
+        # P2.1 one-shot boundary-scan hand-over slot (see provide_scan)
+        self._handed_scan = None
 
     def note_turn(self, turn_id):
         """Register a parent-session turn as authorized (orchestration only)."""
@@ -181,7 +190,7 @@ class Authority:
                         entry = self.workspace / '.zcode' / 'workflow-runs' / f'{run_id}.mjs'
                         if entry.is_file() and not entry.is_symlink():
                             self.runtime_entry_bytes[run_id] = (
-                                hashlib.sha256(read_regular(entry)).hexdigest())
+                                sha256_regular(entry))
         if event.get('type') == 'tool.updated' and payload.get('kind') == 'scheduled' \
                 and payload.get('toolName') == 'Agent':
             dispatch_id = payload.get('toolCallId')
@@ -202,10 +211,36 @@ class Authority:
                 status = payload.get('status')
                 self.children[child]['status'] = status if isinstance(status, str) else 'ended-unknown'
 
+    def provide_scan(self, current):
+        """Hand a JUST-awaited boundary inventory to the next
+        [`check_frozen`](Self.check_frozen) call (P2.1).
+
+        The async run paths compute the workspace scan on the bounded
+        boundary-scan executor and hand it over immediately before the
+        (synchronous) check — no await sits between hand-over and
+        consumption, so no other code path can pick it up. The hand-over
+        is one-shot: consumed by the very next check_frozen, or dropped
+        if that call fails its packet re-hash. ``decide`` never hands
+        anything over and always gets a fresh synchronous scan.
+        """
+        self._handed_scan = current
+
     def check_frozen(self):
-        if hashlib.sha256(read_regular(self.packet_path)).hexdigest() != self.packet_hash:
+        """Verify packet, workspace inputs and trusted executables.
+
+        Signature unchanged (external instrumentation subclasses this
+        exact surface). When the async run path handed over a scan, its
+        result is this check's own inventory — merely computed off-loop;
+        the packet/trusted-executable re-hashes and every bookkeeping
+        check below stay fresh in this call.
+        """
+        if sha256_regular(self.packet_path) != self.packet_hash:
+            self._handed_scan = None  # a handed scan never outlives this
             raise ValueError('Supervisor packet changed')
-        current = inventory(self.workspace)
+        current = self._handed_scan
+        self._handed_scan = None
+        if current is None:
+            current = inventory(self.workspace)
         changed = {name for name in self.before.keys() | current.keys()
                    if self.before.get(name) != current.get(name)}
         # The workflow runtime journals its runs into .zcode/workflow-runs
@@ -238,7 +273,7 @@ class Authority:
                                                 for rid in self.runtime_entry_bytes}):
                     run_id = 'dwfrun-' + parts[2][7:-4]
                     entry = self.workspace / name
-                    current = (hashlib.sha256(read_regular(entry)).hexdigest()
+                    current = (sha256_regular(entry)
                                if entry.is_file() and not entry.is_symlink() else None)
                     if current is not None and current == self.runtime_entry_bytes.get(run_id):
                         new_runtime.add(name)
@@ -256,11 +291,26 @@ class Authority:
             path = Path(name)
             info = path.lstat()
             if (not stat.S_ISREG(info.st_mode) or info.st_nlink != 1
-                    or hashlib.sha256(read_regular(path)).hexdigest() != digest):
+                    or sha256_regular(path) != digest):
                 raise ValueError('Trusted executable/input changed: '+name)
 
     def decide(self, params):
         decision, reason, command_id = 'deny', 'Not in this task contract', None
+        if self.ui_emit is not None:
+            # P0.4 sideband: the request arrival observation (read-only; the
+            # authoritative transition below is untouched whatever happens).
+            # Session/turn identity is the authority's OWN binding, never the
+            # request's claim of it.
+            with contextlib.suppress(Exception):
+                self.ui_emit({'phase': 'requested',
+                              'request_id': params.get('requestId')
+                              if isinstance(params, dict) else None,
+                              'tool_call_id': params.get('toolCallId')
+                              if isinstance(params, dict) else None,
+                              'tool_name': params.get('toolName')
+                              if isinstance(params, dict) else None,
+                              'session_id': self.session_id,
+                              'turn_id': self.turn_id})
         try:
             origin = params.get('origin') if isinstance(params.get('origin'), dict) else None
             if origin and origin.get('kind') == 'subagent':
@@ -465,6 +515,23 @@ class Authority:
                               'input':params.get('input'), 'decision':decision,
                               'reason':reason, 'command_id':command_id,
                               'origin':params.get('origin')})
+        if self.ui_emit is not None:
+            # P0.4 sideband: the decision record above is the authoritative
+            # state; this projection copies only its safe ids and outcome
+            # (session/turn identity comes from the authority's OWN bindings,
+            # not from the request's claims).
+            with contextlib.suppress(Exception):
+                self.ui_emit({'phase': 'decided',
+                              'request_id': params.get('requestId')
+                              if isinstance(params, dict) else None,
+                              'tool_call_id': params.get('toolCallId')
+                              if isinstance(params, dict) else None,
+                              'tool_name': params.get('toolName')
+                              if isinstance(params, dict) else None,
+                              'session_id': self.session_id,
+                              'turn_id': self.turn_id,
+                              'command_id': command_id,
+                              'decision': decision})
         return {'decision':decision, 'reason':reason}
 
     def audit(self, events):

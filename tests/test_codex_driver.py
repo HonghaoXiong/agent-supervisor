@@ -9,6 +9,7 @@ import dataclasses
 import json
 import tempfile
 import unittest
+from unittest import mock
 from pathlib import Path
 
 from zcode_supervisor import codex_driver
@@ -302,6 +303,354 @@ class CodexDriverTests(unittest.TestCase):
         self.assertEqual(written, self.schema)
         receipt = json.loads((evidence / "receipt.json").read_text())
         self.assertFalse(receipt["schema_normalized"])
+
+
+class StreamingEvidenceTests(unittest.TestCase):
+    """P2.3: streaming stdout/stderr evidence and incremental parsing."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.schema = {"type": "object",
+                       "properties": {"summary": {"type": "string"},
+                                      "files": {"type": "array"}},
+                       "required": ["summary", "files"]}
+
+    def _fake(self, source):
+        fake = self.root / "fake-codex"
+        fake.write_text(source)
+        fake.chmod(0o755)
+        return fake
+
+    def _run(self, fake, mode, timeout_s=30.0, **kwargs):
+        evidence = self.root / ("evidence-" + mode)
+        env = {"FAKE_CODEX_MODE": mode,
+               "FX_MODE": mode,
+               "CODEX_HOME": str(self.root / "home")}
+        return codex_driver.run_readonly(
+            fake, self.workspace, "task", self.schema, evidence,
+            timeout_s=timeout_s, env=env, **kwargs), evidence
+
+    def test_accumulator_matches_reference_parser_on_edge_lines(self):
+        lines = [
+            '{"type": "thread.started", "thread_id": "t1"}',
+            "{not json",
+            "[1, 2]",
+            '{"no_type": 1}',
+            "null",
+            '{"type": "error", "message": "Reconnecting... 1/5"}',
+            '{"type": "error", "message": "real failure"}',
+            '{"type": "item.completed", "item": {"type": "command_execution", "command": "ls", "exit_code": 0, "status": "completed"}}',
+            '{"type": "turn.completed"}',
+            '{"type": "turn.completed"}',  # no trailing newline variant
+        ]
+        counts, thread, model, items, retries, hard = codex_driver \
+            ._parse_events(lines)
+        self.assertEqual(counts, {"thread.started": 1, "<invalid-json>": 1,
+                                  "<non-object>": 2, "<no-type>": 1,
+                                  "error": 2, "item.completed": 1,
+                                  "turn.completed": 2})
+        self.assertEqual(thread, "t1")
+        self.assertEqual(retries, 1)
+        self.assertEqual(hard, ["real failure"])
+        self.assertEqual(items, [{"command": "ls", "exit_code": 0,
+                                  "status": "completed"}])
+        # incremental feed order must not matter for the result
+        acc = codex_driver._EventAccumulator()
+        for line in reversed(lines):
+            acc.feed(line)
+        self.assertEqual(acc.result()[0], counts)
+
+    def test_tail_frames_parse_identically(self):
+        """A complete final line without newline parses; a truncated JSON
+        tail counts as <invalid-json> — the acceptance set is exactly the
+        old whole-list parser's."""
+        complete = '{"type": "a"}\n{"type": "b"}'
+        truncated = '{"type": "a"}\n{"type": "b'  # truly broken JSON
+        import io
+        def as_lines(text):
+            return [line for line in io.StringIO(text)]
+        self.assertEqual(codex_driver._parse_events(as_lines(complete))[0],
+                         {"a": 1, "b": 1})
+        self.assertEqual(codex_driver._parse_events(as_lines(truncated))[0],
+                         {"a": 1, "<invalid-json>": 1})
+
+    def test_stderr_excerpt_file_matches_old_join_rule(self):
+        import tempfile as _tf
+        with _tf.TemporaryDirectory() as tmp:
+            raw = Path(tmp) / "stderr.partial"
+            raw.write_text("  head \n" + "E" * 600 + "\nTAIL\n")
+            got = codex_driver._stderr_excerpt_file(raw)
+            want = ("  head \n" + "E" * 600 + "\nTAIL\n").strip()[-500:]
+            self.assertEqual(got, want)
+            self.assertFalse(raw.exists())  # unlinked after read
+            # oversized stream: bounded tail read keeps the same excerpt
+            big = Path(tmp) / "big.partial"
+            big.write_text("X" * (2 * 1024 * 1024) + "\nTAIL-MARKER\n")
+            got_big = codex_driver._stderr_excerpt_file(big)
+            text = ("X" * (2 * 1024 * 1024) + "\nTAIL-MARKER\n")
+            self.assertEqual(got_big, text.strip()[-500:])
+            self.assertTrue(got_big.endswith("TAIL-MARKER"))
+
+    def test_active_writer_partial_before_exit_and_one_awaited_exit(self):
+        import threading, time
+        source = '''#!/usr/bin/env python3
+import json, sys, time
+for event in ({"type": "thread.started", "thread_id": "t1"},
+              {"type": "turn.started", "model": "m"}):
+    sys.stdout.write(json.dumps(event) + "\\n")
+sys.stdout.flush()
+time.sleep(2.5)
+sys.stdout.write(json.dumps({"type": "turn.completed"}) + "\\n")
+sys.stdout.flush()
+last = [a for a in sys.argv[1:] ]
+idx = last.index("-o")
+with open(last[idx + 1], "w") as h:
+    h.write(json.dumps({"summary": "ok", "files": []}))
+'''
+        fake = self._fake(source)
+        evidence = self.root / "evidence-active"
+        exits = []
+        state = {"done": False}
+        observations = []
+
+        def drive():
+            try:
+                codex_driver.run_readonly(
+                    fake, self.workspace, "task", self.schema, evidence,
+                    timeout_s=30, env={"FX_MODE": "active",
+                                       "CODEX_HOME": str(self.root / "home")},
+                    exit_event_sink=exits.append)
+            except BaseException as error:  # surfaced by the assertions
+                state["error"] = f"{type(error).__name__}: {error}"
+            finally:
+                state["done"] = True
+
+        worker = threading.Thread(target=drive, daemon=True)
+        worker.start()
+        deadline = time.monotonic() + 15
+        while not state["done"] and time.monotonic() < deadline:
+            time.sleep(0.2)
+            partial = [p for p in evidence.glob(".codex-events*")
+                       if p.is_file() and p.stat().st_size > 0]
+            observations.append({
+                "partial_lines": (
+                    len([l for l in partial[0].read_text().splitlines()
+                         if l.strip()]) if partial else 0),
+                "receipt": (evidence / "receipt.json").exists(),
+                "final_events_nonempty": (
+                    (evidence / "codex-events.jsonl").stat().st_size > 0
+                    if (evidence / "codex-events.jsonl").exists() else False)})
+        worker.join(timeout=35)
+        self.assertNotIn("error", state, state.get("error"))
+        self.assertTrue(any(o["partial_lines"] >= 2 and not o["receipt"]
+                            for o in observations),
+                        "no flushed partial observed before finalization: "
+                        + repr(observations))
+        # exactly one awaited exit, and only AFTER the run settled
+        self.assertEqual(len(exits), 1)
+        final = json.loads((evidence / "receipt.json").read_text())
+        self.assertEqual(final["outcome"], "delivered")
+        self.assertIn("turn.completed",
+                      final["event_counts"])
+
+    def test_metrics_sink_reports_partial_and_receipt_schema_is_untouched(self):
+        receipt, evidence = self._run(
+            self._fake(FAKE_CODEX_SOURCE), "delivered")
+        metrics = {}
+        receipt2, _ = self._run(self._fake(FAKE_CODEX_SOURCE),
+                                "delivered-metrics", metrics_sink=metrics)
+        self.assertIn("first_partial_s", metrics)
+        self.assertIsNotNone(metrics["first_partial_s"])
+        self.assertGreater(metrics["raw_stdout_bytes"], 0)
+        self.assertIn("receipt_meta", metrics)
+        # receipt dataclass fields unchanged by the metrics hook
+        self.assertEqual(sorted(dataclasses.asdict(receipt)),
+                         sorted(dataclasses.asdict(receipt2)))
+
+
+class Repair1EvidenceIntegrityTests(unittest.TestCase):
+    """P2.3 repair1: finalize immutability, honest pumps, exact excerpt."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.schema = {"type": "object",
+                       "properties": {"summary": {"type": "string"}},
+                       "required": ["summary"]}
+
+    def _fake(self, body):
+        fake = self.root / ("fake-%d" % id(body))
+        fake.write_text("#!/usr/bin/env python3\n" + body)
+        fake.chmod(0o755)
+        return fake
+
+    def _run(self, fake, timeout_s=30.0, **kwargs):
+        evidence = self.root / ("evidence-%d" % id(fake))
+        return codex_driver.run_readonly(
+            fake, self.workspace, "task", self.schema, evidence,
+            timeout_s=timeout_s,
+            env={"CODEX_HOME": str(self.root / "home")}, **kwargs), evidence
+
+    def test_grandchild_late_cannot_mutate_finalized_evidence(self):
+        """repair1 F1: a grandchild outliving the join window must never
+        append to the finalized events file after run_readonly returns."""
+        import time
+        helper = self.root / "late_writer.py"
+        helper.write_text(
+            "#!/usr/bin/env python3\n"
+            "import sys, time\n"
+            "time.sleep(1.0)\n"
+            "sys.stdout.write('{\"type\": \"late\"}\\n')\n"
+            "sys.stdout.flush()\n")
+        fake = self._fake(
+            "import json, subprocess, sys\n"
+            "sys.stdout.write(json.dumps("
+            "{\"type\": \"thread.started\", \"thread_id\": \"g1\"}) + \"\\n\")\n"
+            "sys.stdout.flush()\n"
+            "subprocess.Popen([sys.executable, %r], stdout=sys.stdout)\n"
+            "sys.exit(0)\n" % str(helper))
+        with mock.patch.object(codex_driver, "_TERMINATE_GRACE_S", 0.3):
+            receipt, evidence = self._run(fake)
+        events_file = evidence / "codex-events.jsonl"
+        bytes_at_return = events_file.read_bytes()
+        receipt_counts = dict(receipt.event_counts)
+        # after the grandchild's late-write window has fully elapsed, the
+        # finalized file is byte-identical and the receipt still covers it
+        time.sleep(1.5)
+        self.assertEqual(events_file.read_bytes(), bytes_at_return)
+        live_counts = codex_driver._parse_events(
+            events_file.read_text().splitlines(keepends=True))[0]
+        self.assertEqual(receipt_counts, live_counts)
+
+    def test_recursion_bomb_raises_loudly_with_complete_evidence(self):
+        """repair1 F2: a deep-JSON parse failure must surface as a raise
+        (no receipt), with the raw evidence complete — never a truncated
+        stream reported as delivered."""
+        bomb = "[" * 30000 + "]" * 30000
+        fake = self._fake(
+            "import json, sys\n"
+            "sys.stdout.write(json.dumps("
+            "{\"type\": \"thread.started\", \"thread_id\": \"t1\"}) + \"\\n\")\n"
+            "sys.stdout.write(%r + \"\\n\")\n"
+            "sys.stdout.write(json.dumps({\"type\": \"turn.completed\"})"
+            " + \"\\n\")\n"
+            "sys.stdout.flush()\n"
+            "sys.exit(0)\n" % bomb)
+        with self.assertRaises(RecursionError):
+            self._run(fake)
+        evidence = self.root / ("evidence-%d" % id(fake))
+        self.assertFalse((evidence / "receipt.json").exists())
+        text = (evidence / "codex-events.jsonl").read_text()
+        self.assertIn("turn.completed", text)      # tail line survived
+        self.assertIn("thread.started", text)      # head line survived
+
+    def test_metrics_sink_exception_is_isolated(self):
+        """repair1 F3: a raising caller sink must never take the receipt
+        down (same isolation as the exit-event sink)."""
+        fake = self._fake(
+            "import sys\n"
+            "sys.stdout.write('{\"type\": \"turn.completed\"}\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.exit(0)\n")
+        last_message_needed = self.root / "lm.json"
+
+        def exploding_sink(_payload):
+            raise RuntimeError("metrics sink exploded")
+
+        # delivered path needs a last-message file: the fake writes none,
+        # so accept schema_mismatch — the point is receipt persistence
+        receipt, evidence = self._run(fake, metrics_sink=exploding_sink)
+        self.assertTrue((evidence / "receipt.json").exists())
+        self.assertIn(receipt.outcome, ("delivered", "schema_mismatch"))
+
+    def test_excerpt_window_matches_old_formula_on_boundary_shapes(self):
+        """repair1 R1/R2: exact equivalence including internal runs,
+        multi-byte tails at 65536/65537 boundaries, oversized streams."""
+        import io as _io
+
+        def old_rule(text):
+            return "".join(
+                [line for line in _io.StringIO(text)]).strip()[-500:]
+
+        cases = {
+            "small": "abc\n",
+            "tail_ws_65536": "X" * (1024 * 1024 + 16) + " " * 65536,
+            "tail_ws_65537": "X" * (1024 * 1024 + 17) + " " * 65537,
+            "internal_run_short_tail": "Y" * 900 + " " * 3000 + "z" * 8,
+            "internal_run_big": "A" * 1024 * 1024 + " " * 2000 + "B" * 100,
+            "multibyte_tail_65000": "文" * 400000 + " " * 65000,
+            "multibyte_tail_65200": "字" * 400000 + " " * 65200,
+            "all_whitespace": " " * 100000,
+        }
+        for name, text in cases.items():
+            with self.subTest(shape=name):
+                raw = self.root / ("stderr-%s.partial" % name)
+                raw.write_text(text, encoding="utf-8")
+                self.assertEqual(codex_driver._stderr_excerpt_file(raw),
+                                 old_rule(text))
+                self.assertFalse(raw.exists())
+
+    def test_utf8_truncated_tail_is_old_parity_delivered(self):
+        """repair2 N3/G2: a child ending mid-codepoint keeps the OLD
+        acceptance set — silent tail drop, receipt delivered, no raise."""
+        fake = self._fake(
+            "import sys\n"
+            "NL = chr(10)\n"
+            "sys.stdout.write('{\"type\": \"thread.started\","
+            " \"thread_id\": \"t1\"}' + NL)\n"
+            "sys.stdout.flush()\n"
+            "sys.stdout.buffer.write(b'{\"type\": \"turn.completed\"}'"
+            " + bytes([0xe4, 0xb8]))\n"
+            "sys.stdout.buffer.flush()\n"
+            "sys.exit(0)\n")
+        receipt, evidence = self._run(fake)
+        # exit 0 + no last-message file written by this fake (it never
+        # opens -o) -> the driver records the missing file; either way
+        # NO raise and the decodable prefix is parsed
+        self.assertIn(receipt.outcome,
+                      ("delivered", "schema_mismatch", "failed"))
+        self.assertIn("thread.started", receipt.event_counts)
+        self.assertNotIn("turn.completed", receipt.event_counts)
+        metrics = {}
+        self._run(fake, metrics_sink=metrics)
+        self.assertTrue(metrics["stdout_pump"].get("decode_drop"))
+
+    def test_excerpt_gray_band_is_shorter_but_never_fabricates(self):
+        """repair2 N2/G1: inside the registered gray band (run + 500-char
+        bytes > window cap) the excerpt may be SHORTER than the old
+        answer but never contains fabricated U+FFFD."""
+        mib = 1024 * 1024
+        text = "Q" * mib + " " * (17 * mib)  # run alone > 16MiB cap
+        raw = self.root / "stderr-gray.partial"
+        raw.write_text(text, encoding="utf-8")
+        got = codex_driver._stderr_excerpt_file(raw)
+        want = codex_driver._stderr_excerpt([text])
+        self.assertEqual(len(want), 500)
+        self.assertLess(len(got), 500)
+        self.assertNotIn("\ufffd", got)
+
+    def test_preset_directory_at_partial_path_degrades_not_crashes(self):
+        """repair1 D2/R3: an uncreatable partial degrades to an empty
+        final evidence file with the receipt still written."""
+        fake = self._fake(
+            "import sys\n"
+            "sys.stdout.write('{\"type\": \"turn.completed\"}\\n')\n"
+            "sys.stdout.flush()\n"
+            "sys.exit(0)\n")
+        evidence = self.root / "evidence-preset"
+        (evidence / codex_driver._RAW_STDOUT_PARTIAL).mkdir(parents=True)
+        receipt = codex_driver.run_readonly(
+            fake, self.workspace, "task", self.schema, evidence,
+            timeout_s=30, env={"CODEX_HOME": str(self.root / "home")})
+        self.assertTrue((evidence / "receipt.json").exists())
+        self.assertEqual((evidence / "codex-events.jsonl").read_text(), "")
 
 
 class NormalizeStrictSchemaTests(unittest.TestCase):

@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import asyncio
+import concurrent.futures
 import hashlib
 import json
 import os
-from pathlib import Path
 import stat
 import tempfile
+from contextlib import contextmanager
+from pathlib import Path
 
 
 def require_posix() -> None:
@@ -61,11 +63,79 @@ def read_regular(path: Path) -> bytes:
     require_posix()
     try:
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        with os.fdopen(fd, "rb") as stream:
+    except OSError as error:
+        raise ValueError(f"Cannot read ordinary file {path}: {error.strerror}") from error
+    # F-1 (P2.2 pre-fix): os.fdopen itself can raise before the with
+    # statement takes ownership (e.g. IsADirectoryError on macOS, where
+    # opening a directory with O_NONBLOCK succeeds) — the raw fd must
+    # still be closed, or every call leaks one descriptor.
+    try:
+        stream = os.fdopen(fd, "rb")
+    except OSError as error:
+        os.close(fd)
+        raise ValueError(f"Cannot read ordinary file {path}: {error.strerror}") from error
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        with stream:
             info = os.fstat(stream.fileno())
             if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
                 raise ValueError(f"Expected an ordinary single-link file: {path}")
             return stream.read()
+    except OSError as error:
+        raise ValueError(f"Cannot read ordinary file {path}: {error.strerror}") from error
+
+
+# P2.1 (PLAN §P2.1): upper bound for one file's in-memory read buffer on
+# the hashing path; the workspace-level 256 MiB / 5000-file inventory
+# caps are enforced by the caller and are unchanged by streamed hashing.
+HASH_CHUNK_BYTES = 1024 * 1024
+
+
+def sha256_regular(path: Path, chunk_bytes: int = HASH_CHUNK_BYTES) -> str:
+    """Streamed SHA-256 of one ordinary single-link file.
+
+    Same admission checks and error contract as :func:`read_regular`
+    (``O_NOFOLLOW`` open, ``fstat`` regular + single-link, OSError wrapped
+    in ValueError with the identical message shape), but content is
+    consumed in ``chunk_bytes`` pieces so peak per-file memory stays at
+    one chunk instead of the whole file. The digest is bit-identical to
+    ``hashlib.sha256(read_regular(path)).hexdigest()`` by construction.
+    """
+    require_posix()
+    if isinstance(chunk_bytes, bool) or not isinstance(chunk_bytes, int) \
+            or chunk_bytes <= 0:
+        raise ValueError("chunk_bytes must be a positive integer")
+    if chunk_bytes > HASH_CHUNK_BYTES:
+        # F-7 (P2.2 pre-fix): BufferedReader.read(n) preallocates ~n, so
+        # an unbounded chunk would break the <=1 MiB single-file read
+        # buffer ceiling the P2.1 acceptance froze.
+        raise ValueError("chunk_bytes must not exceed HASH_CHUNK_BYTES")
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except OSError as error:
+        raise ValueError(f"Cannot read ordinary file {path}: {error.strerror}") from error
+    try:
+        stream = os.fdopen(fd, "rb")
+    except OSError as error:
+        os.close(fd)  # F-1: same ownership gap as read_regular
+        raise ValueError(f"Cannot read ordinary file {path}: {error.strerror}") from error
+    except BaseException:
+        os.close(fd)
+        raise
+    try:
+        with stream:
+            info = os.fstat(stream.fileno())
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError(f"Expected an ordinary single-link file: {path}")
+            digest = hashlib.sha256()
+            while True:
+                chunk = stream.read(chunk_bytes)
+                if not chunk:
+                    break
+                digest.update(chunk)
+            return digest.hexdigest()
     except OSError as error:
         raise ValueError(f"Cannot read ordinary file {path}: {error.strerror}") from error
 
@@ -100,6 +170,45 @@ def atomicwrite_json(path: Path, value: object) -> None:
 
 # Keep the short historical name for the protocol client.
 write_json = atomicwrite_json
+
+
+# P2.1 (PLAN §P2.1): dedicated bounded executor for RUN-BOUNDARY scans.
+# Only the run-boundary inventory/check_frozen scans of the async run
+# paths go through this pool so the shared event loop keeps serving
+# while a scan hashes; decide()-time frozen checks stay synchronous and
+# fresh per call, and the approval path stays synchronous serial.
+BOUNDARY_SCAN_WORKERS = 2
+
+_boundary_scan_executor: concurrent.futures.ThreadPoolExecutor | None = None
+
+
+def boundary_scan_executor() -> concurrent.futures.ThreadPoolExecutor:
+    """The process-wide bounded executor for run-boundary scans.
+
+    Lazily created (CLI paths that never scan spawn no threads). Bounds:
+    at most ``BOUNDARY_SCAN_WORKERS`` scan threads exist at any time;
+    further scans queue (their wait still counts into the caller's wall
+    time — the pool only reduces event-loop blocking, it never shortens
+    or greens the P0.1 whole-call hard gate).
+    """
+    global _boundary_scan_executor
+    if _boundary_scan_executor is None:
+        _boundary_scan_executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=BOUNDARY_SCAN_WORKERS,
+            thread_name_prefix='czs-boundary-scan')
+    return _boundary_scan_executor
+
+
+async def run_boundary_scan(func, *args):
+    """Await one pure scan function on the bounded boundary-scan executor.
+
+    Cancellation of this await does NOT kill an already-running scan
+    thread (the scan runs to completion exactly like the old synchronous
+    call, which no cancellation could interrupt either) — the outer
+    cancellation is simply re-delivered at the next await point.
+    """
+    future = boundary_scan_executor().submit(func, *args)
+    return await asyncio.wrap_future(future)
 
 
 @contextmanager

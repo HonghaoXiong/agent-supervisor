@@ -1,0 +1,22 @@
+[package]
+name = "supervisor-macos"
+version = "0.1.0"
+edition = "2021"
+description = "Read-only macOS supervisor UI (egui vertical slice, P1.2)"
+
+[dependencies]
+eframe = "=0.37.0"
+# Present probe (P1.2): egui_wgpu::CallbackTrait::paint is the only
+# app-visible hook that executes INSIDE the frame's wgpu render pass.
+# Version identical to the eframe 0.37 transitive (lock unchanged for
+# every package; only this crate's dep list gains the direct edge).
+egui-wgpu = "=0.37.0"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dependencies.uuid]
+version = "1"
+features = ["v4"]
+
+[profile.release]
+opt-level = 2

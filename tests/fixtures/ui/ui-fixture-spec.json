@@ -1,0 +1,17 @@
+{
+  "version": "ui-fixture-v1",
+  "description": "Pinned PLAN 5.3.2 UI measurement fixture: synthetic 100 nodes / 300 edges / 10000 events replayed from the same start at 100 events/s. Generated deterministically by zcode_supervisor.bench.build_ui_fixture; the digest pins the canonical serialization. No credentials or real sessions.",
+  "spec": {
+    "nodes": 100,
+    "edges": 300,
+    "events": 10000,
+    "replay_events_per_s": 100
+  },
+  "fixture_sha256": "ce32aa261c42e268b29641ac73268422249e40f9f5393cec4e99df88347df807",
+  "canonical_form": "json sort_keys=True separators=(',',':') ensure_ascii=True",
+  "markers": {
+    "start_event_id": "evt-00000",
+    "marker_running": "evt-05000",
+    "marker_terminal": "evt-09999"
+  }
+}

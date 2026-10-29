@@ -1,0 +1,377 @@
+{
+ "event_pages": [
+  {
+   "cut_digest": "96fee81b96d55df3450a138c657f93791068966f6ddd27953f5bbd1084e97e33",
+   "done": true,
+   "events": [
+    {
+     "data": {
+      "accepted_event_id": "wire-golden/1/task-base/1",
+      "task_stream_id": "task-base"
+     },
+     "delivery_ok": null,
+     "duration_ms": null,
+     "error": null,
+     "event_id": "wire-golden/1/hub/1",
+     "kind": "stream.announced",
+     "mode": "app-server",
+     "observed_at": "2026-10-28T13:26:56.810337Z",
+     "outcome": null,
+     "request_id": null,
+     "seq": 1,
+     "session_id": null,
+     "source_event_seq": null,
+     "status": null,
+     "stream_id": "hub",
+     "task_id": "task-base",
+     "tool_call_id": null,
+     "turn_id": null,
+     "v": 1,
+     "worker": "codex"
+    },
+    {
+     "data": {
+      "contract_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "contract_id": "contract-task-base",
+      "created_at": "2070-01-01T00:00:00.000000Z",
+      "initiator_verified": false
+     },
+     "delivery_ok": null,
+     "duration_ms": null,
+     "error": null,
+     "event_id": "wire-golden/1/task-base/1",
+     "kind": "task.accepted",
+     "mode": "app-server",
+     "observed_at": "2026-10-28T13:26:56.810122Z",
+     "outcome": null,
+     "request_id": null,
+     "seq": 1,
+     "session_id": null,
+     "source_event_seq": null,
+     "status": null,
+     "stream_id": "task-base",
+     "task_id": "task-base",
+     "tool_call_id": null,
+     "turn_id": null,
+     "v": 1,
+     "worker": "codex"
+    },
+    {
+     "data": {},
+     "delivery_ok": null,
+     "duration_ms": null,
+     "error": null,
+     "event_id": "wire-golden/1/task-base/2",
+     "kind": "turn.started",
+     "mode": "app-server",
+     "observed_at": "2026-10-28T13:26:56.810367Z",
+     "outcome": null,
+     "request_id": null,
+     "seq": 2,
+     "session_id": "sess-task-base",
+     "source_event_seq": null,
+     "status": null,
+     "stream_id": "task-base",
+     "task_id": "task-base",
+     "tool_call_id": null,
+     "turn_id": "turn-task-base",
+     "v": 1,
+     "worker": "codex"
+    },
+    {
+     "data": {
+      "contract_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "contract_id": "c-gap",
+      "created_at": "2070-01-01T00:00:00.000000Z",
+      "initiator_verified": false
+     },
+     "delivery_ok": null,
+     "duration_ms": null,
+     "error": null,
+     "event_id": "wire-golden/1/task-gap/1",
+     "kind": "task.accepted",
+     "mode": "app-server",
+     "observed_at": "2026-10-28T13:26:56.810390Z",
+     "outcome": null,
+     "request_id": null,
+     "seq": 1,
+     "session_id": null,
+     "source_event_seq": null,
+     "status": null,
+     "stream_id": "task-gap",
+     "task_id": "task-gap",
+     "tool_call_id": null,
+     "turn_id": null,
+     "v": 1,
+     "worker": "codex"
+    },
+    {
+     "data": {
+      "contract_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "contract_id": "c-live",
+      "created_at": "2070-01-01T00:00:00.000000Z",
+      "initiator_verified": false
+     },
+     "delivery_ok": null,
+     "duration_ms": null,
+     "error": null,
+     "event_id": "wire-golden/1/task-live/1",
+     "kind": "task.accepted",
+     "mode": "app-server",
+     "observed_at": "2026-10-28T13:26:56.810438Z",
+     "outcome": null,
+     "request_id": null,
+     "seq": 1,
+     "session_id": null,
+     "source_event_seq": null,
+     "status": null,
+     "stream_id": "task-live",
+     "task_id": "task-live",
+     "tool_call_id": null,
+     "turn_id": null,
+     "v": 1,
+     "worker": "codex"
+    },
+    {
+     "data": {
+      "contract_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+      "contract_id": "c-other",
+      "created_at": "2070-01-01T00:00:00.000000Z",
+      "initiator_verified": false
+     },
+     "delivery_ok": null,
+     "duration_ms": null,
+     "error": null,
+     "event_id": "wire-golden/1/task-other/1",
+     "kind": "task.accepted",
+     "mode": "app-server",
+     "observed_at": "2026-10-28T13:26:56.810416Z",
+     "outcome": null,
+     "request_id": null,
+     "seq": 1,
+     "session_id": null,
+     "source_event_seq": null,
+     "status": null,
+     "stream_id": "task-other",
+     "task_id": "task-other",
+     "tool_call_id": null,
+     "turn_id": null,
+     "v": 1,
+     "worker": "codex"
+    }
+   ],
+   "next_page_cursor": null,
+   "ok": true,
+   "page": null,
+   "snapshot_cursor": {
+    "hub_instance_id": "wire-golden",
+    "journal_epoch": 1,
+    "snapshot_id": "699a7a301bb68e1b",
+    "snapshot_version": 1,
+    "v": 1
+   }
+  }
+ ],
+ "hello": {
+  "cursor_registered": true,
+  "hub_instance_id": "wire-golden",
+  "initial_cut_digest": "96fee81b96d55df3450a138c657f93791068966f6ddd27953f5bbd1084e97e33",
+  "initial_snapshot_cursor": {
+   "hub_instance_id": "wire-golden",
+   "journal_epoch": 1,
+   "snapshot_id": "699a7a301bb68e1b",
+   "snapshot_version": 1,
+   "v": 1
+  },
+  "journal_epoch": 1,
+  "ok": true,
+  "snapshot_version": 1,
+  "streams": [
+   {
+    "high_watermark": 1,
+    "retention_floor": 1,
+    "stream_id": "hub"
+   },
+   {
+    "high_watermark": 2,
+    "retention_floor": 1,
+    "stream_id": "task-base"
+   },
+   {
+    "high_watermark": 1,
+    "retention_floor": 1,
+    "stream_id": "task-gap"
+   },
+   {
+    "high_watermark": 1,
+    "retention_floor": 1,
+    "stream_id": "task-live"
+   },
+   {
+    "high_watermark": 1,
+    "retention_floor": 1,
+    "stream_id": "task-other"
+   }
+  ],
+  "v": 1
+ },
+ "live": [
+  {
+   "event": {
+    "data": {
+     "contract_digest": "3333333333333333333333333333333333333333333333333333333333333333",
+     "contract_id": "contract-task-discovered",
+     "created_at": "2070-01-01T00:00:00.000000Z",
+     "initiator_verified": false
+    },
+    "delivery_ok": null,
+    "duration_ms": null,
+    "error": null,
+    "event_id": "wire-golden/1/task-discovered/1",
+    "kind": "task.accepted",
+    "mode": "app-server",
+    "observed_at": "2026-10-28T13:26:56.811322Z",
+    "outcome": null,
+    "request_id": null,
+    "seq": 1,
+    "session_id": null,
+    "source_event_seq": null,
+    "status": null,
+    "stream_id": "task-discovered",
+    "task_id": "task-discovered",
+    "tool_call_id": null,
+    "turn_id": null,
+    "v": 1,
+    "worker": "codex"
+   },
+   "type": "event"
+  },
+  {
+   "event": {
+    "data": {
+     "accepted_event_id": "wire-golden/1/task-discovered/1",
+     "task_stream_id": "task-discovered"
+    },
+    "delivery_ok": null,
+    "duration_ms": null,
+    "error": null,
+    "event_id": "wire-golden/1/hub/2",
+    "kind": "stream.announced",
+    "mode": "app-server",
+    "observed_at": "2026-10-28T13:26:56.811363Z",
+    "outcome": null,
+    "request_id": null,
+    "seq": 2,
+    "session_id": null,
+    "source_event_seq": null,
+    "status": null,
+    "stream_id": "hub",
+    "task_id": "task-discovered",
+    "tool_call_id": null,
+    "turn_id": null,
+    "v": 1,
+    "worker": "codex"
+   },
+   "type": "event"
+  },
+  {
+   "event": {
+    "data": {},
+    "delivery_ok": null,
+    "duration_ms": null,
+    "error": null,
+    "event_id": "wire-golden/1/task-discovered/2",
+    "kind": "turn.started",
+    "mode": "app-server",
+    "observed_at": "2026-10-28T13:26:56.811395Z",
+    "outcome": null,
+    "request_id": null,
+    "seq": 2,
+    "session_id": "sess-task-discovered",
+    "source_event_seq": null,
+    "status": null,
+    "stream_id": "task-discovered",
+    "task_id": "task-discovered",
+    "tool_call_id": null,
+    "turn_id": "turn-task-discovered",
+    "v": 1,
+    "worker": "codex"
+   },
+   "type": "event"
+  },
+  {
+   "type": "reset_required"
+  }
+ ],
+ "socket": "/var/folders/sd/kb4n98h53mz8qc7ns0hgsfzh0000gn/T/wire-golden-gsh3i0db/ui-events.sock",
+ "state_pages": [
+  {
+   "cut_digest": "96fee81b96d55df3450a138c657f93791068966f6ddd27953f5bbd1084e97e33",
+   "done": true,
+   "next_page_cursor": null,
+   "ok": true,
+   "page": null,
+   "snapshot_cursor": {
+    "hub_instance_id": "wire-golden",
+    "journal_epoch": 1,
+    "snapshot_id": "699a7a301bb68e1b",
+    "snapshot_version": 1,
+    "v": 1
+   },
+   "states": [
+    {
+     "accepted_event_id": "wire-golden/1/task-base/1",
+     "delivery_ok": null,
+     "last_seq": 2,
+     "mode": "app-server",
+     "outcome": null,
+     "session_id": "sess-task-base",
+     "status": "running",
+     "task_id": "task-base",
+     "turn_id": "turn-task-base",
+     "turn_status": "running",
+     "worker": "codex"
+    },
+    {
+     "accepted_event_id": "wire-golden/1/task-gap/1",
+     "delivery_ok": null,
+     "last_seq": 1,
+     "mode": "app-server",
+     "outcome": null,
+     "session_id": null,
+     "status": "running",
+     "task_id": "task-gap",
+     "turn_id": null,
+     "turn_status": null,
+     "worker": "codex"
+    },
+    {
+     "accepted_event_id": "wire-golden/1/task-live/1",
+     "delivery_ok": null,
+     "last_seq": 1,
+     "mode": "app-server",
+     "outcome": null,
+     "session_id": null,
+     "status": "running",
+     "task_id": "task-live",
+     "turn_id": null,
+     "turn_status": null,
+     "worker": "codex"
+    },
+    {
+     "accepted_event_id": "wire-golden/1/task-other/1",
+     "delivery_ok": null,
+     "last_seq": 1,
+     "mode": "app-server",
+     "outcome": null,
+     "session_id": null,
+     "status": "running",
+     "task_id": "task-other",
+     "turn_id": null,
+     "turn_status": null,
+     "worker": "codex"
+    }
+   ]
+  }
+ ]
+}

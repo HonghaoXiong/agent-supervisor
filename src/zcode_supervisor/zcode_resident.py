@@ -19,6 +19,7 @@ This is still a permission broker, not an OS sandbox.
 """
 import argparse
 import asyncio
+import contextlib
 import json
 import math
 import re
@@ -29,10 +30,15 @@ from pathlib import Path
 
 from . import protocol
 from . import runtime
+from . import ui_projection
+from .protocol import RouterOverflow, event_router_mode
 from .authority import (Authority, check_model_snapshot, execution_evidence,
                         inventory, model_execution_evidence, observed_model,
                         own_event)
-from .common import read_regular, write_json
+from .common import read_regular, run_boundary_scan, write_json
+from .deadline import (BudgetExhausted, CallBudget, outer_cancel_pending,
+                       run_best_effort_cleanup)
+from .worker_health import ExitProjection
 
 
 class ResidentError(Exception):
@@ -108,9 +114,17 @@ class SessionRegistry:
 class ResidentZCode:
     """One resident app-server process executing many session-isolated packets."""
 
-    def __init__(self, config, evidence_root: Path, *, client_factory=None):
+    def __init__(self, config, evidence_root: Path, *, client_factory=None,
+                 ui_emitter=None):
         self.config = config
         self.evidence_root = Path(evidence_root)
+        # P0.4: optional sideband UI emitter — session/turn/tool projections
+        # of each run plus the shared process's awaited-exit projection.
+        self._ui_emitter = ui_emitter
+        # P0.3: stamped by the hub's WorkerGeneration holder before start;
+        # propagated to the shared client so health evidence and exit
+        # projections stay attributable to the right generation.
+        self.generation = None
         # client_factory(workspace, output, permission, config); tests inject a fake.
         self._client_factory = client_factory or protocol.ProtocolClient
         self.client = None
@@ -130,6 +144,31 @@ class ResidentZCode:
         # its own workspacePath at session/create time.
         client = self._client_factory(Path(self.config.work_root), output,
                                       self._route_permission, self.config)
+        # P0.3: the hub stamps the resident wrapper before start; carry the
+        # identity down to the communication client it owns.
+        if getattr(client, 'generation', None) is None:
+            client.generation = self.generation
+        # P0.4 round 2: link the client's exit projection to a UI sink ONLY
+        # when the emitter is ENABLED — a disabled (CZS_UI_EVENTS=0) emitter
+        # leaves the client's projection object completely untouched, so any
+        # custom factory callback keeps working unchanged. When enabled, the
+        # prior callback (if the factory installed one) is CHAINED in front
+        # of the UI sink: each real awaited exit fires the prior callback and
+        # the sink exactly once (the P0.3 ExitProjection guard is preserved
+        # by the replacement instance's own exactly-once state).
+        if self._ui_emitter is not None and self._ui_emitter.enabled:
+            sink = ui_projection.make_exit_sink(
+                self._ui_emitter, 'shared-resident', 'zcode')
+            prior = getattr(getattr(client, 'exit_projection', None),
+                            '_on_event', None)
+
+            def chained(record, _prior=prior, _sink=sink):
+                if _prior is not None:
+                    with contextlib.suppress(Exception):
+                        _prior(record)
+                _sink(record)
+
+            client.exit_projection = ExitProjection(on_event=chained)
         try:
             await client.start()
         except BaseException:
@@ -175,6 +214,13 @@ class ResidentZCode:
         if (isinstance(timeout_s, bool) or not isinstance(timeout_s, (int, float))
                 or not math.isfinite(timeout_s) or timeout_s <= 0):
             raise ValueError('Run timeout must be positive and finite')
+        # P0.1 (COMM-01 + review spec-I3/quality-1): the budget is created
+        # IMMEDIATELY after the argument validation — before any file, packet
+        # or preflight work — and anchored at this call start. Synchronous
+        # sections stay non-preemptible but CONSUME it: the first
+        # asynchronous boundary after an exhausted budget fails fast instead
+        # of adding new waits.
+        budget = CallBudget(timeout_s)
         raw_packet = Path(packet_path)
         packet_info = raw_packet.lstat()
         if not stat.S_ISREG(packet_info.st_mode) or packet_info.st_nlink != 1:
@@ -199,16 +245,34 @@ class ResidentZCode:
         # may run concurrently on their own sessions.
         async with self._lock_for(str(workspace)):
             return await self._run_locked(packet, packet_path, workspace, output,
-                                          timeout_s, resume)
+                                          timeout_s, resume, budget)
 
-    async def _run_locked(self, packet, packet_path, workspace, output, timeout_s, resume):
+    async def _run_locked(self, packet, packet_path, workspace, output, timeout_s,
+                          resume, budget):
         client = self.client
         registry = self.registry
         output.parent.mkdir(parents=True, exist_ok=True)
-        before = inventory(workspace)
-        authority = Authority(packet, packet_path, before)
-        authority.check_frozen()
+        before = await run_boundary_scan(inventory, workspace)
         task_id = Path(output).stem
+        # P0.4: the stream id of every UI projection below is the run's task
+        # id (the hub names run.json after its task; standalone runs use the
+        # output stem). No hook without an emitter (default CLI path).
+        authority = Authority(
+            packet, packet_path, before,
+            ui_emit=(ui_projection.authority_hook(
+                self._ui_emitter, task_id, 'zcode', 'resident')
+                if self._ui_emitter is not None else None))
+        authority.provide_scan(await run_boundary_scan(inventory, workspace))
+        authority.check_frozen()
+        router_sub = None  # P2.2: declared pre-try; the finally releases it
+        # P2.2 routed mode: subscribe BEFORE any session traffic exists so
+        # no frame of this session can slip past the read loop; the floor
+        # is narrowed to the server's eventSeq once session/subscribe
+        # answers. Duck-typed: clients/doubles without the API keep the
+        # exact legacy scan path (router_sub stays None).
+        if (event_router_mode() == 'incremental'
+                and hasattr(client, 'subscribe_events')):
+            router_sub = client.subscribe_events(resume or '', 0)
         with output.open('x') as stream:
             json.dump({'delivery_ok': False, 'state': 'starting'}, stream)
         write_json(output.with_suffix('.before.json'), before)
@@ -216,19 +280,48 @@ class ResidentZCode:
         result = {'delivery_ok': False, 'workspace': str(workspace), 'input_id': input_id,
                   'generation': uuid.uuid4().hex, 'scientific_acceptance': 'pending_codex_review',
                   'resident_pid': client.process.pid if client.process else None}
+        tool_names = {}  # toolCallId -> toolName observed at scheduling
         requested_model = packet.get('model')
         if requested_model is not None:
             result['requested_model'] = requested_model
-        deadline = time.monotonic() + timeout_s
         dispatched = False
         turn_succeeded = False
         last_seq = 0
 
-        def remaining():
-            return max(0.001, deadline - time.monotonic())
-
         async def rpc(method, params):
-            return await asyncio.wait_for(client.request(method, params), remaining())
+            # P0.1: one budget for every cancellable exchange — check() raises
+            # BEFORE the request is even created, so an exhausted budget adds
+            # no new send and no new wait (BudgetExhausted is a TimeoutError).
+            timeout = budget.wait_s()
+            return await asyncio.wait_for(client.request(method, params), timeout)
+
+        stop_state = {'issued': False}
+
+        async def stop_session():
+            """One bounded, outer-cancel-resistant session/stop — exactly once.
+
+            Only THIS session is stopped; the resident process keeps serving
+            the others. No id / dead process / exhausted cleanup window means
+            no fabricated stop and no new wait past the hard bound. The
+            window is capped at the cleanup budget (review quality-2): an
+            early failure must not ride the unused primary time.
+            """
+            if stop_state['issued']:
+                return 'already-issued'
+            stop_state['issued'] = True
+            sid = authority.session_id
+            if not sid:
+                return 'skipped-no-session'
+            process = client.process
+            if process is None or process.returncode is not None:
+                return 'skipped-process-gone'
+            window = budget.cleanup_window_s()
+            if window <= 0.0:
+                return 'skipped-no-window'
+            completed = await run_best_effort_cleanup(
+                lambda: client.request('session/stop', {'sessionId': sid}),
+                timeout_s=window)
+            return 'sent' if completed else 'failed'
 
         try:
             setup_started = time.monotonic()
@@ -238,26 +331,45 @@ class ResidentZCode:
             pid = client.process.pid if client.process else None
             if resume:
                 # Registry ownership replaces the old process_alive guard: the
-                # claim itself is the atomic running transition.
+                # claim itself is the atomic running transition. P0.1 review
+                # quality-3: BIND the known id BEFORE the claim, and the
+                # OBSERVED id before any check, so a claim refusal or a
+                # mismatch still has a live session/stop target.
+                authority.session_id = resume
+                self._authorities[resume] = authority
                 registry.claim(resume, task_id, str(workspace), pid)
                 try:
                     snapshot = await rpc('session/resume', {'sessionId': resume, **options})
+                    sid = snapshot['session']['sessionId']
+                    authority.session_id = sid
+                    if sid != resume:
+                        self._authorities.pop(resume, None)
+                        self._authorities[sid] = authority
+                    result['session_id'] = sid
+                    if sid != resume:
+                        raise ValueError('Resume returned a different session')
                     await rpc('session/setMode', {'sessionId': resume, 'mode': 'build'})
                 except BaseException:
                     registry.mark_lost(resume, 'session/resume failed')
                     raise
-                sid = snapshot['session']['sessionId']
-                if sid != resume:
-                    raise ValueError('Resume returned a different session')
             else:
                 snapshot = await rpc('session/create', {
                     **options, 'mode': 'build', 'titleGenerationEnabled': False,
                     **({'model': requested_model} if requested_model is not None else {})})
                 sid = snapshot['session']['sessionId']
+                # P0.1 (COMM-01): the id obtained from session/create binds
+                # immediately — BEFORE the registry claim — so every later
+                # failure (including a claim refusal for an id some other run
+                # already holds) still stops this live session once.
+                authority.session_id = sid
+                self._authorities[sid] = authority
+                result['session_id'] = sid
                 registry.claim(sid, task_id, str(workspace), pid)
-            authority.session_id = sid
-            self._authorities[sid] = authority
-            result['session_id'] = sid
+            # P0.4 sideband: the authoritative session binding (registry
+            # claim done above) is readable — project session.bound once.
+            ui_projection.session_bound(
+                self._ui_emitter, task_id, 'zcode', 'resident',
+                authority.session_id, 'resident')
             if requested_model is not None:
                 result['observed_model_initial'] = observed_model(snapshot)
                 await rpc('session/setModel', {'sessionId': sid, 'model': requested_model,
@@ -271,40 +383,139 @@ class ResidentZCode:
                 'sessionId': sid, 'deliveryKind': 'desktop-continuous', 'includeSnapshot': False})
             result['start_event_seq'] = subscription['eventSeq']
             last_seq = subscription['eventSeq']
+            if router_sub is not None:
+                if router_sub.key != sid:
+                    router_sub.rekey(sid)
+                router_sub.narrow_start(result['start_event_seq'])
             self._setup_latencies_ms.append(round((time.monotonic() - setup_started) * 1000, 3))
             await rpc('session/send', {'sessionId': sid, 'inputId': input_id,
                                        'content': packet['prompt']})
             dispatched = True
             completed = None
             processed = 0
-            while time.monotonic() < deadline:
+            while budget.remaining_s() > 0.0:
                 if client.failure:
                     raise ValueError(client.failure)
-                # The events list is shared process-wide; each run keeps its own
-                # cursor and only ever consumes its OWN session's events.
-                while processed < len(client.events):
-                    event = client.events[processed]
-                    processed += 1
-                    if (event.get('sessionId') != sid
-                            or event.get('seq', -1) <= result['start_event_seq']):
-                        continue
-                    payload = event.get('payload', {})
-                    seq = event.get('seq')
-                    if isinstance(seq, int) and seq > last_seq:
-                        last_seq = seq
-                    if (event.get('type') == 'turn.started'
-                            and payload.get('inputId') == input_id):
-                        authority.turn_id = event['turnId']
-                    if own_event(event, sid, authority.turn_id):
-                        if event.get('type') == 'turn.failed':
-                            raise ValueError('Worker turn failed: ' + str(payload.get('error')))
-                        if event.get('type') == 'turn.completed':
-                            completed = event
+                if router_sub is not None:
+                    if router_sub.overflowed:
+                        # internal control overflow: the OWNING task fails
+                        # through the normal P0.1 cleanup below — never a
+                        # UI-style gap
+                        raise RouterOverflow(
+                            'event subscription backlog overflowed for '
+                            + str(sid))
+                    for _seq, event in router_sub.drain():
+                        payload = event.get('payload', {})
+                        seq = event.get('seq')
+                        if isinstance(seq, int) and seq > last_seq:
+                            last_seq = seq
+                        if (event.get('type') == 'turn.started'
+                                and payload.get('inputId') == input_id):
+                            authority.turn_id = event['turnId']
+                            # P0.4 sideband: authoritative live-turn binding with
+                            # the native seq preserved (never fabricated).
+                            ui_projection.turn_event(
+                                self._ui_emitter, task_id, 'zcode', 'resident',
+                                sid, authority.turn_id, source_event_seq=seq)
+                        if own_event(event, sid, authority.turn_id):
+                            if event.get('type') == 'turn.failed':
+                                # P0.4 round 2: the authoritative native failure
+                                # has been observed — project a fixed SAFE outcome
+                                # (never the native error text) BEFORE raising
+                                # the original failure.
+                                ui_projection.turn_event(
+                                    self._ui_emitter, task_id, 'zcode',
+                                    'resident', sid, authority.turn_id,
+                                    completed=True, source_event_seq=seq,
+                                    outcome='failed', status='failed')
+                                raise ValueError('Worker turn failed: ' + str(payload.get('error')))
+                            if event.get('type') == 'turn.completed':
+                                completed = event
+                                # P0.4 sideband: terminal turn observation.
+                                ui_projection.turn_event(
+                                    self._ui_emitter, task_id, 'zcode', 'resident',
+                                    sid, authority.turn_id, completed=True,
+                                    source_event_seq=seq,
+                                    outcome=payload.get('resultType'))
+                            if event.get('type') == 'tool.updated' \
+                                    and payload.get('kind') in ('scheduled',
+                                                                'result', 'error'):
+                                # P0.4 sideband: observed tool state only (ids and
+                                # tool name; inputs/outputs stay in evidence).
+                                # Terminal events carry no toolName (verified
+                                # native shape) — reuse the name observed at
+                                # scheduling for the SAME toolCallId.
+                                tid = payload.get('toolCallId')
+                                if payload.get('kind') == 'scheduled' \
+                                        and isinstance(tid, str):
+                                    tool_names[tid] = payload.get('toolName')
+                                ui_projection.tool_event(
+                                    self._ui_emitter, task_id, 'zcode', 'resident',
+                                    sid, authority.turn_id, tid,
+                                    'completed' if payload.get('kind') != 'scheduled'
+                                    else 'scheduled',
+                                    payload.get('toolName')
+                                    if isinstance(payload.get('toolName'), str)
+                                    else tool_names.get(tid),
+                                    status=payload.get('kind'))
+                else:
+                    # legacy shared-list scan (unchanged behavior)
+                    while processed < len(client.events):
+                        event = client.events[processed]
+                        processed += 1
+                        if (event.get('sessionId') != sid
+                                or event.get('seq', -1) <= result['start_event_seq']):
+                            continue
+                        payload = event.get('payload', {})
+                        seq = event.get('seq')
+                        if isinstance(seq, int) and seq > last_seq:
+                            last_seq = seq
+                        if (event.get('type') == 'turn.started'
+                                and payload.get('inputId') == input_id):
+                            authority.turn_id = event['turnId']
+                            ui_projection.turn_event(
+                                self._ui_emitter, task_id, 'zcode', 'resident',
+                                sid, authority.turn_id, source_event_seq=seq)
+                        if own_event(event, sid, authority.turn_id):
+                            if event.get('type') == 'turn.failed':
+                                ui_projection.turn_event(
+                                    self._ui_emitter, task_id, 'zcode',
+                                    'resident', sid, authority.turn_id,
+                                    completed=True, source_event_seq=seq,
+                                    outcome='failed', status='failed')
+                                raise ValueError('Worker turn failed: ' + str(payload.get('error')))
+                            if event.get('type') == 'turn.completed':
+                                completed = event
+                                ui_projection.turn_event(
+                                    self._ui_emitter, task_id, 'zcode', 'resident',
+                                    sid, authority.turn_id, completed=True,
+                                    source_event_seq=seq,
+                                    outcome=payload.get('resultType'))
+                            if event.get('type') == 'tool.updated' \
+                                    and payload.get('kind') in ('scheduled',
+                                                                'result', 'error'):
+                                tid = payload.get('toolCallId')
+                                if payload.get('kind') == 'scheduled' \
+                                        and isinstance(tid, str):
+                                    tool_names[tid] = payload.get('toolName')
+                                ui_projection.tool_event(
+                                    self._ui_emitter, task_id, 'zcode', 'resident',
+                                    sid, authority.turn_id, tid,
+                                    'completed' if payload.get('kind') != 'scheduled'
+                                    else 'scheduled',
+                                    payload.get('toolName')
+                                    if isinstance(payload.get('toolName'), str)
+                                    else tool_names.get(tid),
+                                    status=payload.get('kind'))
                 if completed:
                     break
-                await asyncio.sleep(0.02)
+                if router_sub is not None:
+                    # wakeup-driven wait on the absolute budget deadline
+                    await router_sub.wait_new(budget.remaining_s())
+                else:
+                    await asyncio.sleep(0.02)
             if completed is None:
-                raise asyncio.TimeoutError('Worker turn deadline exceeded')
+                raise BudgetExhausted('Worker turn deadline exceeded')
             result['turn_id'] = authority.turn_id
             result['completion'] = completed['payload']
             if completed['payload'].get('resultType') != 'success':
@@ -320,9 +531,14 @@ class ResidentZCode:
                 result['observed_model_after'] = observed_model(snapshot)
                 result['effective_model_after'] = check_model_snapshot(snapshot, requested_model)
                 result['model_execution'] = model_execution_evidence(
-                    client.events, sid, authority.turn_id, requested_model)
+                    [frame for _seq, frame in router_sub.history]
+                    if router_sub is not None else client.events,
+                    sid, authority.turn_id, requested_model)
+            authority.provide_scan(await run_boundary_scan(inventory, workspace))
             authority.check_frozen()
-            commands, problems = execution_evidence(client.events, authority)
+            evidence_frames = ([frame for _seq, frame in router_sub.history]
+                                if router_sub is not None else client.events)
+            commands, problems = execution_evidence(evidence_frames, authority)
             result['commands'] = commands
             seen = {entry['command_id'] for entry in commands}
             required = {entry['id'] for entry in packet.get('commands', [])
@@ -333,6 +549,15 @@ class ResidentZCode:
             result['execution_problems'] = problems
             result['delivery_ok'] = not problems
             result['outcome'] = 'delivered' if not problems else 'evidence-rejected'
+        except asyncio.CancelledError:
+            # P0.1 (COMM-01): an outer cancel is a BaseException — the old
+            # except tuple never saw it, so session/stop was bypassed entirely.
+            # Bounded best-effort stop first, then the cancellation re-raises
+            # through the unchanged synchronous finally below.
+            result['outcome'] = result.get('outcome') or 'cancelled'
+            result['error'] = 'outer cancel during resident run'
+            result['cleanup_stop'] = await stop_session()
+            raise
         except (ResidentError, ValueError, OSError, EOFError, asyncio.TimeoutError,
                 KeyError, TypeError) as error:
             result['error'] = (f'{type(error).__name__}: {error}' if isinstance(error, ResidentError)
@@ -348,12 +573,11 @@ class ResidentZCode:
             else:
                 result['outcome'] = 'worker-failed'
             # Stop only THIS session; the resident process keeps serving others.
-            if authority.session_id and client.process and client.process.returncode is None:
-                try:
-                    await asyncio.wait_for(
-                        client.request('session/stop', {'sessionId': authority.session_id}), 2)
-                except Exception:
-                    pass
+            result['cleanup_stop'] = await stop_session()
+            if outer_cancel_pending():
+                # A cancel arrived while the bounded stop ran: propagate it
+                # instead of converting it into a settled failure result.
+                raise asyncio.CancelledError()
         finally:
             self._authorities.pop(authority.session_id, None)
             result['turn_id'] = result.get('turn_id') or authority.turn_id
@@ -365,9 +589,19 @@ class ResidentZCode:
                 # only a session whose turn completed cleanly becomes resumable.
                 if result.get('completion'):
                     registry.release(authority.session_id, last_seq)
+                    # P0.4 sideband: registry is the authority; project after
+                    # its write (exited with the last consumed native seq).
+                    ui_projection.session_state(
+                        self._ui_emitter, task_id, 'zcode', 'resident',
+                        authority.session_id, 'resident', 'exited',
+                        last_source_seq=last_seq)
                 else:
                     registry.mark_lost(authority.session_id,
                                        result.get('error') or result.get('outcome') or 'lost')
+                    ui_projection.session_state(
+                        self._ui_emitter, task_id, 'zcode', 'resident',
+                        authority.session_id, 'resident', 'lost',
+                        last_source_seq=last_seq)
             try:
                 authority.check_frozen()
                 after = inventory(workspace)
@@ -386,6 +620,11 @@ class ResidentZCode:
             if result.get('scope_error') and result.get('outcome') != 'postflight-rejected':
                 result['outcome'] = 'scope-error'
             write_json(output, protocol.redact_transport(result))
+            # P2.2: the task-owned frames release ONLY here — after the
+            # result (and every evidence inside it) is finalized and
+            # persisted; raw wire frames stay in the on-disk events log.
+            if router_sub is not None:
+                router_sub.release()
         return result
 
 

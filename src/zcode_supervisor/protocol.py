@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
 """Bounded ZCode app-server client. A permission broker, not an OS sandbox."""
 import asyncio
-import hashlib
+import contextlib
 import inspect
+import itertools
 import json
 import math
 import os
@@ -20,9 +21,24 @@ from .authority import (Authority, _edit_input_equivalent, _workflow_input_equiv
                         goal_state_from_snapshot, inventory, model_execution_evidence,
                         observed_model, orchestration_tool_surface, own_event,
                         runtime_owned, workflow_jobs_from_snapshot)
-from .common import process_alive, read_regular, workspace_lock, write_json
+from .common import (process_alive, read_regular, run_boundary_scan,
+                     sha256_regular, workspace_lock, write_json)
 from . import profile
+from . import ui_projection
 from .notify import send as send_notification
+from .worker_health import ExitProjection
+
+# P0.3 review C1: bounded close termination gradient. The worst case
+# (grace + TERM + KILL) must fit WorkerGeneration's default retirement
+# window (worker_health.OLD_CLOSE_BUDGET_S) so an evicted stdin-ignoring
+# child really receives its signals and is reaped inside the window.
+CLOSE_GRACE_S = 2.0   # stdin close -> first bounded wait (well-behaved child)
+
+# Sequential per-process generations for cold clients wired to the UI exit
+# sink (one cold child per execute run; PLAN §4.3 identity key).
+_COLD_GENERATIONS = itertools.count(1)
+CLOSE_TERM_S = 1.0    # SIGTERM -> second bounded wait
+CLOSE_KILL_S = 1.0    # SIGKILL -> final bounded wait (then bounded give-up)
 
 
 def redact_transport(value):
@@ -38,8 +54,376 @@ def redact_transport(value):
     return value
 
 
+# ---------------------------------------------------------------------------
+# P2.2: keyed bounded event routing beside the evidence stores
+# ---------------------------------------------------------------------------
+# Per-subscription bound for the UNDELIVERED backlog. Delivered frames move
+# into the subscription's task-owned history (its evidence slice) and are
+# released when that task's evidence is finalized — retention grows only
+# with active tasks, never with completed ones.
+EVENT_ROUTER_BOUND = 1024
+
+
+def event_router_mode():
+    """CZS_EVENT_ROUTER=incremental opts every consumer loop of this
+    process into the routed path; the default (and any other value) is
+    the legacy scan-and-sleep behavior — the rollback switch."""
+    return 'incremental' if os.environ.get('CZS_EVENT_ROUTER') == 'incremental' \
+        else 'legacy'
+
+
+class RouterOverflow(ValueError):
+    """A bounded subscription's undelivered backlog overflowed (P2.2).
+
+    The OWNING task fails with this error and runs its normal P0.1
+    cleanup path (bounded stop, registry loss) — an internal control
+    queue may never degrade into a UI-style gap."""
+    pass
+
+
+class BoundedSubscription:
+    """One task's bounded subscription: wakeup-driven delivery plus a
+    task-owned history that IS the evidence slice (released only after
+    the task's evidence is finalized)."""
+
+    def __init__(self, router, key, start_seq, bound,
+                 deliver_unattributed=False):
+        self._router = router
+        self.key = key
+        self.start_seq = start_seq
+        self.bound = bound
+        self.deliver_unattributed = deliver_unattributed
+        self.pending = []            # [(seq, frame)] undelivered — bounded
+        self.history = []            # delivered frames — the evidence slice
+        self.overflowed = False
+        self.released = False
+        self.delivered_count = 0     # metrics
+        self.wakeup_count = 0        # metrics: real wakeups consumed
+        self._wakeup = asyncio.Event()
+        # P2.2-repair1 (A/E): while the subscription sits on a PLACEHOLDER
+        # key (None pre-thread-start, '' pre-session-create), keyed frames
+        # that cannot match yet are stashed per future key and drained at
+        # rekey — the rekey window can no longer lose them.
+        self._stash = {}
+        # P2.2-repair1 (D): the smallest seq this subscription ever saw on
+        # the LIVE wire (delivered or stashed). Store-replay at rekey skips
+        # seqs at/above it (already seen); below it lie only frames that
+        # predate the subscription — exactly what replay must recover.
+        self._live_floor = None
+
+    def _is_placeholder(self):
+        return self.key is None or self.key == ''
+
+    # -- router side ------------------------------------------------------
+    def _offer(self, seq, frame):
+        if self.released:
+            return
+        if len(self.pending) >= self.bound:
+            self.overflowed = True   # consumer lagged: the task will fail
+            self._wakeup.set()
+            return
+        self.pending.append((seq, frame))
+        self._wakeup.set()
+
+    def _offer_live(self, seq, frame):
+        if self._live_floor is None or seq < self._live_floor:
+            self._live_floor = seq
+        self._offer(seq, frame)
+
+    def _stash_frame(self, future_key, seq, frame):
+        if self._live_floor is None or seq < self._live_floor:
+            self._live_floor = seq
+        if sum(len(v) for v in self._stash.values()) >= self.bound:
+            self.overflowed = True   # placeholder backlog is bounded too
+            self._wakeup.set()
+            return
+        self._stash.setdefault(future_key, []).append((seq, frame))
+
+    # -- consumer side ------------------------------------------------------
+    def drain(self):
+        """Take every undelivered frame into the task-owned history."""
+        out, self.pending = self.pending, []
+        self.history.extend(out)
+        self.delivered_count += len(out)
+        self._wakeup.clear()
+        return out
+
+    def narrow_start(self, start_seq):
+        """Raise the delivery floor to a server-authoritative seq (the
+        session/subscribe eventSeq). The subscription is created EARLY
+        (start_seq 0, before session/create) so no frame of this session
+        can slip past the read loop; once the subscribe response names
+        the real baseline, everything at or below it is dropped — exactly
+        the frames the legacy `seq <= start_event_seq` filter skipped."""
+        self.start_seq = start_seq
+        self.pending = [(seq, frame) for seq, frame in self.pending
+                        if seq is None or seq > start_seq]
+        self.history = [(seq, frame) for seq, frame in self.history
+                        if seq is None or seq > start_seq]
+
+    async def wait_new(self, timeout_s):
+        """Wait for the next publish. The caller derives ``timeout_s``
+        from its absolute budget (budget.wait_s/remaining_s), so the
+        deadline semantics of the old polling loop are preserved; False
+        means the timeout elapsed (the caller re-checks its budget)."""
+        if self.pending or self.overflowed or self.released:
+            return True
+        self.wakeup_count += 1
+        if self._router is not None:
+            self._router.wakeup_total += 1
+        try:
+            await asyncio.wait_for(self._wakeup.wait(), timeout_s)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    def release(self):
+        """Drop the task-owned frames and leave the router. Called only
+        after the task's evidence is finalized (raw wire evidence stays
+        in the on-disk frame log — it is untouched by routing)."""
+        self.released = True
+        self.pending = []
+        self.history = []
+        if self._router is not None:
+            self._router._release(self)
+
+    def rekey(self, key, replay_pairs=()):
+        """Switch the routing key (the authoritative id arrives only
+        after session/create / thread/start).
+
+        ``replay_pairs`` (P2.2-repair1 D): an explicit ``(seq, frame)``
+        enumeration of the client's store, in seq order — the production
+        callers pass it (codex: the notification store with its parallel
+        seq record; frames predating this subscription are recovered
+        here). Pairs at/above ``_live_floor`` were already seen on the
+        live wire (delivered or stashed) and are skipped, so replay can
+        never duplicate. The placeholder stash for the new key drains
+        last; stashes for other keys are dropped (their frames remain in
+        the store for their own subscribers' replay)."""
+        self.key = key
+        if not replay_pairs and self._router is not None:
+            replay_pairs = self._router.replay(
+                key, self.start_seq,
+                include_unattributed=self.deliver_unattributed)
+        for seq, frame in replay_pairs:
+            if seq is None or seq <= self.start_seq:
+                continue
+            if self._live_floor is not None and seq >= self._live_floor:
+                continue
+            frame_key = self._router._key_of(frame) \
+                if self._router is not None else None
+            if frame_key == key or (frame_key is None
+                                    and self.deliver_unattributed):
+                self._offer(seq, frame)
+        for seq, frame in self._stash.pop(key, []):
+            self._offer(seq, frame)
+        self._stash.clear()
+        self._wakeup.set()
+
+
+class EventRouter:
+    """Keyed bounded fan-out beside a client's legacy evidence store.
+
+    ``key_of``/``seq_of`` extract the routing identity (zcode: event
+    ``sessionId``/``seq``; codex: notification ``threadId``/list index).
+    ``store`` (optional) enables replay-at-subscribe for consumers whose
+    legacy behavior drained the whole history (codex ``processed=0``).
+    Unattributed frames (key None) are broadcast to subscriptions that
+    asked for them — that is exactly what the legacy per-frame handlers
+    processed."""
+
+    def __init__(self, key_of, seq_of, store=None, store_seqs=None,
+                 bound=None):
+        self._key_of = key_of
+        self._seq_of = seq_of       # live-wire seq extraction (zcode events)
+        # P2.2-repair1 D: a store-carrying router OWNS its replay source —
+        # production codex passes its notification store plus the aligned
+        # seq record, so rekey's replay is a live production path (never
+        # the old seq_of=None dead branch). ``store_seqs`` may be shorter
+        # than the store for directly-constructed routers; the positional
+        # fallback keeps replay usable there.
+        self._store = store
+        self._store_seqs = store_seqs
+        # resolved at call time so tests can tighten the bound
+        self.bound = bound if bound is not None else EVENT_ROUTER_BOUND
+        self._subs = []
+        self.publish_count = 0
+        self.wakeup_total = 0   # consumer wakeups consumed (P2.2 metrics)
+
+    def replay(self, key, start_seq, include_unattributed=False):
+        """Matching (seq, frame) pairs of the store above ``start_seq``.
+
+        Seq resolution: the aligned record's value — a None or missing
+        record entry falls back to the frame's own seq via ``seq_of``,
+        then to the store position (repair2 F4: the record NEVER wins
+        with None). ``include_unattributed`` (repair2 F3) also returns
+        key-None frames, so subscriptions that asked for the
+        unattributed broadcast recover pre-subscription unattributed
+        frames too — the legacy processed=0 drain delivered them."""
+        if self._store is None:
+            return []
+        out = []
+        for index, frame in enumerate(list(self._store)):
+            seq = None
+            if self._store_seqs is not None and index < len(self._store_seqs):
+                seq = self._store_seqs[index]
+            if seq is None:
+                seq = self._seq_of(frame)
+            if seq is None:
+                seq = index + 1
+            if seq <= start_seq:
+                continue
+            frame_key = self._key_of(frame)
+            if frame_key == key or (frame_key is None
+                                    and include_unattributed):
+                out.append((seq, frame))
+        return out
+
+    def subscribe(self, key, start_seq, deliver_unattributed=False):
+        sub = BoundedSubscription(self, key, start_seq, self.bound,
+                                  deliver_unattributed=deliver_unattributed)
+        self._subs.append(sub)
+        return sub
+
+    def publish(self, frame, seq=None):
+        self.publish_count += 1
+        key = self._key_of(frame)
+        if seq is None:
+            seq = self._seq_of(frame)
+        for sub in list(self._subs):
+            if sub.released or seq is None or seq <= sub.start_seq:
+                continue
+            if key == sub.key or (key is None and sub.deliver_unattributed):
+                sub._offer_live(seq, frame)
+            elif sub._is_placeholder() and key is not None:
+                # P2.2-repair1 A/E: keyed frame under a placeholder key —
+                # stash it for the future rekey instead of dropping it
+                sub._stash_frame(key, seq, frame)
+
+    def wake_all(self):
+        """P2.2-repair1 B: wake every waiter (transport failure paths) so
+        consumer loops re-check client.failure immediately — the legacy
+        fail-fast classification is preserved."""
+        for sub in list(self._subs):
+            sub._wakeup.set()
+
+    def has_subscriber_for(self, key):
+        return any(not sub.released and sub.key == key for sub in self._subs)
+
+    def has_placeholder(self):
+        """True while any subscription still sits on a pre-authority
+        placeholder key — the store must keep keyed frames so their
+        receipts can scan them and their rekey can replay them."""
+        return any(not sub.released and sub._is_placeholder()
+                   for sub in self._subs)
+
+    def _release(self, sub):
+        with contextlib.suppress(ValueError):
+            self._subs.remove(sub)
+
+    def metrics(self):
+        return {'active_subscriptions': len(self._subs),
+                'retained_frames': sum(len(s.pending) + len(s.history)
+                                       for s in self._subs)}
+
+
+class TombstoneEvictionError(ValueError):
+    """A pending-response tombstone had to be evicted (TTL or capacity).
+
+    Subclasses :class:`ValueError` on purpose so the fail-closed path keeps
+    flowing through the drivers' existing exception families unchanged.
+    """
+
+
+class PendingTombstones:
+    """Bounded registry of request ids abandoned by a LOCAL timeout/cancel.
+
+    Only ids whose frame was already sent on the wire and whose pending entry
+    was then removed by the local caller (an ``asyncio`` timeout or
+    cancellation) are recorded (PLAN §7 P0.2). A late response for such an id
+    is consumed as a KNOWN-LATE frame instead of failing the shared client;
+    responses for every other id keep the ``Unmatched protocol response``
+    fail-closed handling.
+
+    Capacity and TTL are resource contracts, not CLI compatibility
+    measurements. Evicting an entry for either reason is never silent:
+    ``record``/``consume`` raise :class:`TombstoneEvictionError` so the client
+    can fail closed immediately with an explainable terminal state (an orderly
+    transport reset belongs to the P0.3 worker-generation path). The registry
+    never grows past ``capacity``, entries stay until their TTL so duplicates
+    cannot degrade into ignorable unknowns, and ``clock`` is injectable for
+    deterministic tests.
+    """
+
+    DEFAULT_CAPACITY = 1024
+    DEFAULT_TTL_S = 300.0
+
+    def __init__(self, capacity=DEFAULT_CAPACITY, ttl_s=DEFAULT_TTL_S,
+                 clock=time.monotonic):
+        if isinstance(capacity, bool) or not isinstance(capacity, int) or capacity <= 0:
+            raise ValueError('Tombstone capacity must be a positive integer')
+        if (isinstance(ttl_s, bool) or not isinstance(ttl_s, (int, float))
+                or not math.isfinite(ttl_s) or ttl_s <= 0):
+            raise ValueError('Tombstone TTL must be a positive finite number')
+        self.capacity = capacity
+        self.ttl_s = float(ttl_s)
+        self._clock = clock
+        self._entries = {}
+
+    def __len__(self):
+        return len(self._entries)
+
+    def record(self, rid, reason):
+        """Register one locally abandoned request id (its send had succeeded).
+
+        Raises :class:`TombstoneEvictionError` — without recording ``rid`` —
+        when any older entry is already past its TTL or the registry is at
+        capacity: both are fail-closed resource events, never silent evictions.
+        """
+        now = self._clock()
+        expired = sorted(old_rid for old_rid, entry in self._entries.items()
+                         if now - entry['recorded_at'] > self.ttl_s)
+        if expired:
+            raise TombstoneEvictionError(
+                'Pending tombstones expired before eviction: '
+                + ', '.join(expired) + f' (TTL {self.ttl_s}s); fail-closed')
+        if len(self._entries) >= self.capacity:
+            raise TombstoneEvictionError(
+                f'Pending tombstone capacity {self.capacity} exhausted; fail-closed')
+        self._entries[rid] = {'reason': str(reason), 'recorded_at': now,
+                              'late_kind': None, 'late_count': 0,
+                              'last_late_at': None}
+
+    def consume(self, rid, kind):
+        """Mark one late response frame against its tombstone.
+
+        Returns a copy of the recorded entry when ``rid`` is a live tombstone
+        — the frame is a known-late response and must be consumed without
+        resolving, replaying or failing anything — and ``None`` when ``rid``
+        was never tombstoned (the caller keeps its unmatched fail-closed
+        handling). Duplicate frames keep incrementing ``late_count``: the
+        entry survives until its TTL, so a duplicate can never become an
+        ignorable unknown. Raises :class:`TombstoneEvictionError` when this
+        entry's TTL already elapsed.
+        """
+        entry = self._entries.get(rid)
+        if entry is None:
+            return None
+        now = self._clock()
+        if now - entry['recorded_at'] > self.ttl_s:
+            del self._entries[rid]
+            raise TombstoneEvictionError(
+                f'Pending tombstone for {rid} expired (TTL {self.ttl_s}s) '
+                'before its late response; fail-closed')
+        entry['late_count'] += 1
+        entry['late_kind'] = kind
+        entry['last_late_at'] = now
+        return dict(entry)
+
+
 class ProtocolClient:
-    def __init__(self, workspace, output, permission, config=None, orchestration=None):
+    def __init__(self, workspace, output, permission, config=None, orchestration=None,
+                 tombstones=None, exit_event_sink=None):
         # orchestration: the validated packet block (or None) backing the
         # host-side subagent runtime config answers; never client input.
         self.orchestration = orchestration
@@ -48,6 +432,26 @@ class ProtocolClient:
         self.permission = permission
         self.config = config
         self.pending = {}
+        # P0.2: known-late response bookkeeping for requests removed from
+        # ``pending`` by a local timeout/cancel after a successful wire send.
+        self.tombstones = tombstones if tombstones is not None else PendingTombstones()
+        # P0.3: generation identity (stamped by the hub's WorkerGeneration
+        # holder) and the exactly-once awaited-exit projection. P0.4 round 2:
+        # an optional exit_event_sink links that projection to the UI
+        # process.exited sideband (fresh construction only — existing custom
+        # projections are never overwritten here; the resident path chains).
+        self.generation = None
+        self.exit_projection = (ExitProjection(on_event=exit_event_sink)
+                                if exit_event_sink is not None
+                                else ExitProjection())
+        if exit_event_sink is not None and self.generation is None:
+            # A cold client wired to the UI exit sink gets its own sequential
+            # integer generation at creation (P0.3 per-process identity
+            # semantics — {process_scope, generation} is the exit emission
+            # key). Shared-resident clients are NOT wired here and keep
+            # generation=None so the hub's WorkerGeneration stamp (or a test
+            # double's own identity) is propagated unchanged.
+            self.generation = next(_COLD_GENERATIONS)
         self.events = []
         self.responses = []
         self.counter = 0
@@ -59,6 +463,21 @@ class ProtocolClient:
         self.wire = None
         self.reader = None
         self.closing = False
+        # P2.2: keyed bounded routing beside `events` (legacy consumers
+        # never touch it; subscribe_events creates it on first use)
+        self._event_router = None
+
+    def subscribe_events(self, session_id, start_seq):
+        """P2.2: one task's bounded subscription to this client's
+        session/event stream, keyed by sessionId from ``start_seq`` on.
+        Under CZS_EVENT_ROUTER=legacy nothing routes and this is unused."""
+        if self._event_router is None:
+            self._event_router = EventRouter(
+                key_of=lambda event: event.get('sessionId')
+                if isinstance(event, dict) else None,
+                seq_of=lambda event: event.get('seq')
+                if isinstance(event, dict) else None)
+        return self._event_router.subscribe(session_id, start_seq)
 
     async def start(self):
         if self.config is None:
@@ -92,11 +511,31 @@ class ProtocolClient:
         rid = f'host-{self.counter}'
         future = asyncio.get_running_loop().create_future()
         self.pending[rid] = future
+        sent = False
         try:
             await self.send({'id':rid, 'method':method, 'params':params})
+            sent = True
             return await future
         finally:
-            self.pending.pop(rid, None)
+            # P0.2 sole-owner terminal cleanup. ``pending`` is the identity
+            # registry: whoever removes the entry first owns the tombstone
+            # decision exactly once. The cleanup records only when IT removed
+            # its own still-cancelled future — i.e. the local caller (asyncio
+            # timeout or cancel) ended the request with no response consumed
+            # by read_loop (round-2 blocker 1: a response already delivered
+            # leaves the entry popped and the future done-with-result, so no
+            # tombstone and any duplicate stays unknown fail-closed). A cancel
+            # inside drain leaves the future uncancelled (ambiguous send), and
+            # teardown / already-failed clients are gated out as well.
+            removed = self.pending.pop(rid, None)
+            if (removed is future and sent and future.cancelled()
+                    and not self.closing and self.failure is None):
+                try:
+                    self.tombstones.record(rid, 'local-timeout-or-cancel')
+                except TombstoneEvictionError as error:
+                    # Capacity/TTL eviction is never silent: fail closed now.
+                    # The cancellation itself still propagates unchanged.
+                    self.fail(error)
 
     async def reverse(self, frame):
         method, params = frame['method'], frame.get('params', {})
@@ -130,15 +569,33 @@ class ProtocolClient:
         await self.send({'id':frame['id'], 'result':response})
 
     def fail(self, error):
-        self.failure = str(error) or type(error).__name__
+        # P0.2 (round-2 minor 3): the FIRST terminal failure is the
+        # explainable cause and is never overwritten — a later stream error
+        # (e.g. the EOF that often follows an eviction fail-close) keeps it.
+        # Still idempotent for pending futures: any straggler receives a
+        # terminal exception so every waiter ends explainably.
+        if self.failure is None:
+            self.failure = str(error) or type(error).__name__
+        # P2.2-repair1 B: routed waiters must re-check client.failure now,
+        # not after their full budget — legacy fail-fast preserved.
+        if self._event_router is not None:
+            self._event_router.wake_all()
         for future in self.pending.values():
             if not future.done():
                 future.set_exception(error)
         self.pending.clear()
 
     def reverse_done(self, task):
-        if not task.cancelled() and task.exception() is not None:
-            self.fail(task.exception())
+        # P2.2: the exception is read FIRST (an unobserved one would be
+        # lost at gc time); the completed task then leaves the active
+        # registry so finished work never accumulates.
+        failed = None
+        if not task.cancelled():
+            failed = task.exception()
+        with contextlib.suppress(ValueError):
+            self.tasks.remove(task)
+        if failed is not None:
+            self.fail(failed)
 
     async def read_loop(self):
         try:
@@ -163,11 +620,35 @@ class ProtocolClient:
                     elif frame['method'] == 'session/event':
                         if not isinstance(frame.get('params'), dict):
                             raise ValueError('Session event parameters must be an object')
-                        self.events.append(frame['params'])
+                        event = frame['params']
+                        if self._event_router is not None:
+                            # P2.2 routed mode: subscriptions own their
+                            # frames (bounded, released after evidence
+                            # finalization); the raw wire log above keeps
+                            # the persistent record untouched
+                            self._event_router.publish(event)
+                        else:
+                            self.events.append(event)
                         if self.on_event:
-                            self.on_event(frame['params'])
+                            self.on_event(event)
                 elif frame.get('id') in self.pending:
                     future = self.pending.pop(frame['id'])
+                    if future.cancelled() and not self.closing \
+                            and self.failure is None:
+                        # P0.2 (round-2 blocker 2): the request was locally
+                        # removed (timeout/cancel) but its cleanup task has
+                        # not necessarily run yet — THIS frame is the first
+                        # late response. The reader took the pending entry,
+                        # so it owns the record: atomically tombstone and
+                        # consume the frame in one loop turn (the later
+                        # cleanup finds its entry gone and cannot record a
+                        # second time). The frame is audited exactly once,
+                        # through the same consume path as every other late
+                        # frame.
+                        self.tombstones.record(frame['id'],
+                                               'local-timeout-or-cancel')
+                        self.consume_late(frame)
+                        continue
                     if future.done():
                         continue
                     if 'error' in frame:
@@ -177,7 +658,7 @@ class ProtocolClient:
                     else:
                         raise ValueError('Response has no result or error')
                 else:
-                    raise ValueError('Unmatched protocol response')
+                    self.consume_late(frame)
             if not self.closing:
                 raise EOFError('ZCode protocol stream closed')
         except asyncio.CancelledError:
@@ -185,26 +666,77 @@ class ProtocolClient:
         except Exception as error:
             self.fail(error)
 
+    def consume_late(self, frame):
+        """Consume one response frame whose request was locally abandoned.
+
+        A known-late frame (its id is in the tombstone registry) is recorded
+        to the evidence wire and dropped: nothing is resolved, replayed or
+        failed. Everything else keeps the fail-closed unmatched behavior; a
+        tombstone whose TTL already elapsed fails closed with the eviction
+        reason instead of an anonymous unmatched error.
+        """
+        rid = frame.get('id')
+        kind = ('error' if 'error' in frame
+                else 'result' if 'result' in frame else None)
+        entry = self.tombstones.consume(rid, kind)
+        if entry is None:
+            raise ValueError('Unmatched protocol response')
+        if kind is None:
+            raise ValueError('Response has no result or error')
+        self.wire.write(json.dumps({'late_response_to': rid,
+                                    'tombstone_reason': entry['reason'],
+                                    'late_kind': kind,
+                                    'duplicate': entry['late_count'] > 1},
+                                   ensure_ascii=False)+'\n')
+        self.wire.flush()
+
     async def close(self):
         self.closing = True
         if self.process is not None:
             if self.process.stdin is not None:
                 self.process.stdin.close()
+            # P0.3 review C1: a BOUNDED termination gradient whose worst
+            # case (grace + TERM + KILL = 4 s) fits the worker gate's
+            # default retirement window, so evicting a stdin-ignoring but
+            # signal-responsive child actually delivers SIGTERM/SIGKILL and
+            # awaits the reaped exit inside the cleanup budget. The previous
+            # shape (5 s first wait, unbounded final wait) could overrun any
+            # bounded window and leak an un-signalled child. An unkillable
+            # process only ever costs the last bounded wait — no unbounded
+            # wait and no fabricated exit evidence.
+            exited = False
             try:
-                await asyncio.wait_for(self.process.wait(), 5)
+                await asyncio.wait_for(self.process.wait(), CLOSE_GRACE_S)
+                exited = True
             except asyncio.TimeoutError:
+                pass
+            if not exited:
                 try:
                     os.killpg(self.process.pid, signal.SIGTERM)
                 except ProcessLookupError:
                     pass
                 try:
-                    await asyncio.wait_for(self.process.wait(), 3)
+                    await asyncio.wait_for(self.process.wait(), CLOSE_TERM_S)
+                    exited = True
                 except asyncio.TimeoutError:
-                    try:
-                        os.killpg(self.process.pid, signal.SIGKILL)
-                    except ProcessLookupError:
-                        pass
-                    await self.process.wait()
+                    pass
+            if not exited:
+                try:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                try:
+                    await asyncio.wait_for(self.process.wait(), CLOSE_KILL_S)
+                    exited = True
+                except asyncio.TimeoutError:
+                    pass  # bounded best-effort ends without exit evidence
+            if exited:
+                # P0.3: a wait in the gradient above actually completed — the
+                # only place process.exited may be projected, exactly once
+                # per client (the projection itself rejects non-integer
+                # codes; duplicate close emits nothing).
+                self.exit_projection.observe_awaited_exit(
+                    self.process.returncode, generation=self.generation)
         tasks = ([self.reader] if self.reader is not None else []) + self.tasks
         for task in tasks:
             if not task.done():
@@ -397,7 +929,7 @@ def outcome_label(kind, problems=None):
     return text
 
 
-async def execute(args, config):
+async def execute(args, config, ui_emitter=None):
     if args.resume and not re.fullmatch(r'sess_[A-Za-z0-9_-]+', args.resume):
         raise ValueError('Invalid resume session ID')
     if (isinstance(args.timeout, bool) or not isinstance(args.timeout, (int, float))
@@ -420,8 +952,11 @@ async def execute(args, config):
     output.parent.mkdir(parents=True, exist_ok=True)
     state_dir = Path(config.state_dir).resolve()
     state_dir.mkdir(parents=True, exist_ok=True)
+    # P0.4 round 2: UI projection stream label for this cold run (the hub
+    # names the output file after its task id).
+    ui_task_id = Path(args.out).stem
     with workspace_lock(workspace, state_dir):
-        before = inventory(workspace)
+        before = await run_boundary_scan(inventory, workspace)
         habit_profile = profile.resolve_profile_path(config)
         habits = None
         if habit_profile is not None:
@@ -435,19 +970,29 @@ async def execute(args, config):
             habits['profile'] = {'path': str(habit_profile),
                                  'sha256': profile.digest_file(habit_profile)}
             validate_packet(packet)
-        authority = Authority(packet, packet_path, before)
+        authority = Authority(
+            packet, packet_path, before,
+            ui_emit=(ui_projection.authority_hook(
+                ui_emitter, ui_task_id, 'zcode', 'cold')
+                if ui_emitter is not None else None))
+        authority.provide_scan(await run_boundary_scan(inventory, workspace))
         authority.check_frozen()
         # Reserve the basename atomically so another worker cannot overwrite it.
         with output.open('x') as stream:
             json.dump({'delivery_ok': False, 'state': 'starting'}, stream)
         write_json(output.with_suffix('.before.json'), before)
-        # Test doubles from parallel work may predate the orchestration
-        # parameter; pass it only when the constructor accepts it.
-        if 'orchestration' in inspect.signature(ProtocolClient.__init__).parameters:
-            client = ProtocolClient(workspace, output, authority.decide, config,
-                                    orchestration=authority.orchestration)
-        else:
-            client = ProtocolClient(workspace, output, authority.decide, config)
+        # Test doubles from parallel work may predate the orchestration and
+        # P0.4 parameters; pass each only when the constructor accepts it.
+        client_params = {}
+        constructor = inspect.signature(ProtocolClient.__init__).parameters
+        if 'orchestration' in constructor:
+            client_params['orchestration'] = authority.orchestration
+        if ui_emitter is not None and ui_emitter.enabled \
+                and 'exit_event_sink' in constructor:
+            client_params['exit_event_sink'] = ui_projection.make_exit_sink(
+                ui_emitter, 'cold', 'zcode')
+        client = ProtocolClient(workspace, output, authority.decide, config,
+                                **client_params)
         input_id = 'input_'+uuid.uuid4().hex
         def receive_event(event):
             # Native orchestration bookkeeping: every parent turn observed in
@@ -462,6 +1007,14 @@ async def execute(args, config):
                     and event.get('payload',{}).get('inputId') == input_id):
                 authority.turn_id = event['turnId']
         client.on_event = receive_event
+        # P2.2 routed mode: subscribe on the constructed client BEFORE any
+        # session traffic (the read loop starts routing from the first
+        # frame); the floor is narrowed once session/subscribe answers.
+        # Duck-typed: clients/doubles without the API keep the legacy path.
+        router_sub = None  # declared here: the finally releases it
+        if (event_router_mode() == 'incremental'
+                and hasattr(client, 'subscribe_events')):
+            router_sub = client.subscribe_events(args.resume or '', 0)
         result = {'delivery_ok':False,'workspace':str(workspace),'input_id':input_id,
                   'generation':uuid.uuid4().hex, 'scientific_acceptance':'pending_codex_review'}
         if habits is not None:
@@ -542,6 +1095,10 @@ async def execute(args, config):
             subscription = await rpc('session/subscribe', {
                 'sessionId':sid,'deliveryKind':'desktop-continuous','includeSnapshot':False})
             result['start_event_seq'] = subscription['eventSeq']
+            if router_sub is not None:
+                if router_sub.key != sid:
+                    router_sub.rekey(sid)
+                router_sub.narrow_start(result['start_event_seq'])
             orchestration_result = {'enabled': bool(authority.orchestration)}
             await rpc('session/send', {'sessionId':sid,'inputId':input_id,'content':packet['prompt']})
             dispatched = True
@@ -553,22 +1110,42 @@ async def execute(args, config):
             while time.monotonic() < deadline:
                 if client.failure:
                     raise ValueError(client.failure)
-                while processed < len(client.events):
-                    event = client.events[processed]
-                    processed += 1
-                    if event.get('sessionId') != sid or event.get('seq', -1) <= result['start_event_seq']:
-                        continue
-                    payload = event.get('payload',{})
-                    if event.get('type') == 'turn.started' and payload.get('inputId') == input_id:
-                        authority.turn_id = event['turnId']
-                    if own_event(event,sid,authority.turn_id):
-                        if event.get('type') == 'turn.failed':
-                            raise ValueError('Worker turn failed: '+str(payload.get('error')))
-                        if event.get('type') == 'turn.completed':
-                            completed = event
+                if router_sub is not None:
+                    if router_sub.overflowed:
+                        # internal control overflow: the OWNING task fails
+                        # through its normal cleanup — never a UI-style gap
+                        raise RouterOverflow(
+                            'event subscription backlog overflowed for '
+                            + str(sid))
+                    for _seq, event in router_sub.drain():
+                        payload = event.get('payload',{})
+                        if event.get('type') == 'turn.started' and payload.get('inputId') == input_id:
+                            authority.turn_id = event['turnId']
+                        if own_event(event,sid,authority.turn_id):
+                            if event.get('type') == 'turn.failed':
+                                raise ValueError('Worker turn failed: '+str(payload.get('error')))
+                            if event.get('type') == 'turn.completed':
+                                completed = event
+                else:
+                    while processed < len(client.events):
+                        event = client.events[processed]
+                        processed += 1
+                        if event.get('sessionId') != sid or event.get('seq', -1) <= result['start_event_seq']:
+                            continue
+                        payload = event.get('payload',{})
+                        if event.get('type') == 'turn.started' and payload.get('inputId') == input_id:
+                            authority.turn_id = event['turnId']
+                        if own_event(event,sid,authority.turn_id):
+                            if event.get('type') == 'turn.failed':
+                                raise ValueError('Worker turn failed: '+str(payload.get('error')))
+                            if event.get('type') == 'turn.completed':
+                                completed = event
                 if completed:
                     break
-                await asyncio.sleep(0.02)
+                if router_sub is not None:
+                    await router_sub.wait_new(max(0.0, deadline - time.monotonic()))
+                else:
+                    await asyncio.sleep(0.02)
             if completed is None:
                 raise asyncio.TimeoutError('Worker turn deadline exceeded')
             result['turn_id'] = authority.turn_id
@@ -751,8 +1328,13 @@ async def execute(args, config):
                                 problems_orch.append(f'goal is not verified at audit: {status!r}')
                     elif not problems_orch or 'goal final show failed' not in str(problems_orch):
                         problems_orch.append('goal still busy at the audit boundary')
+                # P2.2-repair1 C/F-4: orchestration evidence scans read the
+                # SAME evidence slice as the later audits — the routed
+                # history when incremental, the shared store when legacy.
+                evidence_source = ([frame for _seq, frame in router_sub.history]
+                                   if router_sub is not None else client.events)
                 orchestration_tool_results = []
-                for event in client.events:
+                for event in evidence_source:
                     payload = event.get('payload')
                     if not isinstance(payload, dict):
                         continue
@@ -768,7 +1350,7 @@ async def execute(args, config):
                 orchestration_result['workflow_tool_results'] = orchestration_tool_results
                 skill_calls = []
                 streamed_skill_inputs = {}
-                for event in client.events:
+                for event in evidence_source:
                     payload = event.get('payload')
                     if not isinstance(payload, dict):
                         continue
@@ -796,14 +1378,17 @@ async def execute(args, config):
             snapshot = await rpc('session/read', {'sessionId':sid,'deliveryKind':'desktop-continuous','messageLimit':10})
             if snapshot['session'].get('status') != 'idle' or snapshot['runtime'].get('pendingRequestIds'):
                 raise ValueError('Worker is not idle or still has pending interactions')
+            evidence_source = ([frame for _seq, frame in router_sub.history]
+                               if router_sub is not None else client.events)
             if requested_model is not None:
                 result['observed_model_after'] = observed_model(snapshot)
                 result['effective_model_after'] = check_model_snapshot(snapshot, requested_model)
                 result['model_execution'] = model_execution_evidence(
-                    client.events, sid, authority.turn_id, requested_model,
+                    evidence_source, sid, authority.turn_id, requested_model,
                     authority=authority)
+            authority.provide_scan(await run_boundary_scan(inventory, workspace))
             authority.check_frozen()
-            commands, problems = execution_evidence(client.events, authority)
+            commands, problems = execution_evidence(evidence_source, authority)
             result['commands'] = commands
             seen = {entry['command_id'] for entry in commands}
             required = {entry['id'] for entry in packet.get('commands',[]) if entry.get('required',True)}
@@ -886,14 +1471,14 @@ async def execute(args, config):
                         run_id = 'dwfrun-' + parts[2][7:-4]
                         entry = workspace / name
                         return (entry.is_file() and not entry.is_symlink()
-                                and hashlib.sha256(read_regular(entry)).hexdigest()
+                                and sha256_regular(entry)
                                 == authority.runtime_entry_bytes.get(run_id))
                     return False
                 result['changed_files'] = [name for name in changed_all if not _final_artifact(name)]
                 runtime_artifacts = [name for name in changed_all if _final_artifact(name)]
                 if runtime_artifacts:
                     result['runtime_artifacts'] = {
-                        name: hashlib.sha256(read_regular(workspace / name)).hexdigest()
+                        name: sha256_regular(workspace / name)
                         for name in runtime_artifacts if (workspace / name).is_file()}
             except (ValueError,OSError) as error:
                 result.update(delivery_ok=False,scope_error=str(error))
@@ -906,6 +1491,10 @@ async def execute(args, config):
                 # post-success audit verdict keeps its more specific category.
                 result['outcome'] = 'scope-error'
             write_json(output,redact_transport(result))
+            # P2.2: task-owned routed frames release only after the result
+            # (with all its evidence) is finalized and persisted
+            if router_sub is not None:
+                router_sub.release()
             if authority.session_id and result.get('completion'):
                 write_json(state_dir/(authority.session_id+'.json'), {
                     'workspace':str(workspace),'state':'exited','pid':client.process.pid,

@@ -1,9 +1,11 @@
 """Broker regression contracts; no live CLI, network, SSH, or scientific runtime."""
 import asyncio
+import hashlib
 import copy
 import io
 import json
 import math
+import time
 import os
 from contextlib import redirect_stdout
 from pathlib import Path
@@ -33,7 +35,7 @@ class AuthorityFixture(unittest.TestCase):
             "allowed_files": ["result.txt", "editable.py"],
             "commands": [{"id": "check", "command": self.command,
                           "max_uses": 2, "max_timeout_ms": 5000}],
-            "trusted_hashes": {str(self.runner): protocol.hashlib.sha256(
+            "trusted_hashes": {str(self.runner): hashlib.sha256(
                 self.runner.read_bytes()).hexdigest()},
         }
         self.packet_path.write_text(json.dumps(self.packet))
@@ -862,6 +864,332 @@ class QuietSummaryTests(unittest.IsolatedAsyncioTestCase):
         output = await self.run_execute(quiet=False)
         self.assertIn('delivery_ok', output)
         self.assertIn('sess_quiet', output)
+
+
+class EventRouterTests(unittest.IsolatedAsyncioTestCase):
+    """P2.2: bounded keyed routing, wakeup waits, overflow, rekey/narrow."""
+
+    def _router(self):
+        return protocol.EventRouter(
+            key_of=lambda frame: frame.get('sessionId'),
+            seq_of=lambda frame: frame.get('seq'))
+
+    async def test_delivery_wakes_the_consumer_and_keeps_history(self):
+        router = self._router()
+        sub = router.subscribe('sess_a', 0)
+        self.assertEqual(sub.drain(), [])
+        router.publish({'sessionId': 'sess_a', 'seq': 1, 'type': 'x'})
+        router.publish({'sessionId': 'sess_b', 'seq': 2, 'type': 'x'})
+        router.publish({'sessionId': 'sess_a', 'seq': 0, 'type': 'old'})
+        woken = await sub.wait_new(0.05)
+        self.assertTrue(woken)
+        frames = sub.drain()
+        self.assertEqual([f['seq'] for _s, f in frames], [1])
+        self.assertEqual([f['seq'] for _s, f in sub.history], [1])
+        self.assertEqual(sub.delivered_count, 1)
+
+    async def test_wait_new_times_out_without_frames(self):
+        router = self._router()
+        sub = router.subscribe('sess_a', 0)
+        self.assertFalse(await sub.wait_new(0.01))
+
+    def test_overflow_marks_and_release_empties(self):
+        router = protocol.EventRouter(
+            key_of=lambda f: f.get('k'), seq_of=lambda f: f.get('seq'),
+            bound=2)
+        sub = router.subscribe('k', 0)
+        for seq in (1, 2, 3, 4):
+            router.publish({'k': 'k', 'seq': seq})
+        self.assertTrue(sub.overflowed)
+        self.assertEqual(len(sub.pending), 2)  # bounded backlog
+        sub.release()
+        self.assertTrue(sub.released)
+        self.assertEqual(router.metrics()['active_subscriptions'], 0)
+        self.assertEqual(router.metrics()['retained_frames'], 0)
+        # post-release publishes are refused
+        router.publish({'k': 'k', 'seq': 5})
+        self.assertEqual(sub.pending, [])
+
+    def test_narrow_start_drops_at_or_below_the_floor(self):
+        router = self._router()
+        sub = router.subscribe('sess_a', 0)
+        for seq in (1, 2, 3):
+            router.publish({'sessionId': 'sess_a', 'seq': seq})
+        sub.drain()
+        sub.narrow_start(2)
+        self.assertEqual([f['seq'] for _s, f in sub.history], [3])
+        router.publish({'sessionId': 'sess_a', 'seq': 2})
+        self.assertEqual(sub.pending, [])  # at-floor frames never deliver
+
+    def test_rekey_replay_uses_production_pairs_and_never_duplicates(self):
+        """G2: the production shape — explicit-seq publish under a
+        placeholder key (frames get stashed), then rekey with the
+        client-provided (seq, frame) store enumeration. Frames below the
+        live floor (pre-subscription) are recovered; frames at/above it
+        (already stashed) are delivered exactly once."""
+        router = self._router()
+        sub = router.subscribe(None, 0, deliver_unattributed=True)
+        # pre-subscription store frames (seqs 1-3, never published)
+        store_pairs = [(1, {'sessionId': 'th_1', 'seq': 1, 'n': 1}),
+                       (2, {'sessionId': 'th_2', 'seq': 2, 'n': 2}),
+                       (3, {'sessionId': None, 'seq': 3, 'n': 3})]
+        # window frames while the placeholder key is set: stashed (own)
+        # or delivered live (unattributed broadcast)
+        router.publish({'sessionId': 'th_1', 'seq': 4, 'n': 4}, seq=4)
+        router.publish({'sessionId': None, 'seq': 5, 'n': 5}, seq=5)
+        # a late pre-rekey frame for another thread: stashed, then
+        # dropped at rekey (its own subscriber's replay covers it)
+        router.publish({'sessionId': 'th_2', 'seq': 6, 'n': 6}, seq=6)
+        window_unattributed = sub.drain()
+        self.assertEqual([f['n'] for _s, f in window_unattributed], [5])
+        # the store enumeration mirrors the client's parallel seq record:
+        # pre-subscription pairs + the stashed/live frames now in store
+        full_store = (list(store_pairs)
+                      + [(4, {'sessionId': 'th_1', 'seq': 4, 'n': 4}),
+                         (5, {'sessionId': None, 'seq': 5, 'n': 5}),
+                         (6, {'sessionId': 'th_2', 'seq': 6, 'n': 6})])
+        sub.rekey('th_1', replay_pairs=full_store)
+        drained = sub.drain()
+        # pre-subscription own (1) and pre-subscription unattributed (3)
+        # are recovered by replay; stashed own (4) drains; the live
+        # unattributed (5) is NOT re-delivered (live floor dedup);
+        # foreign threads (2, 6) never arrive
+        self.assertEqual([f['n'] for _s, f in drained], [1, 3, 4])
+        self.assertEqual([f['n'] for _s, f in sub.history], [5, 1, 3, 4])
+
+    def test_unattributed_broadcast_only_when_requested(self):
+        router = self._router()
+        plain = router.subscribe('sess_a', 0)
+        broadcast = router.subscribe('sess_b', 0, deliver_unattributed=True)
+        router.publish({'sessionId': None, 'seq': 1})
+        self.assertEqual(len(plain.pending), 0)
+        self.assertEqual(len(broadcast.pending), 1)
+
+    async def test_cold_execute_routed_matches_legacy_shape(self):
+        """execute() under CZS_EVENT_ROUTER=incremental with a routed fake
+        client still delivers (early subscribe + narrow)."""
+        import tempfile
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp).resolve()  # macOS /var is a symlink chain
+            workspace = root / 'ws'
+            workspace.mkdir()
+            (workspace / 'frozen.txt').write_text('Frozen input\n')
+            packet = root / 'packet.json'
+            packet.write_text(json.dumps(
+                {'workspace': str(workspace), 'prompt': 'p',
+                 'allowed_files': []}))
+            config = SimpleNamespace(work_root=root,
+                                     state_dir=root / 'state',
+                                     cache_dir=root / 'cache')
+            args = SimpleNamespace(packet=str(packet),
+                                   out=str(root / 'run.json'),
+                                   resume=None, timeout=5, quiet=True)
+
+            class RoutedFakeClient:
+                def __init__(self):
+                    self.events = []
+                    self.on_event = None
+                    self.failure = None
+                    self.process = SimpleNamespace(pid=1, returncode=None)
+                    self._router = protocol.EventRouter(
+                        key_of=lambda e: e.get('sessionId'),
+                        seq_of=lambda e: e.get('seq'))
+
+                def subscribe_events(self, session_id, start_seq):
+                    return self._router.subscribe(session_id, start_seq)
+
+                async def start(self):
+                    pass
+
+                async def close(self):
+                    self.process.returncode = 0
+
+                async def request(self, method, params):
+                    if method == 'session/create':
+                        return {'session': {'sessionId': 'sess_r'}}
+                    if method == 'session/subscribe':
+                        return {'eventSeq': 0}
+                    if method == 'session/read':
+                        return {'session': {'status': 'idle'},
+                                'runtime': {'pendingRequestIds': []}}
+                    if method == 'session/send':
+                        loop = asyncio.get_running_loop()
+                        loop.create_task(self._turn(params['inputId']))
+                        return {}
+                    return {}
+
+                async def _turn(self, input_id):
+                    await asyncio.sleep(0.01)
+                    for type_, seq in (('turn.started', 1),
+                                       ('turn.completed', 2)):
+                        event = {'type': type_, 'sessionId': 'sess_r',
+                                 'turnId': 'turn_r', 'seq': seq,
+                                 'payload': {'inputId': input_id}
+                                 if type_ == 'turn.started'
+                                 else {'resultType': 'success'}}
+                        self._router.publish(event)
+                        if self.on_event:
+                            self.on_event(event)
+
+            fake = RoutedFakeClient()
+            with patch.dict(os.environ, {'CZS_EVENT_ROUTER': 'incremental'}), \
+                    patch.object(protocol, 'ProtocolClient',
+                                 lambda *a, **k: fake), \
+                    redirect_stdout(io.StringIO()):
+                await protocol.execute(args, config)
+            result = json.loads((root / 'run.json').read_text())
+            self.assertTrue(result['delivery_ok'])
+            self.assertEqual(result['outcome'], 'delivered')
+
+
+class RoutedFailureAndOrchestrationTests(unittest.IsolatedAsyncioTestCase):
+    """P2.2-repair1 G3/G4: transport-failure wakeup and orchestration
+    evidence under the routed path."""
+
+    async def test_transport_failure_wakes_routed_waiters_fast(self):
+        """G3 (repair1 B): client.fail() must wake every subscription —
+        the consumer re-checks failure immediately instead of burning
+        its whole budget (legacy fail-fast preserved)."""
+        client = protocol.ProtocolClient.__new__(protocol.ProtocolClient)
+        client.failure = None      # __new__ skips __init__; fail() reads it
+        client.pending = {}
+        client._event_router = None
+        sub = client.subscribe_events('sess_x', 0)
+        started = time.monotonic()
+
+        async def fail_soon():
+            await asyncio.sleep(0.05)
+            client.fail(ValueError('ZCode protocol stream closed'))
+
+        task = asyncio.get_running_loop().create_task(fail_soon())
+        woken = await sub.wait_new(5.0)
+        elapsed = time.monotonic() - started
+        await task
+        self.assertTrue(woken)
+        self.assertLess(elapsed, 1.0)
+        self.assertEqual(client.failure, 'ZCode protocol stream closed')
+
+    async def test_orchestration_evidence_identical_across_router_modes(self):
+        """G4 (repair1 C/F-4): a routed duck-typed client (the real
+        ProtocolClient wiring) with an orchestration packet —
+        skill_invocations and workflow_tool_results must match legacy
+        exactly and be non-empty."""
+        import tempfile
+
+        class OrchFakeClient:
+            def __init__(self):
+                self.events = []
+                self.on_event = None
+                self.failure = None
+                self.process = SimpleNamespace(pid=1, returncode=None)
+                self._event_router = None
+
+            def subscribe_events(self, session_id, start_seq):
+                if self._event_router is None:
+                    self._event_router = protocol.EventRouter(
+                        key_of=lambda e: e.get('sessionId'),
+                        seq_of=lambda e: e.get('seq'))
+                return self._event_router.subscribe(session_id, start_seq)
+
+            async def start(self):
+                pass
+
+            async def close(self):
+                self.process.returncode = 0
+
+            async def request(self, method, params):
+                if method == 'session/create':
+                    return {'session': {'sessionId': 'sess_orch'}}
+                if method == 'session/subscribe':
+                    return {'eventSeq': 0}
+                if method == 'session/read':
+                    return {'session': {'status': 'idle'},
+                            'runtime': {'pendingRequestIds': []}}
+                if method == 'session/subagents':
+                    return {'running': [], 'ended': {'items': []}}
+                if method == 'session/send':
+                    loop = asyncio.get_running_loop()
+                    loop.create_task(self._turn(params['inputId']))
+                    return {}
+                return {}
+
+            async def _turn(self, input_id):
+                await asyncio.sleep(0.01)
+                sid, turn = 'sess_orch', 'turn_orch'
+                events = [
+                    {'type': 'turn.started', 'sessionId': sid,
+                     'turnId': turn, 'seq': 1,
+                     'payload': {'inputId': input_id}},
+                    {'type': 'model.streaming', 'sessionId': sid,
+                     'turnId': turn, 'seq': 2,
+                     'payload': {'kind': 'tool_call', 'toolName': 'Skill',
+                                 'toolCallId': 'tc1',
+                                 'input': {'skill': 'report'}}},
+                    {'type': 'tool.updated', 'sessionId': sid,
+                     'turnId': turn, 'seq': 3,
+                     'payload': {'kind': 'scheduled', 'toolName': 'Skill',
+                                 'toolCallId': 'tc1'}},
+                    {'type': 'tool.updated', 'sessionId': sid,
+                     'turnId': turn, 'seq': 4,
+                     'payload': {'kind': 'result', 'toolName': 'Skill',
+                                 'toolCallId': 'tc1'}},
+                    {'type': 'tool.updated', 'sessionId': sid,
+                     'turnId': turn, 'seq': 5,
+                     'payload': {'kind': 'result',
+                                 'toolName': 'CreateWorkflow',
+                                 'toolCallId': 'tc2',
+                                 'result': {'content': 'wf ok'}}},
+                    {'type': 'turn.completed', 'sessionId': sid,
+                     'turnId': turn, 'seq': 6,
+                     'payload': {'resultType': 'success'}},
+                ]
+                for event in events:
+                    if self._event_router is not None:
+                        self._event_router.publish(event)
+                    else:
+                        self.events.append(event)
+                    if self.on_event:
+                        self.on_event(event)
+
+        harvest = {}
+        for mode in ('legacy', 'incremental'):
+            with tempfile.TemporaryDirectory() as tmp:
+                root = Path(tmp).resolve()
+                ws = root / 'ws'
+                ws.mkdir()
+                (ws / 'frozen.txt').write_text('frozen\n')
+                packet = root / 'packet.json'
+                packet.write_text(json.dumps({
+                    'workspace': str(ws), 'prompt': 'p',
+                    'allowed_files': [],
+                    'orchestration': {'agents': {'profiles': [
+                        {'name': 'worker', 'description': 'd',
+                         'systemPrompt': 's', 'tools': ['Read'],
+                         'max_turns': 1}],
+                        'allowed_types': ['worker']}}}))
+                config = SimpleNamespace(work_root=root,
+                                         state_dir=root / 'state',
+                                         cache_dir=root / 'cache')
+                args = SimpleNamespace(packet=str(packet),
+                                       out=str(root / 'run.json'),
+                                       resume=None, timeout=8, quiet=True)
+                fake = OrchFakeClient()
+                with patch.dict(os.environ,
+                                {'CZS_EVENT_ROUTER': mode}), \
+                        patch.object(protocol, 'ProtocolClient',
+                                     lambda *a, **k: fake), \
+                        redirect_stdout(io.StringIO()):
+                    await protocol.execute(args, config)
+                result = json.loads((root / 'run.json').read_text())
+                orch = result.get('orchestration') or {}
+                harvest[mode] = {
+                    'skills': orch.get('skill_invocations'),
+                    'wf': orch.get('workflow_tool_results'),
+                    'problems': orch.get('problems')}
+        self.assertEqual(harvest['legacy'], harvest['incremental'])
+        self.assertTrue(harvest['incremental']['skills'])
+        self.assertTrue(harvest['incremental']['wf'])
+
 
 
 if __name__ == "__main__":

@@ -117,5 +117,195 @@ class StateHelpersTests(unittest.TestCase):
                 common.process_alive(42)
 
 
+class StreamedHashTests(unittest.TestCase):
+    """P2.1 chunked SHA-256: same admission/error contract as
+    read_regular, bit-identical digests, bounded per-file buffer."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.directory = Path(temporary.name)
+
+    def patterned(self, size: int) -> bytes:
+        return bytes(range(256)) * (size // 256) + bytes(size % 256)
+
+    def test_digest_matches_read_regular_across_chunk_boundaries(self):
+        chunk = common.HASH_CHUNK_BYTES
+        for size in (0, 1, 255, 256, 1024, chunk - 1, chunk, chunk + 1,
+                     2 * chunk, 3 * chunk + 7):
+            with self.subTest(size=size):
+                path = self.directory / f"s{size}.bin"
+                payload = self.patterned(size)
+                path.write_bytes(payload)
+                self.assertEqual(common.sha256_regular(path),
+                                 hashlib.sha256(payload).hexdigest())
+                self.assertEqual(common.sha256_regular(path),
+                                 hashlib.sha256(common.read_regular(path)).hexdigest())
+
+    def test_custom_chunk_size_same_digest(self):
+        path = self.directory / "custom.bin"
+        payload = self.patterned(100_003)
+        path.write_bytes(payload)
+        self.assertEqual(common.sha256_regular(path, chunk_bytes=1024),
+                         hashlib.sha256(payload).hexdigest())
+
+    def test_error_types_and_messages_match_read_regular(self):
+        real = self.directory / "real"
+        real.write_text("content")
+        link = self.directory / "link"
+        link.symlink_to(real)
+        shared = self.directory / "shared"
+        os.link(real, shared)
+        fifo = self.directory / "fifo"
+        os.mkfifo(fifo)
+        missing = self.directory / "missing"
+        # a directory is refused with the identical message too (on macOS
+        # the O_NONBLOCK open itself fails with EISDIR, so the OSError
+        # wrapper fires before the fstat admission check)
+        directory = self.directory / "dir"
+        directory.mkdir()
+        for path in (link, shared, fifo, missing, directory):
+            with self.subTest(path=path.name):
+                with self.assertRaises(ValueError) as read_error:
+                    common.read_regular(path)
+                with self.assertRaises(ValueError) as hash_error:
+                    common.sha256_regular(path)
+                self.assertEqual(str(hash_error.exception),
+                                 str(read_error.exception))
+
+    def test_directory_input_leaks_no_descriptors(self):
+        """F-1 regression: on macOS os.open(dir, O_NONBLOCK) succeeds and
+        os.fdopen then raises IsADirectoryError BEFORE the with-statement
+        owns the fd — both readers must close it anyway and keep the
+        ValueError contract."""
+        def open_fds():
+            return len(os.listdir("/dev/fd"))
+
+        directory = self.directory / "adir"
+        directory.mkdir()
+        import gc
+        for func in (common.read_regular, common.sha256_regular):
+            with self.subTest(func=func.__name__):
+                before = open_fds()
+                messages = set()
+                for _ in range(50):
+                    with self.assertRaises(ValueError) as caught:
+                        func(directory)
+                    messages.add(str(caught.exception))
+                gc.collect()
+                self.assertEqual(open_fds() - before, 0)
+                self.assertEqual(
+                    messages,
+                    {f"Cannot read ordinary file {directory}: Is a directory"})
+
+    def test_unreadable_file_leaks_no_descriptors(self):
+        """Permission-denied open must not leak either (the fdopen gap is
+        unreachable there, but the error path is held to the same bar)."""
+        if os.geteuid() == 0:
+            self.skipTest("root ignores permission bits")
+        def open_fds():
+            return len(os.listdir("/dev/fd"))
+
+        path = self.directory / "locked.bin"
+        path.write_bytes(b"x")
+        path.chmod(0o000)
+        self.addCleanup(path.chmod, 0o600)
+        import gc
+        for func in (common.read_regular, common.sha256_regular):
+            with self.subTest(func=func.__name__):
+                before = open_fds()
+                for _ in range(50):
+                    with self.assertRaises(ValueError):
+                        func(path)
+                gc.collect()
+                self.assertEqual(open_fds() - before, 0)
+
+    def test_invalid_chunk_size_rejected(self):
+        path = self.directory / "small.bin"
+        path.write_bytes(b"x")
+        for bad in (0, -1, True, 1.5, "1024",
+                    common.HASH_CHUNK_BYTES + 1, common.HASH_CHUNK_BYTES * 1024):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                common.sha256_regular(path, chunk_bytes=bad)
+
+    def test_peak_memory_stays_at_chunk_scale_not_file_scale(self):
+        """A 8 MiB file must hash with well under 8 MiB of live allocations
+        (read_regular's whole-file buffer would exceed the bound)."""
+        import tracemalloc
+        chunk = common.HASH_CHUNK_BYTES
+        size = 8 * chunk
+        path = self.directory / "big.bin"
+        path.write_bytes(self.patterned(size))
+        tracemalloc.start()
+        try:
+            common.sha256_regular(path)
+            _, peak = tracemalloc.get_traced_memory()
+        finally:
+            tracemalloc.stop()
+        self.assertLess(peak, 4 * chunk)
+
+
+class BoundaryScanExecutorTests(unittest.TestCase):
+    """P2.1: run-boundary scans ride one bounded off-loop executor."""
+
+    def test_executor_is_shared_and_bounded(self):
+        executor = common.boundary_scan_executor()
+        self.assertIs(executor, common.boundary_scan_executor())
+        self.assertEqual(executor._max_workers, common.BOUNDARY_SCAN_WORKERS)
+
+    def test_scan_runs_off_the_event_loop_thread_and_returns_result(self):
+        import asyncio
+        import threading
+
+        def probe(value):
+            return value, threading.current_thread() is threading.main_thread()
+
+        async def main():
+            return await common.run_boundary_scan(probe, 41)
+
+        value, ran_on_main = asyncio.run(main())
+        self.assertEqual(value, 41)
+        self.assertFalse(ran_on_main)
+
+    def test_cancelling_the_await_never_kills_the_running_scan(self):
+        import asyncio
+        import threading
+
+        started = threading.Event()
+        finished = threading.Event()
+
+        def slow_scan():
+            started.set()
+            for _ in range(200):
+                if finished.wait(0.005):
+                    return "scan-settled"
+            return "scan-settled"
+
+        async def main():
+            task = asyncio.get_running_loop().create_task(
+                common.run_boundary_scan(slow_scan))
+            await asyncio.get_running_loop().run_in_executor(None, started.wait, 2)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass  # the await is gone; the scan thread keeps running
+            for _ in range(400):
+                if finished.is_set():
+                    break
+                await asyncio.sleep(0.005)
+            return None
+
+        async def settle():
+            await asyncio.sleep(0.02)
+            finished.set()
+
+        async def both():
+            await asyncio.gather(main(), settle())
+
+        asyncio.run(both())
+        self.assertTrue(started.is_set())
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -5,6 +5,7 @@ codex home and zcode database are temp fixtures, and the only subprocess run
 is the hub server itself (MCP stdio)."""
 
 import asyncio
+import threading
 import contextlib
 import io
 import json
@@ -14,6 +15,8 @@ import sys
 import tempfile
 import time
 import unittest
+from unittest import mock
+from types import SimpleNamespace
 from dataclasses import dataclass
 from pathlib import Path
 from unittest.mock import AsyncMock, patch
@@ -25,6 +28,426 @@ from zcode_supervisor.runtime import Config
 
 TOOL_NAMES = ["delegate", "health", "list_sessions", "list_skills",
               "list_workers", "read_context"]
+
+
+class StreamingAdmissionTests(unittest.TestCase):
+    """P2.4 repair1 F-A/F-B/F-C: admission parity, fd ownership, and the
+    str.splitlines separator set on the streamed index read."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.tasks = self.root / "hub" / "tasks"
+        self.tasks.mkdir(parents=True)
+        self.config = SimpleNamespace(state_dir=str(self.root),
+                                      work_root=str(self.root))
+
+    def _write(self, text):
+        (self.tasks / "index.jsonl").write_text(text, encoding="utf-8")
+
+    def test_hardlink_index_is_refused_like_read_regular(self):
+        self._write(json.dumps({"task_id": "t1", "worker": "codex",
+                                "status": "running"}) + "\n")
+        # a SECOND hard link to the same inode: the index path itself
+        # now reports st_nlink == 2 — read_regular refused this shape
+        (self.tasks / "second-link.jsonl").hardlink_to(
+            self.tasks / "index.jsonl")
+        with self.assertRaises(H.HubError) as caught:
+            H.list_sessions_impl(self.config)
+        self.assertEqual(caught.exception.code, "index-unreadable")
+        self.assertIn("Expected an ordinary single-link file",
+                      caught.exception.detail)
+
+    def test_fifo_index_race_refused_not_silently_consumed(self):
+        # standing FIFOs are invisible to the old is_file() gate too —
+        # the admission matters in the is_file->open TOCTOU window
+        os.mkfifo(self.tasks / "index.jsonl")
+        real_is_file = Path.is_file
+        with mock.patch.object(
+                Path, "is_file",
+                lambda self: True if self.name == "index.jsonl"
+                else real_is_file(self)):
+            with self.assertRaises(H.HubError) as caught:
+                H.list_sessions_impl(self.config)
+        self.assertEqual(caught.exception.code, "index-unreadable")
+
+    def test_directory_race_leaks_no_fd(self):
+        # simulate the is_file->open TOCTOU: the path is a directory by
+        # open time; the failed fdopen path must close the fd
+        (self.tasks / "index.jsonl").mkdir()
+        real_is_file = Path.is_file
+
+        def racing_is_file(self):
+            if self.name == "index.jsonl":
+                return True  # race: passes the check, becomes a dir
+            return real_is_file(self)
+
+        def fd_count():
+            return len(os.listdir("/dev/fd"))
+        import unittest.mock as _mock
+        with _mock.patch.object(Path, "is_file", racing_is_file):
+            before = fd_count()
+            for _ in range(5):
+                with self.assertRaises(H.HubError):
+                    H.list_sessions_impl(self.config)
+            import gc
+            gc.collect()
+            self.assertEqual(fd_count() - before, 0)
+
+    def test_exotic_separators_keep_old_record_boundaries(self):
+        lines = [json.dumps({"task_id": "t%d" % i, "worker": "codex",
+                             "status": "running", "seq": i})
+                 for i in range(4)]
+        shapes = {
+            "ff": lines[0] + "\x0c" + lines[1] + "\n",
+            "vt": lines[0] + "\x0b" + lines[1] + "\n",
+            "fs_gs_rs": lines[0] + "\x1c" + lines[1] + "\x1d"
+                        + lines[2] + "\x1e" + lines[3] + "\n",
+            "nel": lines[0] + "\x85" + lines[1] + "\n",
+            "ls_ps": lines[0] + "\u2028" + lines[1] + "\u2029",
+        }
+        for name, text in shapes.items():
+            with self.subTest(shape=name):
+                self._write(text)
+                result = H.list_sessions_impl(self.config)
+                self.assertEqual(result["total"],
+                                 len(text.splitlines()))
+                self.assertEqual(result["malformed_index_lines"], 0)
+                self.assertEqual(
+                    [r["task_id"] for r in result["sessions"]],
+                    [json.loads(line)["task_id"]
+                     for line in text.splitlines()])
+
+
+class Repair2LinearityTests(unittest.TestCase):
+    """P2.4 repair2 R1/R2: giant-line wall is linear; multibyte chars
+    crossing the 256KiB chunk boundary survive in both readers."""
+
+    def test_giant_single_line_wall_is_linear(self):
+        import time as _time
+        walls = {}
+        for size_mb in (5, 10, 20):
+            text = '{"blob": "' + "X" * (size_mb * 1024 * 1024) + '"}'
+            with tempfile.TemporaryDirectory() as tmp:
+                f = Path(tmp) / "index.jsonl"
+                f.write_text(text, encoding="utf-8")
+                root = Path(tmp)
+                (root / "hub" / "tasks").mkdir(parents=True)
+                (root / "hub" / "tasks" / "index.jsonl").write_text(
+                    text, encoding="utf-8")
+                config = SimpleNamespace(state_dir=str(root),
+                                         work_root=str(root))
+                t0 = _time.monotonic()
+                result = H.list_sessions_impl(config)
+                walls[size_mb] = _time.monotonic() - t0
+                self.assertEqual(result["total"], 1)
+        # wall gate (dispatch: 30MB ~<=1s class -> 20MB must be well
+        # under a second) AND linear-ish growth (doubling ~doubles)
+        self.assertLess(walls[20], 1.0)
+        self.assertLess(walls[10] / walls[5], 3.0)
+        self.assertLess(walls[20] / walls[10], 3.0)
+
+    def test_multibyte_straddling_chunk_boundary_survives(self):
+        """R2: 中 (E4 B8 AD) split across the 256KiB chunk edge must
+        survive in _index_hints (old read_text parity) and in the hub
+        streaming splitter."""
+        from zcode_supervisor.codex_driver import _index_hints
+        chunk = 256 * 1024
+        lead = b'{"session_id":"s1","path":"'
+        target = chunk - 1 - len(lead)
+        data = (lead + b"p" * target
+                + "中".encode() + b'"}\n')
+        with tempfile.TemporaryDirectory() as tmp:
+            home = Path(tmp)
+            (home / "session_index.jsonl").write_bytes(data)
+            hints = _index_hints(home, "s1")
+        self.assertEqual(len(hints), 1)
+        self.assertIn("中", str(hints[0]))
+        self.assertNotIn("\ufffd", str(hints[0]))
+        # hub side: same shape through the streaming splitter
+        with tempfile.TemporaryDirectory() as tmp:
+            f = Path(tmp) / "x"
+            f.write_bytes(data)
+            lines = list(H._splitlines_streaming(f))
+        self.assertEqual(len(lines), 1)
+        self.assertIn("中", lines[0])
+        self.assertNotIn("\ufffd", lines[0])
+
+
+class Repair3DanglingCrBoundaryTests(unittest.TestCase):
+    """P2.4 repair3 R3/N6: a lone ``\\r`` dangling at a chunk boundary
+    (block ends, no segment emitted) must stay INSIDE the scan window —
+    it still acts as a separator (or pairs into ``\\r\\n``) once the next
+    chunk arrives. repair2 folded it into the scanned prefix, gluing
+    records across the boundary (consumer-visible: total=0/malformed=1
+    at the real 256KiB boundary; hints lost both records)."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+
+    # ---- drivers over the REAL product entry points ----------------
+    def _hub_segments(self, data, chunk):
+        path = self.root / "corpus.bin"
+        path.write_bytes(data)
+        return list(H._splitlines_streaming(path, chunk_bytes=chunk))
+
+    def _hints_segments(self, data, chunk):
+        """Real _index_hints loop driven at an arbitrary chunk size via
+        a capped reader (raw segments recorded past the JSON gate)."""
+        from zcode_supervisor import codex_driver
+        home = self.root / "hint-home"
+        home.mkdir(exist_ok=True)
+        (home / "session_index.jsonl").write_bytes(data)
+        recorded: list = []
+
+        class _Capped:
+            def __init__(self, real):
+                self._real = real
+
+            def read(self, size):
+                return self._real.read(min(size, chunk))
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                self._real.close()
+                return False
+
+        real_open = open
+
+        def capped_open(file, mode="r", *args, **kwargs):
+            assert "b" in mode
+            return _Capped(real_open(file, mode, *args, **kwargs))
+
+        with mock.patch.object(
+                codex_driver, "_absorb_index_line",
+                lambda line, tid, hints: recorded.append(line)), \
+                mock.patch("builtins.open", capped_open):
+            codex_driver._index_hints(home, "th1")
+        return recorded
+
+    def _assert_both_sides_exact(self, data):
+        truth = data.decode("utf-8", "replace").splitlines()
+        for chunk in range(1, len(data) + 2):
+            with self.subTest(chunk=chunk, data=data):
+                self.assertEqual(self._hub_segments(data, chunk), truth)
+                self.assertEqual(self._hints_segments(data, chunk), truth)
+
+    # ---- dispatch shape 1: \r at last block byte + \n crossing -----
+    def test_cr_last_byte_then_lf_crossing(self):
+        # the \r must pair into \r\n — no residual \r inside a segment
+        self._assert_both_sides_exact(b"abcdef\r\ndef")
+
+    # ---- dispatch shape 2: dangling \r + non-\n crossing -----------
+    def test_cr_last_byte_then_nonlf_crossing(self):
+        for data in (b"abcdef\rx",          # standalone \r splits
+                     b"abcdef\r\rx",        # \r\r then content
+                     b"a\r\r\nb",           # \r \r\n mix
+                     b"a\n\r\rb",           # \n \r \r
+                     b"a\r\rb"):            # \r\r mid-file
+            with self.subTest(data=data):
+                self._assert_both_sides_exact(data)
+
+    # ---- dispatch shape 3: dangling \r + multibyte crossing --------
+    def test_cr_last_byte_then_multibyte_crossing(self):
+        for text in ("\r中x",               # \r then a 3-byte char
+                     "中\rx",               # multibyte then dangling \r
+                     "前中\r后",            # \r deep inside multibyte run
+                     "\r😀x"):              # \r then a 4-byte char
+            with self.subTest(text=text):
+                self._assert_both_sides_exact(text.encode())
+
+    # ---- dispatch shape 4: \r\r\r is three separator events -------
+    def test_cr_cr_cr_is_three_empty_segments(self):
+        for data, want in ((b"\r\r\rQ", ["", "", "", "Q"]),
+                           (b"a\r\r\rb", ["a", "", "", "b"])):
+            truth = data.decode("utf-8", "replace").splitlines()
+            self.assertEqual(truth, want)  # the oracle agrees: 3 empties
+            for chunk in range(1, len(data) + 2):
+                with self.subTest(chunk=chunk, data=data):
+                    self.assertEqual(self._hub_segments(data, chunk), want)
+                    self.assertEqual(self._hints_segments(data, chunk), want)
+
+    def test_eof_trailing_lone_cr_loses_only_one_tail_empty(self):
+        """Registered exemption R4/N3: a lone trailing \\r at EOF loses
+        exactly ONE trailing empty segment (stream == truth[:-1] with
+        truth[-1] == '') — the consumer layers skip blank lines, so the
+        loss is invisible there. This asserts the exemption shape itself
+        so any widening of the divergence fails here."""
+        data = b"\r\r\r"
+        decoded = data.decode("utf-8", "replace")
+        truth = decoded.splitlines()
+        self.assertEqual(truth, ["", "", ""])
+        for chunk in range(1, len(data) + 2):
+            with self.subTest(chunk=chunk):
+                self.assertTrue(decoded.endswith("\r") and truth[-1] == "")
+                self.assertEqual(self._hub_segments(data, chunk),
+                                 truth[:-1])
+                self.assertEqual(self._hints_segments(data, chunk),
+                                 truth[:-1])
+
+    # ---- dispatch shape 5: real 256KiB boundary, end to end --------
+    def test_real_256kib_boundary_end_to_end(self):
+        block = 256 * 1024
+        # hub: record A is a VALID json line of exactly 262143 bytes,
+        # so the lone \r is the LAST byte of the first 256KiB block;
+        # the next byte is not \n — the two records must stay two
+        # (repair2 merged them: total=0, malformed=1)
+        head = '{"task_id":"a1","worker":"codex","blob":"'
+        record1 = head + "x" * (block - 1 - len(head) - 2) + '"}'
+        self.assertEqual(len(record1.encode()), block - 1)
+        record2 = '{"task_id":"a2","worker":"codex"}'
+        data = record1.encode() + b"\r" + record2.encode() + b"\n"
+        self.assertEqual(data[block - 1:block], b"\r")
+        tasks = self.root / "hub" / "tasks"
+        tasks.mkdir(parents=True)
+        (tasks / "index.jsonl").write_bytes(data)
+        config = SimpleNamespace(state_dir=str(self.root),
+                                 work_root=str(self.root))
+        result = H.list_sessions_impl(config)
+        self.assertEqual(result["total"], 2)
+        self.assertEqual(result["malformed_index_lines"], 0)
+        self.assertEqual([r["task_id"] for r in result["sessions"]],
+                         ["a1", "a2"])
+        # hints: same boundary shape through the real _index_hints
+        # (real file, unpatched open, real 256KiB reads) — both records
+        # must survive (repair2 lost both)
+        from zcode_supervisor.codex_driver import _index_hints
+        home = self.root / "codex-home"
+        home.mkdir()
+        head2 = '{"id":"th1","path":"/a.jsonl","pad":"'
+        line1 = head2 + "x" * (block - 1 - len(head2) - 2) + '"}'
+        line1_bytes = line1.encode()
+        self.assertEqual(len(line1_bytes), block - 1)
+        (home / "session_index.jsonl").write_bytes(
+            line1_bytes + b"\r"
+            + b'{"id":"th1","path":"/b.jsonl"}' + b"\n")
+        hints = [str(path) for path in _index_hints(home, "th1")]
+        self.assertEqual(hints, ["/a.jsonl", "/b.jsonl"])
+
+
+class BoundedReadOffloadTests(unittest.TestCase):
+    """P2.4: dedicated 2-worker executor + 4-semaphore read offload —
+    cancellation, saturation and shutdown behaviour."""
+
+    def test_executor_is_bounded_and_shared(self):
+        pool = H.read_executor_pool()
+        self.assertIs(pool, H.read_executor_pool())
+        self.assertEqual(pool._max_workers, H._READ_EXECUTOR_WORKERS)
+        self.assertEqual(H._READ_EXECUTOR_WORKERS, 2)
+        self.assertEqual(H._READ_CONCURRENCY, 4)
+
+    def test_offload_runs_off_loop_and_returns_value(self):
+        import threading
+
+        async def main():
+            seen = {}
+
+            def probe():
+                seen['thread'] = threading.current_thread()
+                return 41
+
+            result = await H._offload_read(lambda: 0) or None
+            value = await H._offload_read(probe)
+            return value, seen.get('thread')
+
+        value, thread = asyncio.run(main())
+        self.assertEqual(value, 41)
+        self.assertIsNotNone(thread)
+        self.assertNotEqual(thread, threading.main_thread())
+
+    def test_cancellation_does_not_kill_the_pool(self):
+        import time
+
+        started = threading.Event()
+
+        def slow():
+            started.set()
+            time.sleep(1.0)
+            return 'done'
+
+        async def main():
+            task = asyncio.get_running_loop().create_task(
+                H._offload_read(slow))
+            await asyncio.get_running_loop().run_in_executor(
+                None, started.wait, 2)
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            # the pool still serves reads after a cancelled caller
+            return await H._offload_read(lambda: 'ok')
+
+        self.assertEqual(asyncio.run(main()), 'ok')
+
+    def test_saturation_caps_concurrent_reads(self):
+        import time
+        active = []
+        peak = []
+
+        def record(name):
+            active.append(name)
+            peak.append(len(active))
+            time.sleep(0.05)
+            active.remove(name)
+            return name
+
+        async def main():
+            tasks = [asyncio.get_running_loop().create_task(
+                H._offload_read(record, i)) for i in range(10)]
+            return await asyncio.gather(*tasks)
+
+        results = asyncio.run(main())
+        self.assertEqual(sorted(results), list(range(10)))
+        # executor bound: never more than 2 workers inside the reads
+        self.assertLessEqual(max(peak), H._READ_EXECUTOR_WORKERS)
+
+    def test_second_event_loop_lifetime_does_not_break(self):
+        """repair1 F-D: a process-level semaphore bound to its first
+        loop broke any SECOND loop lifetime; per-loop laziness must let
+        repeated asyncio.run compete without RuntimeError."""
+        import time
+
+        def saturate(tag):
+            active = []
+            peak = []
+
+            def record(name):
+                active.append(name)
+                peak.append(len(active))
+                time.sleep(0.02)
+                active.remove(name)
+                return name
+
+            async def main():
+                tasks = [asyncio.get_running_loop().create_task(
+                    H._offload_read(record, i)) for i in range(12)]
+                return await asyncio.gather(*tasks)
+
+            results = asyncio.run(main())
+            return results, max(peak)
+
+        first, peak1 = saturate('first')
+        second, peak2 = saturate('second')  # previously RuntimeError
+        self.assertEqual(len(first), 12)
+        self.assertEqual(len(second), 12)
+        self.assertLessEqual(peak1, H._READ_EXECUTOR_WORKERS)
+        self.assertLessEqual(peak2, H._READ_EXECUTOR_WORKERS)
+
+    def test_shutdown_then_fresh_pool(self):
+        H.read_executor_pool()  # ensure it exists
+        H.shutdown_read_executor(wait=True)
+        self.assertIsNone(H._read_executor)
+        # the next call lazily builds a fresh, working pool
+        async def main():
+            return await H._offload_read(lambda: 'rebuilt')
+        self.assertEqual(asyncio.run(main()), 'rebuilt')
+        H.shutdown_read_executor(wait=True)
 
 
 class HubFixture(unittest.TestCase):
@@ -740,6 +1163,66 @@ class DelegateCodexAppServerTests(HubFixture):
             appserver_factory=BrokenClient))
         self.assertEqual(result["outcome"], "runner-error")
         self.assertIn("appserver boot failed", result["error"])
+
+    def test_appserver_delegate_shares_one_budget_between_start_and_run(self):
+        # P0.1 review spec-I5 (RED): the lazy app-server start and the
+        # driver's run must live on ONE primary budget owned by this
+        # delegate. A 0.25 s start plus a turn that only finishes within a
+        # FRESH 0.4 s budget must time out on the shared budget — and the
+        # delegate must bound the lazy initialize instead of starting it
+        # unbounded.
+        seen = {}
+
+        class SlowStartClient:
+            def __init__(self):
+                self.starts = 0
+
+            async def start(self, budget=None, initialize_timeout=None):
+                self.starts += 1
+                seen["start_budget"] = budget
+                seen["initialize_timeout"] = initialize_timeout
+                await asyncio.sleep(0.25)
+                return {"userAgent": "fake-appserver"}
+
+            async def close(self):
+                pass
+
+        class BudgetAwareDriver:
+            def __init__(self, client):
+                pass
+
+            async def run_task(self, authority, workspace, prompt, *, model=None,
+                               sandbox="read-only", approval_policy="on-request",
+                               timeout_s=600, budget=None):
+                seen["run_budget"] = budget
+                deadline = (budget.primary_deadline if budget is not None
+                            else time.monotonic() + timeout_s)
+                await asyncio.sleep(0.20)  # turn finishes at +0.20 s
+                if time.monotonic() < deadline:
+                    return {"outcome": "delivered", "thread_id": "th_shared",
+                            "turn_id": "turn_shared", "final_message": "ok",
+                            "command_items": [], "approvals": []}
+                return {"outcome": "timeout", "thread_id": "th_shared",
+                        "turn_id": "turn_shared", "final_message": None,
+                        "command_items": [], "approvals": []}
+
+        client = SlowStartClient()
+        self.register(self.appserver_contract(max_timeout_ms=400))
+        result = asyncio.run(H.delegate_impl(
+            self.config, self.evidence_root, "hub-codex-1",
+            {"agent": "a", "session_id": "s"},
+            codex_path=str(self.fake_codex),
+            appserver_factory=lambda: client,
+            appserver_driver_factory=lambda c: BudgetAwareDriver(c)))
+        # the SAME CallBudget OBJECT reached the lazy start and the driver —
+        # not a numeric copy, not a second full budget
+        from zcode_supervisor.deadline import CallBudget
+        self.assertIsInstance(seen.get("start_budget"), CallBudget)
+        self.assertIsInstance(seen.get("run_budget"), CallBudget)
+        self.assertIs(seen["start_budget"], seen["run_budget"])
+        self.assertLessEqual(seen["run_budget"].timeout_s, 0.4)
+        # shared budget: 0.25 s start + 0.20 s turn > 0.4 s -> timeout
+        self.assertEqual(result["outcome"], "timeout")
 
     def test_explicit_exec_mode_keeps_the_exec_runner_path(self):
         self.register(self.codex_contract(mode="exec"))

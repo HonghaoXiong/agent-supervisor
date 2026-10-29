@@ -37,7 +37,9 @@ class ReexportIdentityTests(unittest.TestCase):
                 self.assertIn(name, vars(authority))
 
     def test_protocol_keeps_the_symbols_and_patch_targets_it_owns(self):
-        for name in ('hashlib', 'asyncio', 'process_alive', 'send_notification',
+        # 'hashlib' left protocol.py in the P2.2 pre-fix (F-2: dead import
+        # after the P2.1 streamed-hash swap); it is no longer a patch target
+        for name in ('asyncio', 'process_alive', 'send_notification',
                      'ProtocolClient', 'execute', 'probe', 'validate_packet',
                      'checked_locations', 'redact_transport', 'normalized_absolute',
                      'normalized_relative', 'short_session', 'outcome_label'):
@@ -191,6 +193,55 @@ class AuthorityBrokerSurfaceTests(unittest.TestCase):
 
     def test_authority_satisfies_the_permission_broker_protocol(self):
         self.assertIsInstance(self.authority, authority.PermissionBroker)
+
+
+class StreamedInventoryTests(unittest.TestCase):
+    """P2.1: inventory digests come from the bounded chunked hasher."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.workspace = Path(temporary.name) / 'workspace'
+        self.workspace.mkdir()
+
+    def test_multichunk_file_digests_match_whole_file_hashes(self):
+        import hashlib
+        from zcode_supervisor.common import HASH_CHUNK_BYTES
+        payload = bytes(range(256)) * (5 * HASH_CHUNK_BYTES // 256 + 13)
+        (self.workspace / 'big.bin').write_bytes(payload)
+        (self.workspace / 'small.txt').write_text('plain\n')
+        result = authority.inventory(self.workspace)
+        self.assertEqual(result['big.bin']['sha256'],
+                         hashlib.sha256(payload).hexdigest())
+        self.assertEqual(result['small.txt']['sha256'],
+                         hashlib.sha256(b'plain\n').hexdigest())
+        self.assertEqual(result['big.bin']['mode'],
+                         (self.workspace / 'big.bin').stat().st_mode & 0o777)
+
+    def test_workspace_caps_still_enforced_with_streamed_hashing(self):
+        # the 256 MiB / 5000-file inventory caps are lstat-based and
+        # unchanged by P2.1; both sides of each cap must keep raising
+        import struct
+        base = self.workspace
+        # file-count cap: 5001 empty files
+        for index in range(5001):
+            (base / f'f{index}').write_bytes(b'')
+        with self.assertRaisesRegex(ValueError, '256 MiB / 5000 files'):
+            authority.inventory(base)
+
+    def test_packet_hash_and_check_frozen_use_the_streamed_digest(self):
+        packet = {'workspace': str(self.workspace), 'prompt': 'p',
+                  'allowed_files': []}
+        packet_path = self.workspace.parent / 'packet.json'
+        packet_path.write_text(json.dumps(packet))
+        before = authority.inventory(self.workspace)
+        instance = authority.Authority(packet, packet_path, before)
+        self.assertEqual(instance.packet_hash,
+                         authority.sha256_regular(packet_path))
+        instance.check_frozen()  # streamed re-hash agrees -> no raise
+        packet_path.write_text(json.dumps(packet) + ' ')
+        with self.assertRaisesRegex(ValueError, 'Supervisor packet changed'):
+            instance.check_frozen()
 
 
 if __name__ == '__main__':
