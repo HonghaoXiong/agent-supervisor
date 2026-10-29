@@ -360,7 +360,16 @@ for line in sys.stdin:
     elif method == "turn/interrupt":
         observed["interrupt"] = params
         send({"id": frame["id"], "result": {}})
-        finish(0)
+        if MODE == "timeout":
+            finish(0)
+        # Python 3.13 fixture fix: a real app-server stays alive after
+        # answering turn/interrupt (the interrupt ends the TURN, not the
+        # process — same contract as fixtures/ui/fake_server.py). Only the
+        # "timeout" mode keeps the historical exit-at-interrupt: its runs
+        # are DESIGNED to end there, with the diag written by finish().
+        # p05-family cancel tests continue using the client (adjudication
+        # B) after the driver's legitimate interrupt, so the fake must
+        # keep serving until the client closes stdin.
     else:
         send({"id": frame["id"],
               "error": {"code": -32601,
