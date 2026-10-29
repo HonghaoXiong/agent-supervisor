@@ -30,6 +30,15 @@
 //! socket can never become a retry storm. `ui_drawn_ns` is the app-side
 //! draw-pass completion mark only; without a renderer/compositor
 //! present probe, end-to-end latency stays honestly "unavailable".
+//!
+//! polish1 request deadline (P3.3 N2): the connect/baseline phase
+//! (hello → snapshot → snapshot-events → subscribe) waits per op under
+//! `ipc::REQUEST_DEADLINE` — a hub that accepts and then stays silent
+//! fails the round bounded and the app returns to the waiting rescan
+//! (startup can never stay wedged). The post-handshake EVENT STREAM
+//! keeps NO idle deadline: protocol v1 has no heartbeat, a quiet
+//! stream is legal, and its silence is undetectable at this layer
+//! (v2 heartbeat = separate protocol work).
 
 pub mod discovery;
 pub mod ipc;
@@ -39,7 +48,7 @@ pub mod view;
 
 use eframe::egui;
 use std::sync::mpsc::Receiver;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use discovery::DiscoveryOutcome;
 use ipc::{Frame, UiClient, CHANNEL_BOUND};
@@ -80,6 +89,12 @@ pub struct SupervisorApp {
     preferred_socket: Option<String>,
     /// No hub discoverable right now: bounded rescan posture.
     pub waiting: bool,
+    /// Per-request read budget for the connect/baseline phase
+    /// (hello / snapshot / snapshot-events / subscribe). Production
+    /// default [`ipc::REQUEST_DEADLINE`]; tests shrink it so deadline
+    /// paths run in milliseconds (polish1 P3.3 N2 — a silently lying
+    /// server must fail the connect bounded, never block startup).
+    pub connect_deadline: Duration,
     /// Discovery round injectable for deterministic tests; `None` uses
     /// the real env → registry → CWD resolution (`discovery::discover`).
     pub discover_fn:
@@ -119,6 +134,7 @@ impl Default for SupervisorApp {
             hub_candidates: Vec::new(),
             preferred_socket: None,
             waiting: true,
+            connect_deadline: ipc::REQUEST_DEADLINE,
             discover_fn: None,
             ui_client: None,
             reconnect_attempts: 0,
@@ -151,8 +167,15 @@ impl SupervisorApp {
         self.socket_manual = manual;
         self.hub_label = hub_label;
         self.hub_candidates = candidates;
+        // request-phase deadline (polish1 P3.3 N2): a server that
+        // accepts and never answers fails here bounded instead of
+        // wedging the round (and app startup) forever
         let (mut client, hello) =
-            UiClient::connect(socket_path).map_err(|e| e.0)?;
+            UiClient::connect_with_request_deadline(
+                socket_path,
+                self.connect_deadline,
+            )
+            .map_err(|e| e.0)?;
         self.reducer.note_hello();
         if client.protocol_version_mismatch {
             let server_v = hello
@@ -194,12 +217,11 @@ impl SupervisorApp {
         self.ui_client = Some(client);
         self.reducer.mark_live();
         self.waiting = false;
-        self.status_line = match &self.hub_label {
-            Some(label) => {
-                format!("connected: {} tasks · hub: {label}", states.len())
-            }
-            None => format!("connected: {} tasks", states.len()),
-        };
+        // polish1 single-source contract: the status line carries the
+        // CONNECTION facts only; the hub name lives exclusively in the
+        // status-bar badge (view::hub_badge_text) so the bar renders
+        // `hub:` exactly once (the old embedded copy duplicated it).
+        self.status_line = format!("connected: {} tasks", states.len());
         // baseline events (event-page replay) may carry tracked ids
         self.probe.observe(&self.reducer, self.journal_enqueued_ns);
         Ok(())
@@ -352,11 +374,23 @@ impl SupervisorApp {
 
     /// The injected-or-real discovery round (tests pin deterministic
     /// outcomes; production reads env / registry / CWD).
+    ///
+    /// Injection-surface contract (polish1 N2): an EMPTY `Registry`
+    /// outcome — impossible from `discovery::resolve`, possible from an
+    /// injected `discover_fn` — is normalized to `None` HERE so every
+    /// caller treats it as "nothing anywhere" (waiting posture). No
+    /// code path may ever index into an empty candidate list.
     fn run_discovery(&self) -> DiscoveryOutcome {
-        match &self.discover_fn {
+        let outcome = match &self.discover_fn {
             Some(injected) => injected(),
             None => discovery::discover(),
+        };
+        if let DiscoveryOutcome::Registry(live) = &outcome {
+            if live.is_empty() {
+                return DiscoveryOutcome::None;
+            }
         }
+        outcome
     }
 
     /// Minimal multi-hub switch (no list popup): advance to the next
@@ -412,25 +446,28 @@ impl eframe::App for SupervisorApp {
         egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
                 ui.label(&self.status_line);
-                // one-click multi-hub: the registry label is a button
-                // while alternatives exist — click cycles to the next
-                // live hub (minimal switch, no list popup)
-                if self.hub_candidates.len() > 1 {
-                    let label = self
-                        .hub_label
-                        .clone()
-                        .unwrap_or_else(|| "?".into());
-                    if ui
-                        .selectable_label(
-                            false,
-                            format!("hub: {label} (click to switch)"),
-                        )
-                        .clicked()
-                    {
-                        self.cycle_hub();
+                // one-click multi-hub: the badge is the SINGLE source
+                // of `hub: <name>` (polish1 — the status line no
+                // longer embeds a second copy). Single instance: plain
+                // label. Multiple live hubs: the SAME text as a cycle
+                // button (click switches to the next hub; the hover
+                // hint carries the affordance, the text stays stable).
+                if let Some(badge) =
+                    view::hub_badge_text(self.hub_label.as_deref())
+                {
+                    if self.hub_candidates.len() > 1 {
+                        if ui
+                            .selectable_label(false, badge.clone())
+                            .on_hover_text(
+                                "click to switch to the next hub",
+                            )
+                            .clicked()
+                        {
+                            self.cycle_hub();
+                        }
+                    } else {
+                        ui.label(badge);
                     }
-                } else if let Some(label) = &self.hub_label {
-                    ui.label(format!("hub: {label}"));
                 }
                 let banners = view::banners(&self.reducer.projection);
                 if banners.stale {

@@ -43,8 +43,12 @@ pub struct HubEntry {
 pub enum DiscoveryOutcome {
     /// `CZS_UI_SOCKET` was set — an outright override (never probed).
     Env(String),
-    /// Live registry entries, newest first. The caller picks (index 0
-    /// by default, or a preferred socket for hub cycling).
+    /// Live registry entries, newest first; NEVER empty — `resolve`
+    /// emits `None` when every entry is dead, and `main::run_discovery`
+    /// normalizes an (injection-only) empty list the same way (polish1
+    /// N2: nothing may index into an empty candidate list). The caller
+    /// picks (index 0 by default, or a preferred socket for hub
+    /// cycling).
     Registry(Vec<HubEntry>),
     /// Legacy CWD-relative socket exists.
     Fallback(String),

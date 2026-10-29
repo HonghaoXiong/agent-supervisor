@@ -155,6 +155,34 @@ pub fn safe_error(code: &str, message: &str) -> String {
     format!("error {code}: {message}")
 }
 
+/// The status-bar hub badge text — the ONE AND ONLY source of the
+/// `hub: <name>` segment (polish1: the connection status line used to
+/// embed a second `hub:` and the bar rendered the project name twice).
+/// `None` (env / CWD-fallback / manual connects) renders no badge at
+/// all. The text is IDENTICAL whether the badge renders as a plain
+/// label (single instance) or as the cycle button (multi instance) —
+/// only the interactivity differs, never the text.
+pub fn hub_badge_text(hub_label: Option<&str>) -> Option<String> {
+    hub_label
+        .filter(|label| !label.is_empty())
+        .map(|label| format!("hub: {label}"))
+}
+
+/// Pure join of the status-bar text exactly as `ui` composes it
+/// (status line widget + badge widget; banners/gaps follow). Tests pin
+/// the SHAPE here: whatever the connection state, the bar carries the
+/// `hub:` prefix at most once — through the badge, never through the
+/// connection status line itself.
+pub fn status_bar_text(status_line: &str, hub_label: Option<&str>) -> String {
+    match hub_badge_text(hub_label) {
+        Some(badge) if !status_line.is_empty() => {
+            format!("{status_line}  {badge}")
+        }
+        Some(badge) => badge,
+        None => status_line.to_string(),
+    }
+}
+
 fn is_terminal(task: &TaskState) -> bool {
     matches!(
         task.status.as_str(),
@@ -212,5 +240,35 @@ mod tests {
         let detail = details_of(projection.tasks.get("a").unwrap());
         assert_eq!(detail.status, "completed");
         assert!(detail.outcome.is_empty());
+    }
+
+    #[test]
+    fn hub_badge_is_the_single_hub_segment() {
+        // polish1 duplicate-label contract: the badge is the ONLY
+        // `hub:` segment; the connection status line never embeds one.
+        assert_eq!(
+            hub_badge_text(Some("czs-demo-proj")).as_deref(),
+            Some("hub: czs-demo-proj")
+        );
+        assert_eq!(hub_badge_text(None), None);
+        assert_eq!(hub_badge_text(Some("")), None);
+        let bar = status_bar_text("connected: 0 tasks", Some("czs-demo-proj"));
+        assert_eq!(bar.matches("hub:").count(), 1, "exactly one: {bar}");
+        assert!(bar.contains("hub: czs-demo-proj"));
+        // no registry label (env / CWD fallback / manual): no badge
+        assert_eq!(
+            status_bar_text("connected: 3 tasks", None),
+            "connected: 3 tasks"
+        );
+        // even a hub-bearing status LINE would duplicate — the join
+        // must not paper over it (guards the app against regression)
+        assert_eq!(
+            status_bar_text("connected: 0 tasks · hub: czs-demo-proj",
+                            Some("czs-demo-proj"))
+                .matches("hub:")
+                .count(),
+            2,
+            "an embedded hub label WOULD duplicate — the app must not emit one"
+        );
     }
 }

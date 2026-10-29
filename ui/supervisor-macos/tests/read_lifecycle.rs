@@ -335,6 +335,7 @@ fn version_mismatch_hello_refused_envelope_refused_and_stale() {
 fn disconnect_to_stale_to_bounded_reconnect() {
     // connection 1: handshake, two tasks, then the socket dies;
     // connection 2: handshake again, one task, stays alive
+    // connection 2: handshake again, one task, stays alive
     let path = socket_path("reconnect");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).expect("bind");
@@ -403,4 +404,84 @@ fn disconnect_to_stale_to_bounded_reconnect() {
         std::thread::sleep(Duration::from_millis(10));
     }
     assert!(!app.reducer.knows_task("a"), "stale task stayed discarded");
+}
+
+// ------------------------------------------------- polish1 request deadline
+//
+// P3.3 N2: a server that ACCEPTS and then never answers must fail the
+// connection at the request deadline instead of blocking forever (the
+// RED demo captured pre-fix: connect sat out the server's whole 4 s
+// silence window and only the server's EOF unblocked it). The deadline
+// covers the REQUEST-RESPONSE phase only (hello / snapshot /
+// snapshot-events / subscribe): protocol v1 has NO heartbeat, so a
+// quiet EVENT STREAM after the handshake is legal and carries no
+// deadline (honest boundary — a v2 heartbeat is separate work).
+
+/// Client level: hello silence → bounded TransportError naming the
+/// deadline and the op. The injected 250 ms budget stands in for the
+/// 10 s production constant (never sleep real 10 s in tests).
+#[test]
+fn hello_silence_hits_request_deadline_not_forever() {
+    let path = scripted_server("silent-hello", |stream| {
+        let _ = read_line(stream); // swallow the hello request…
+        std::thread::sleep(Duration::from_secs(5)); // …socket open, silent
+    });
+    wait_bound(&path, Duration::from_secs(5));
+    let start = Instant::now();
+    let error = UiClient::connect_with_request_deadline(
+        &path,
+        Duration::from_millis(250),
+    )
+    .expect_err("the request deadline must fire");
+    assert!(error.0.contains("deadline"), "{}", error.0);
+    assert!(error.0.contains("hello"), "{}", error.0);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "bounded return, not a block: {:?}",
+        start.elapsed()
+    );
+}
+
+/// App level: a hub that answers hello then goes silent on snapshot
+/// (the lying-server shape) used to wedge `reconnect_round` forever —
+/// including app CREATION. With the deadline the round fails bounded
+/// and the app lands in the waiting posture with a bounded rescan:
+/// startup can never stay stuck, auto-attach keeps retrying.
+#[test]
+fn snapshot_silence_deadline_returns_app_to_waiting() {
+    let path = scripted_server("silent-snapshot", |stream| {
+        let _ = read_line(stream); // hello request
+        send(stream, HELLO);
+        let _ = read_line(stream); // snapshot request swallowed…
+        std::thread::sleep(Duration::from_secs(5)); // …silent, open
+    });
+    wait_bound(&path, Duration::from_secs(5));
+
+    let mut app = SupervisorApp::default();
+    app.connect_deadline = Duration::from_millis(300);
+    let entry = app::discovery::HubEntry {
+        socket: path.clone(),
+        pid: 1,
+        project_root: "/proj/silent".into(),
+        started_at: 9.0,
+    };
+    app.discover_fn = Some(Box::new(move || {
+        app::discovery::DiscoveryOutcome::Registry(vec![entry.clone()])
+    }));
+    let start = Instant::now();
+    app.reconnect_round(Instant::now()); // must RETURN, bounded
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "round returned bounded: {:?}",
+        start.elapsed()
+    );
+    assert!(app.waiting, "failed attach → waiting posture");
+    assert_eq!(app.reducer.projection.health, Some(Health::Stale));
+    assert!(app.status_line.contains("deadline"), "{}", app.status_line);
+    assert!(app.status_line.contains("waiting"), "{}", app.status_line);
+    let wait = app
+        .reconnect_at
+        .expect("bounded rescan scheduled")
+        .saturating_duration_since(Instant::now());
+    assert!(wait <= Duration::from_secs(4), "rescan bounded: {wait:?}");
 }

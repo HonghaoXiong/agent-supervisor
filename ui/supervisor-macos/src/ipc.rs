@@ -36,6 +36,19 @@
 //! server is therefore ALWAYS observable — a delivered Reset, a
 //! Disconnected channel, or both — never silence.
 //!
+//! Request-phase deadline (polish1, P3.3 N2): every REQUEST-RESPONSE
+//! op (hello / snapshot / snapshot-events / subscribe) waits for its
+//! answer under [`REQUEST_DEADLINE`] — a server is expected to answer
+//! these immediately, so a server that accepts and then stays silent
+//! fails the connection bounded (TransportError → stale → the existing
+//! bounded reconnect), instead of blocking app startup forever.
+//! The EVENT-STREAM read loop deliberately carries NO idle deadline:
+//! protocol v1 has no heartbeat, so a quiet stream after the handshake
+//! is LEGAL and its silence is undetectable at this layer (an honest
+//! boundary — a v2 heartbeat is separate protocol work, not a client
+//! change). `request` therefore clears the socket read timeout again
+//! before the subscribe phase hands the reader to the read loop.
+//!
 //! Read-only surface: hello / snapshot / snapshot-events / subscribe.
 //! There is no write-back, control, approval, tool, shell or file op
 //! anywhere in this module.
@@ -78,6 +91,18 @@ pub const CHANNEL_BOUND: usize = 1024;
 /// discarded up to the newline, then the reader stops with a marker).
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
 
+/// Hard budget for one request-response round (hello / snapshot /
+/// snapshot-events / subscribe). Rationale: a server answers these
+/// IMMEDIATELY — they are table lookups plus a channel registration,
+/// never user work — so anything still unanswered after 10 s is a
+/// silent/lying server, not a slow one. The deadline fails the
+/// connection (TransportError → stale → bounded reconnect); it NEVER
+/// applies to the event-stream read loop (protocol v1 has no
+/// heartbeat — a quiet stream is legal; see the module docs).
+/// Tests inject smaller budgets via
+/// [`UiClient::connect_with_request_deadline`] instead of sleeping.
+pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
+
 /// A connected client. The frame-channel sender is owned by the read
 /// thread EXCLUSIVELY (the old client-held clone kept the channel
 /// forever-connected and masked the reader's death — repair1 fix), so
@@ -85,6 +110,7 @@ pub const MAX_LINE_BYTES: usize = 256 * 1024;
 /// still lives. Dropping the client closes the socket, wakes the
 /// reader (EOF), which delivers its final marker and joins within a
 /// bounded wait (see [`UiClient::DROP_JOIN_TIMEOUT`]).
+#[derive(Debug)]
 pub struct UiClient {
     writer: UnixStream,
     reader: Option<BufReader<UnixStream>>, // None once moved to thread
@@ -94,13 +120,28 @@ pub struct UiClient {
     /// answered (raw-server probes drive this), but the app refuses to
     /// apply anything from a version-mismatched server (repair1 #4).
     pub protocol_version_mismatch: bool,
+    /// Per-request read budget (production default
+    /// [`REQUEST_DEADLINE`]; tests shrink it so deadline paths run in
+    /// milliseconds instead of sleeping the real 10 s).
+    pub request_deadline: Duration,
 }
 
 impl UiClient {
-    /// Connect to the socket and perform hello. Returns the client and
-    /// the hello response (with `initial_snapshot_cursor`).
+    /// Connect to the socket and perform hello with the production
+    /// [`REQUEST_DEADLINE`]. Returns the client and the hello response
+    /// (with `initial_snapshot_cursor`).
     pub fn connect(
         socket_path: &str,
+    ) -> Result<(Self, serde_json::Value), TransportError> {
+        Self::connect_with_request_deadline(socket_path, REQUEST_DEADLINE)
+    }
+
+    /// Deadline-injectable connect (the test entry): identical to
+    /// [`connect`](Self::connect) but each request-response wait is
+    /// bounded by `deadline` instead of [`REQUEST_DEADLINE`].
+    pub fn connect_with_request_deadline(
+        socket_path: &str,
+        deadline: Duration,
     ) -> Result<(Self, serde_json::Value), TransportError> {
         let stream = UnixStream::connect(socket_path)
             .map_err(|e| TransportError(format!("connect: {e}")))?;
@@ -112,6 +153,7 @@ impl UiClient {
             reader_done: None,
             reader_handle: None,
             protocol_version_mismatch: false,
+            request_deadline: deadline,
         };
         let hello = client.request(
             "hello",
@@ -170,10 +212,14 @@ impl UiClient {
     }
 
     /// One request/response round trip (hello / snapshot / snapshot-
-    /// events). Reads EXACTLY one line from the shared persistent
-    /// reader, so any coalesced bytes past the newline stay buffered
-    /// for the next request or the read loop. Only legal before
-    /// `subscribe_all` claims the reader.
+    /// events / subscribe). Reads EXACTLY one line from the shared
+    /// persistent reader, so any coalesced bytes past the newline stay
+    /// buffered for the next request or the read loop. Only legal
+    /// before `subscribe_all` claims the reader. The read waits under
+    /// `self.request_deadline` (per-op budget; a silent server fails
+    /// bounded — see the module docs) and the timeout is CLEARED again
+    /// before returning, so the deadline-free event-stream read loop
+    /// never inherits it.
     pub fn request(
         &mut self,
         op: &str,
@@ -196,8 +242,36 @@ impl UiClient {
         let reader = self.reader.as_mut().ok_or_else(|| {
             TransportError("request after subscribe".into())
         })?;
-        let (payload, overflow, eof) = read_line_capped(reader)
-            .map_err(|e| TransportError(format!("read {op}: {e}")))?;
+        // polish1 (P3.3 N2): arm the per-request read budget. WouldBlock
+        // on a blocking socket means the budget expired (SO_RCVTIMEO).
+        reader
+            .get_ref()
+            .set_read_timeout(Some(self.request_deadline))
+            .map_err(|e| TransportError(format!("deadline {op}: {e}")))?;
+        let read = read_line_capped(reader);
+        // Disarm on EVERY path (success, IO error, deadline) before
+        // mapping: a surviving connection must never leak the timeout
+        // into the subscribe read loop — an idle event stream is legal.
+        let _ = reader.get_ref().set_read_timeout(None);
+        let (payload, overflow, eof) = match read {
+            Ok(triple) => triple,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(TransportError(format!(
+                    "read {op}: request deadline exceeded after {:?} \
+                     — server accepted but never answered",
+                    self.request_deadline
+                )));
+            }
+            Err(e) => {
+                return Err(TransportError(format!("read {op}: {e}")))
+            }
+        };
         if overflow || (eof && payload.is_empty()) {
             return Err(TransportError(format!(
                 "{op}: protocol error ({})",
@@ -508,5 +582,48 @@ mod tests {
         let huge = reconnect_backoff(1000);
         assert!(huge >= first);
         assert!(huge <= Duration::from_secs(6)); // no unbounded growth
+    }
+
+    /// polish1 (P3.3 N2): the request deadline exists, and the socket
+    /// read timeout is DISARMED after a successful request — the
+    /// event-stream read loop must never inherit an idle deadline
+    /// (protocol v1 has no heartbeat; a quiet stream is legal).
+    #[test]
+    fn request_deadline_armed_then_cleared_for_event_stream() {
+        assert_eq!(REQUEST_DEADLINE, Duration::from_secs(10));
+        let (a, mut b) = UnixStream::pair().unwrap();
+        let _answered = std::thread::spawn(move || {
+            use std::io::Write as _;
+            let _ = b.write_all(b"{\"ok\":true}\n");
+            let _ = b.flush();
+            // hold the peer open: no EOF, the client read must return
+            // because the ANSWER arrived, not because the socket died
+            std::thread::sleep(Duration::from_millis(500));
+        });
+        let mut client = UiClient {
+            writer: a.try_clone().unwrap(),
+            reader: Some(BufReader::new(a)),
+            reader_done: None,
+            reader_handle: None,
+            protocol_version_mismatch: false,
+            request_deadline: Duration::from_millis(250),
+        };
+        let response = client
+            .request("hello", serde_json::json!({"v": 1}))
+            .expect("answered request succeeds well inside the budget");
+        assert_eq!(response.get("ok"), Some(&serde_json::Value::Bool(true)));
+        let timeout = client
+            .reader
+            .as_ref()
+            .unwrap()
+            .get_ref()
+            .read_timeout()
+            .expect("read_timeout query");
+        assert!(
+            timeout.is_none(),
+            "timeout CLEARED after the request (event stream stays deadline-free)"
+        );
+        drop(client);
+        let _ = _answered.join();
     }
 }

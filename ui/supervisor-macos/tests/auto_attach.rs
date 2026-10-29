@@ -170,6 +170,27 @@ fn no_hub_shows_waiting_with_bounded_rescan() {
     }
 }
 
+/// polish1 N2: an EMPTY `Registry(vec![])` outcome (unreachable from
+/// the real resolver, possible from an injected discover_fn) used to
+/// panic on `live[index]`. Contract: empty candidates are "nothing
+/// anywhere" — the same waiting/rescan path as `None`, never an index.
+#[test]
+fn empty_registry_outcome_waits_like_none_never_panics() {
+    let (_, reader) = sequenced(vec![DiscoveryOutcome::Registry(vec![])]);
+    let mut app = SupervisorApp::default();
+    app.discover_fn = Some(reader);
+    app.reconnect_round(Instant::now());
+    assert!(app.waiting, "empty registry == nothing discovered");
+    assert!(app.status_line.contains("waiting for a supervisor hub"));
+    assert!(app.reconnect_at.is_some(), "bounded rescan scheduled");
+    assert!(app.hub_candidates.is_empty());
+    assert_eq!(app.hub_label, None);
+    // the waiting posture keeps rescanning bounded (same as None)
+    let at = due(&app);
+    assert!(at.duration_since(Instant::now())
+        <= Duration::from_millis(3001) + Duration::from_secs(1));
+}
+
 #[test]
 fn hub_appearing_later_auto_attaches_with_label() {
     let hub = scripted_hub("attach");
@@ -188,8 +209,66 @@ fn hub_appearing_later_auto_attaches_with_label() {
     assert!(!app.waiting);
     assert_eq!(app.reducer.projection.health, Some(Health::Live));
     assert_eq!(app.hub_label.as_deref(), Some("underworld"));
-    assert!(app.status_line.contains("hub: underworld"));
+    // polish1 single-source contract: the composed status bar carries
+    // `hub:` exactly once (through the badge, not the status line)
+    let bar = app::view::status_bar_text(
+        &app.status_line,
+        app.hub_label.as_deref(),
+    );
+    assert_eq!(bar.matches("hub:").count(), 1, "duplicate: {bar}");
+    assert!(bar.contains("hub: underworld"));
     assert_eq!(app.reconnect_attempts, 0);
+}
+
+/// polish1: the user-screenshot defect — a single-instance registry
+/// connect rendered `hub: <name>` TWICE (the status line embedded one
+/// AND the badge widget drew another). The composed bar must carry
+/// exactly one `hub:`, and the status line itself none.
+#[test]
+fn single_instance_status_bar_shows_exactly_one_hub_label() {
+    let hub = scripted_hub("onehub");
+    let (_, reader) = sequenced(vec![DiscoveryOutcome::Registry(vec![
+        hub_entry(&hub, "/Users/x/czs-demo-proj", 9.0),
+    ])]);
+    let mut app = SupervisorApp::default();
+    app.discover_fn = Some(reader);
+    app.reconnect_round(Instant::now());
+    assert!(!app.waiting);
+    assert_eq!(app.hub_candidates.len(), 1, "single instance");
+    assert!(
+        !app.status_line.contains("hub:"),
+        "status line must not embed the hub label: {}",
+        app.status_line
+    );
+    let bar = app::view::status_bar_text(
+        &app.status_line,
+        app.hub_label.as_deref(),
+    );
+    assert_eq!(bar.matches("hub:").count(), 1, "duplicate: {bar}");
+    assert!(bar.contains("connected: 0 tasks"));
+    assert_eq!(
+        bar.matches("hub: czs-demo-proj").count(),
+        1,
+        "the one badge names the hub: {bar}"
+    );
+
+    // multi instance: the SAME badge text (only the widget becomes the
+    // cycle control — the text shape does not change)
+    let other = scripted_hub("onehub-other");
+    let (_, reader) = sequenced(vec![DiscoveryOutcome::Registry(vec![
+        hub_entry(&hub, "/Users/x/czs-demo-proj", 9.0),
+        hub_entry(&other, "/Users/x/czs-demo-proj-2", 1.0),
+    ])]);
+    let mut app = SupervisorApp::default();
+    app.discover_fn = Some(reader);
+    app.reconnect_round(Instant::now());
+    assert_eq!(app.hub_candidates.len(), 2);
+    let bar = app::view::status_bar_text(
+        &app.status_line,
+        app.hub_label.as_deref(),
+    );
+    assert_eq!(bar.matches("hub:").count(), 1, "multi duplicate: {bar}");
+    assert!(bar.contains("hub: czs-demo-proj"));
 }
 
 #[test]

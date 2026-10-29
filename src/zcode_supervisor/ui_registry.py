@@ -65,6 +65,11 @@ def pid_alive(pid: int) -> bool:
     ``PermissionError`` means the pid EXISTS but belongs to another user
     — reported alive, exactly like a same-user live pid; readers relying
     on socket existence/connect probes make the final call anyway.
+
+    ``OverflowError`` (pid past the C ``pid_t`` range — macOS raises it
+    for ``pid >= 2**31``, and it is NOT an ``OSError`` subclass) and
+    ``ValueError`` read as DEAD: a hand-corrupted registry entry must
+    never crash a reader (polish1 N1).
     """
     if not isinstance(pid, int) or pid <= 0:
         return False
@@ -72,7 +77,7 @@ def pid_alive(pid: int) -> bool:
         os.kill(pid, 0)
     except PermissionError:
         return True
-    except OSError:
+    except (OSError, OverflowError, ValueError):
         return False
     return True
 

@@ -232,6 +232,45 @@ class PidAliveTests(unittest.TestCase):
                                         side_effect=foreign):
             self.assertTrue(ui_registry.pid_alive(1234567))
 
+    def test_pid_alive_out_of_range_pids_are_dead_not_crash(self):
+        # polish1 N1: os.kill raises OverflowError (NOT an OSError
+        # subclass) for pids past the C pid_t range — a hand-corrupted
+        # registry must read them as dead, never crash the reader.
+        for bad in (2 ** 31, 2 ** 31 + 7, 2 ** 63 - 1, 2 ** 63,
+                    2 ** 100, -1, -2 ** 31):
+            self.assertFalse(ui_registry.pid_alive(bad), bad)
+
+        def overflow(pid, sig):
+            raise OverflowError("Python int too large to convert to C long")
+
+        def garbage(pid, sig):
+            raise ValueError("nonsense from a patched kill")
+
+        with unittest.mock.patch.object(ui_registry.os, "kill",
+                                        side_effect=overflow):
+            self.assertFalse(ui_registry.pid_alive(1234567))
+        with unittest.mock.patch.object(ui_registry.os, "kill",
+                                        side_effect=garbage):
+            self.assertFalse(ui_registry.pid_alive(1234567))
+
+
+class HandCorruptedRegistryTests(TempRegistryTestCase):
+    """polish1 N1 regression: junk pids in the FILE never crash reads."""
+
+    def test_corrupt_pid_entries_filtered_without_raising(self):
+        socket = self.root / "s.sock"
+        socket.touch()
+        bad = {"big31": 2 ** 31, "big63": 2 ** 63,
+               "neg": -5, "strpid": "999", "huge": 2 ** 70}
+        self.write_raw({
+            key: {"socket": str(socket), "pid": pid,
+                  "project_root": "/p", "started_at": 1.0,
+                  "heartbeat_at": 1.0}
+            for key, pid in bad.items()})
+        # must not raise (OverflowError pre-fix) and drops every entry
+        self.assertEqual(ui_registry.read_registry(path=self.registry), [])
+        self.assertEqual(self.load_raw(), {}, "cleanup removed them all")
+
 
 class RegistryPathTests(TempRegistryTestCase):
     def test_env_override_and_home_default(self):
