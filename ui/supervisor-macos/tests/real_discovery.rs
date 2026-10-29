@@ -105,7 +105,9 @@ fn discover_env_overrides_and_missing_registry_is_none() {
 }
 
 /// Manual smoke hook: run the Rust read path against a registry that a
-/// REAL `czs hub serve` (CZS_UI_EVENTS=1) wrote. Skipped otherwise.
+/// REAL `czs hub serve` (UI events on — the default since 2026-10-24;
+/// `CZS_UI_EVENTS=1` is no longer required, `CZS_UI_EVENTS=0` rolls
+/// back) wrote. Skipped otherwise.
 #[test]
 fn smoke_live_registry() {
     let Ok(smoke_registry) = std::env::var("CZS_SMOKE_REGISTRY") else {

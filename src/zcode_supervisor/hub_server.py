@@ -1020,9 +1020,10 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
     worker = contract["worker"]
     mode = contract.get("mode") or ("cold" if worker == "zcode" else "exec")
     # P0.4 sideband UI projection (never part of the delegate result): the
-    # default emitter is env-gated and OFF by default (rollback switch
-    # CZS_UI_EVENTS=0); the default initiator resolver has no trusted
-    # registry, so initiator identity stays unverified in v1 production.
+    # default emitter is env-gated and ON by default (default flipped
+    # 2026-10-24; rollback switch CZS_UI_EVENTS=0); the default initiator
+    # resolver has no trusted registry, so initiator identity stays
+    # unverified in v1 production.
     emitter = ui_emitter if ui_emitter is not None \
         else ui_projection.default_emitter()
     initiator_resolver = ui_initiator_resolver \
@@ -1563,10 +1564,12 @@ async def serve(config, evidence_root: Path, **injectables) -> None:
 
     server = build_server(config, Path(evidence_root), **injectables)
     workers = getattr(server, "czs_workers", None)
-    # P1.1: the read-only UI event surface — created ONLY when CZS_UI_EVENTS
-    # is explicitly enabled. It attaches to the SAME default projection
-    # emitter (no second task state) and any failure leaves the UI simply
-    # unavailable: the control plane, approvals and evidence are untouched.
+    # P1.1: the read-only UI event surface — on by default since
+    # 2026-10-24; created unless CZS_UI_EVENTS carries an explicit false
+    # value (rollback: CZS_UI_EVENTS=0). It attaches to the SAME default
+    # projection emitter (no second task state) and any failure leaves the
+    # UI simply unavailable: the control plane, approvals and evidence are
+    # untouched.
     ui_server = None
     try:
         from .ui_server import start_ui_service

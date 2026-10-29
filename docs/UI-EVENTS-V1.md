@@ -179,9 +179,11 @@ outcome, delivery_ok, duration_ms, error, data
   **订阅者按不可信输入隔离**（round 2 Critical）：每个订阅者只拿独立深拷贝；
   accepted 的权威 event_id 在 publish 前保存，订阅者 clear/篡改/抛错后
   announced 链路与 delegate 结果不受影响。
-- 回滚开关：`CZS_UI_EVENTS`（**默认 0=关闭投影 emit**，PLAN §7 P0.4）；通知计数
-  修复独立于开关恒生效。关闭态对既有 custom exit projection **零改动**；启用态
-  将既有 callback 与 UI sink 链式组合（各恰一次，保留 P0.3 once 语义）。
+- 回滚开关：`CZS_UI_EVENTS`（**默认开=投影 emit 生效**——2026-10-24 产品裁定翻转
+  原"默认 0"；未设/空串=开，显式 `0`/`false`/`no`/`off`（strip+大小写不敏感）=关，
+  任何其他非空值按显式开启计；PLAN §7 P0.4）；通知计数修复独立于开关恒生效。
+  关闭态对既有 custom exit projection **零改动**；启用态将既有 callback 与 UI sink
+  链式组合（各恰一次，保留 P0.3 once 语义）。
 
 ### 5.6 round 2 修订（双审查 + 控制器 round 1）
 
@@ -239,7 +241,9 @@ outcome, delivery_ok, duration_ms, error, data
 
 ## 6. P1.1：有界 journal、snapshot/subscribe-all 与本机只读 UDS（线协议）
 
-默认 `CZS_UI_EVENTS=0`；显式启用才创建 journal 与 `<state_dir>/ui-events.sock`。
+默认开启（未设/空串 `CZS_UI_EVENTS` = 开）；journal 与
+`<state_dir>/ui-events.sock` 随 UI 服务默认创建，显式 `CZS_UI_EVENTS=0`
+（0/false/no/off）时关闭（2026-10-24 翻转前的旧默认为 0）。
 journal 作为共享投影 emitter 的订阅者（seq 仍由同一 `UiEventStream` 单写者分配，
 无第二份 task 状态）；emit/UI/journal/socket 失败只使 UI 不可用，不改变
 delegate、审批、证据与进程回收。

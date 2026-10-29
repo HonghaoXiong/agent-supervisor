@@ -6,7 +6,9 @@ projections) always migrates FIRST, then the projection runs, and no emit
 path can change a delegate result, an approval decision, native evidence, or
 process cleanup — the emitter never raises and records its own failures.
 There is no journal, socket or UI client in P0.4 (P1.1/P1.2); the rollback
-switch is ``CZS_UI_EVENTS`` (default off, PLAN §7 P0.4).
+switch is ``CZS_UI_EVENTS`` (default ON since 2026-10-24 — the UI surface
+ships enabled so double-clicking the app just works; rolling back sets
+``CZS_UI_EVENTS=0``, PLAN §7 P0.4).
 
 Initiator identity is fail-closed (:class:`UiInitiatorResolver`): a canonical
 opaque session id is only emitted when the agent belongs to the fixed known
@@ -52,11 +54,14 @@ __all__ = [
     "turn_event",
 ]
 
-#: Rollback switch (PLAN §7 P0.4): default OFF — projection emit is disabled
-#: until the journal/socket layers exist; the notification-count correctness
-#: fix is independent of this switch and always applies.
+#: Rollback switch (PLAN §7 P0.4; default flipped ON 2026-10-24 by product
+#: decision): the UI event surface is enabled unless the flag carries an
+#: explicit false value ("0"/"false"/"no"/"off", stripped, case-insensitive).
+#: Unset or empty enables; any other non-empty value counts as an explicit
+#: enable. The notification-count correctness fix is independent of this
+#: switch and always applies.
 ENV_FLAG = "CZS_UI_EVENTS"
-_TRUTHY = ("1", "true", "yes", "on")
+_FALSY = ("0", "false", "no", "off")
 
 REASON_INITIATOR_UNVERIFIED = "initiator_unverified"
 _LOCATOR_TYPES = ("resident", "app-server-thread")
@@ -64,7 +69,13 @@ _IDENTITY_KEYS = ("threadId", "thread_id", "conversationId")
 
 
 def _env_enabled() -> bool:
-    return os.environ.get(ENV_FLAG, "").strip().lower() in _TRUTHY
+    """Default ON (double-click the app and it just works).
+
+    Only a non-empty explicit false value — ``0``/``false``/``no``/``off``,
+    after ``strip().lower()`` — disables the surface; unset or empty means
+    ON, and every other non-empty value counts as an explicit enable.
+    """
+    return os.environ.get(ENV_FLAG, "").strip().lower() not in _FALSY
 
 
 def _active(emitter) -> bool:
@@ -134,8 +145,8 @@ class UiEmitter:
 
     ``build``/``publish``/``emit`` never raise — construction or subscriber
     failures are recorded in :attr:`failures` (bounded) and the envelope is
-    skipped. When ``enabled`` is false (the default rollback state) nothing
-    is built and no sequence numbers are consumed.
+    skipped. When ``enabled`` is false (the ``CZS_UI_EVENTS=0`` rollback
+    state) nothing is built and no sequence numbers are consumed.
     """
 
     def __init__(self, hub_instance_id=None, journal_epoch=1, enabled=None,

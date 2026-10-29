@@ -65,8 +65,8 @@
   },
   "src/zcode_supervisor/hub_server.py": {
    "mode": "100644",
-   "blob": "83a55cea89473e0fa1842a7fe2e560354981419f",
-   "sha256": "d621a18ad1fd92999a44aa006eeb615ae7198bc47c413155b6fbc03a4cd01e84"
+   "blob": "3d0c0e0cfc2780b7d20e58ff51bdfa6d353fdfe3",
+   "sha256": "3d29bebc89e53874d1c7659c1ab54b61879af497767c234f097150b9172c1b53"
   },
   "src/zcode_supervisor/mcp_readonly.py": {
    "mode": "100644",
@@ -125,5 +125,5 @@
   }
  },
  "refreshed_at": "2026-10-29",
- "refresh_reason": "P0-P3 supervisor merge 2c8d6dc + fixture compat fix; review evidence: out/agent-supervisor-implementation/controller-reviews/ (11 FINAL-ACCEPTANCE docs)"
+ "refresh_reason": "UI-events default flip (comment-only change to hub_server.py); independent review controller-reviews/uidefault-on/"
 }

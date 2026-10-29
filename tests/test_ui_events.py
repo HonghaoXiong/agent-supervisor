@@ -1298,18 +1298,28 @@ class HubDelegateProjectionTests(HubUiFixture):
         self.assertEqual(data["initiator_session_id"], "sess_ctrl_1")
         self.assertEqual(data["parent_session_id"], "sess_parent_9")
 
-    def test_default_emitter_is_env_gated_and_off_by_default(self):
+    def test_default_emitter_is_env_gated_and_on_by_default(self):
+        # 2026-10-24 product decision: unset/empty flag = ON (double-click
+        # the app and it just works); ONLY a non-empty explicit false value
+        # (0/false/no/off) rolls back; any other non-empty value = explicit
+        # enable.
         _, ui_projection = _ui_modules()
         with patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CZS_UI_EVENTS", None)
-            self.assertFalse(ui_projection.UiEmitter().enabled)
+            self.assertTrue(ui_projection.UiEmitter().enabled)
             registration, _body = self.contract()
             result = self.delegate(registration["contract_id"])
         self.assertEqual(result["outcome"], "delivered")
-        with patch.dict(os.environ, {"CZS_UI_EVENTS": "0"}):
-            self.assertFalse(ui_projection.UiEmitter().enabled)
-        with patch.dict(os.environ, {"CZS_UI_EVENTS": "1"}):
-            self.assertTrue(ui_projection.UiEmitter().enabled)
+        with patch.dict(os.environ, {"CZS_UI_EVENTS": ""}):
+            self.assertTrue(ui_projection.UiEmitter().enabled)  # empty = on
+        for rollback in ("0", "false", "no", "off", " 0 ", "OFF"):
+            with patch.dict(os.environ, {"CZS_UI_EVENTS": rollback}):
+                self.assertFalse(ui_projection.UiEmitter().enabled,
+                                 f"CZS_UI_EVENTS={rollback!r} must disable")
+        for explicit in ("1", "true", "yes", "on", "enabled"):
+            with patch.dict(os.environ, {"CZS_UI_EVENTS": explicit}):
+                self.assertTrue(ui_projection.UiEmitter().enabled,
+                                f"CZS_UI_EVENTS={explicit!r} must enable")
         self.assertIs(ui_projection.default_emitter(),
                       ui_projection.default_emitter())
 

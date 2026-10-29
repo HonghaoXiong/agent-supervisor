@@ -360,8 +360,9 @@ class UiEventServer:
         self.journal = journal
         self.heartbeat_s = float(heartbeat_s)
         # one-click discovery (ui_registry): only the gated production
-        # path (start_ui_service, i.e. CZS_UI_EVENTS on) turns this on —
-        # direct constructions (bench, tests) never touch ~/.czs
+        # path (start_ui_service — on by default since 2026-10-24; rolled
+        # back only via CZS_UI_EVENTS=0) turns this on — direct
+        # constructions (bench, tests) never touch ~/.czs
         self.register_service = bool(register_service)
         self._registry_entry = None
         self._registry_task = None
@@ -553,10 +554,10 @@ async def start_ui_service(*, state_dir, emitter=None, journal=None,
                            heartbeat_s: float = 15.0):
     """Wire journal+server onto the ONE shared projection emitter.
 
-    Enabled only by an explicit ``CZS_UI_EVENTS`` flag (default off). Any
-    setup failure returns ``None`` — the UI surface stays unavailable and
-    the hub's control plane is untouched. There is never a fallback
-    transport.
+    On by default (unset/empty ``CZS_UI_EVENTS``); the explicit rollback
+    path is ``CZS_UI_EVENTS=0`` (0/false/no/off). Any setup failure
+    returns ``None`` — the UI surface stays unavailable and the hub's
+    control plane is untouched. There is never a fallback transport.
     """
     if not _env_enabled():
         return None

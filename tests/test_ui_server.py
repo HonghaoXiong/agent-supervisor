@@ -631,13 +631,16 @@ class UiServerRepair2Tests(UiServerTestCase):
 
 
 class UiServiceWiringTests(unittest.IsolatedAsyncioTestCase):
-    async def test_service_off_by_default_and_on_with_flag(self):
+    async def test_service_on_by_default_and_off_with_flag(self):
+        # 2026-10-24 product decision: the UI event surface is ON with the
+        # flag unset/empty; ONLY an explicit false value (0/false/no/off)
+        # rolls back — and the rolled-back service writes no registry.
         import zcode_supervisor.ui_server as ui_server
 
         temporary = tempfile.TemporaryDirectory()
         self.addCleanup(temporary.cleanup)
         state = secure_dir(Path(temporary.name))
-        # registry isolation: the enabled service registers into
+        # registry isolation: the default-on service registers into
         # ~/.czs/ui-registry.json by default — pin it into the temp dir
         # so this test never touches (or depends on) the real one
         registry_file = Path(temporary.name) / "ui-registry.json"
@@ -645,15 +648,9 @@ class UiServiceWiringTests(unittest.IsolatedAsyncioTestCase):
             os.environ.pop("CZS_UI_EVENTS", None)
             os.environ["CZS_UI_REGISTRY"] = str(registry_file)
             service = await ui_server.start_ui_service(state_dir=state)
-            self.assertIsNone(service)
-            self.assertFalse(registry_file.exists())
-        with unittest.mock.patch.dict(os.environ, {"CZS_UI_EVENTS": "1",
-                                                   "CZS_UI_REGISTRY":
-                                                       str(registry_file)}):
-            service = await ui_server.start_ui_service(state_dir=state)
             self.assertIsNotNone(service)
-            # one-click discovery: the gated service registered itself,
-            # and close() removes the entry again (best-effort)
+            # one-click discovery: the default-on service registered
+            # itself, and close() removes the entry again (best-effort)
             from zcode_supervisor import ui_registry
             live = ui_registry.read_registry(path=registry_file)
             self.assertEqual([entry["socket"] for entry in live],
@@ -680,6 +677,16 @@ class UiServiceWiringTests(unittest.IsolatedAsyncioTestCase):
                 await service.close()
             self.assertEqual(
                 ui_registry.read_registry(path=registry_file), [])
+        # rollback block: an explicit false value leaves NO service and NO
+        # registry write (fresh path — the default-on block above already
+        # created its own registry file)
+        rollback_registry = Path(temporary.name) / "ui-registry-off.json"
+        with unittest.mock.patch.dict(os.environ, {"CZS_UI_EVENTS": "0",
+                                                   "CZS_UI_REGISTRY":
+                                                       str(rollback_registry)}):
+            service = await ui_server.start_ui_service(state_dir=state)
+            self.assertIsNone(service)
+            self.assertFalse(rollback_registry.exists())
 
     async def test_service_failure_leaves_ui_unavailable_only(self):
         # a path that cannot ever bind: the service reports None instead of

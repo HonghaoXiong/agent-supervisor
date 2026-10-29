@@ -268,15 +268,36 @@ class ServiceWiringTests(unittest.IsolatedAsyncioTestCase):
         return await ui_server.start_ui_service(
             state_dir=state, emitter=emitter)
 
-    async def test_flag_off_writes_no_registry(self):
+    async def test_explicit_flag_off_writes_no_registry(self):
+        # 2026-10-24 default flip: the surface is ON when the flag is
+        # unset — ONLY an explicit false value (0/false/no/off) rolls it
+        # back, and the rolled-back service writes no registry entry.
+        state = secure_dir(self.root)
+        emitter = make_emitter()
+        with unittest.mock.patch.dict(os.environ, {"CZS_UI_EVENTS": "0",
+                                                   "CZS_UI_REGISTRY":
+                                                       str(self.registry)}):
+            service = await self._service(state, emitter)
+        self.assertIsNone(service)
+        self.assertFalse(self.registry.exists())
+
+    async def test_unset_flag_is_on_and_writes_registry(self):
+        # the flipped default end to end: no CZS_UI_EVENTS at all → the
+        # service starts and registers itself for one-click discovery
         state = secure_dir(self.root)
         emitter = make_emitter()
         with unittest.mock.patch.dict(os.environ, {}, clear=False):
             os.environ.pop("CZS_UI_EVENTS", None)
             os.environ["CZS_UI_REGISTRY"] = str(self.registry)
             service = await self._service(state, emitter)
-        self.assertIsNone(service)
-        self.assertFalse(self.registry.exists())
+            self.assertIsNotNone(service)
+            try:
+                live = ui_registry.read_registry(path=self.registry)
+                self.assertEqual([entry["pid"] for entry in live],
+                                 [os.getpid()])
+            finally:
+                await service.close()
+        self.assertEqual(ui_registry.read_registry(path=self.registry), [])
 
     async def test_direct_server_construction_never_registers(self):
         from zcode_supervisor import ui_server
