@@ -965,6 +965,52 @@ class EventRouterTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(plain.pending), 0)
         self.assertEqual(len(broadcast.pending), 1)
 
+    def test_rekey_delivers_backlog_in_global_seq_order(self):
+        """WP-B repair1 (quality N-1): the rekey backlog — replayed
+        pre-subscription store pairs, live window frames already sitting
+        in pending and the new key's stash — is delivered as ONE
+        sequence-ordered merge. Last-candidate-wins consumers therefore
+        see the highest-seq candidate last, exactly matching legacy's
+        processed=0 wire-order drain. Pre-fix, replay APPENDED after
+        the live window frames: an earlier wire frame won the binding
+        (order ['stale_B', 'stale_A'] instead of wire order)."""
+        store = [
+            {'sessionId': None, 'seq': 1, 'n': 'stale_A'},
+            {'sessionId': 'k', 'seq': 2, 'n': 'own_pre'}]
+        router = protocol.EventRouter(
+            key_of=lambda frame: frame.get('sessionId'),
+            seq_of=lambda frame: frame.get('seq'),
+            store=store, store_seqs=[1, 2])
+        sub = router.subscribe(None, 0, deliver_unattributed=True)
+        # live wire inside the subscribe->rekey window: an unattributed
+        # frame goes straight to pending, a keyed frame is stashed (the
+        # production consumer does NOT drain inside the window — the
+        # driver's first drain is after rekey)
+        router.publish({'sessionId': None, 'seq': 3, 'n': 'stale_B'},
+                       seq=3)
+        router.publish({'sessionId': 'k', 'seq': 4, 'n': 'own_stash'},
+                       seq=4)
+        self.assertEqual([f['n'] for _s, f in sub.pending], ['stale_B'])
+        sub.rekey('k')
+        order = [f['n'] for _s, f in sub.drain()]
+        self.assertEqual(order, ['stale_A', 'own_pre', 'stale_B',
+                                 'own_stash'])
+
+    def test_event_router_default_is_incremental_legacy_is_rollback(self):
+        """WP-B default flip (2026-10-30): unset (and any non-legacy
+        value) selects the incremental routed path; exactly 'legacy' is
+        the single explicit rollback switch."""
+        from zcode_supervisor.protocol import event_router_mode
+        with patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(event_router_mode(), 'incremental')
+        for value in ('', 'incremental', 'INCREMENTAL', 'bogus'):
+            with patch.dict(os.environ,
+                            {'CZS_EVENT_ROUTER': value}):
+                self.assertEqual(event_router_mode(), 'incremental',
+                                 f'value {value!r} must not roll back')
+        with patch.dict(os.environ, {'CZS_EVENT_ROUTER': 'legacy'}):
+            self.assertEqual(event_router_mode(), 'legacy')
+
     async def test_cold_execute_routed_matches_legacy_shape(self):
         """execute() under CZS_EVENT_ROUTER=incremental with a routed fake
         client still delivers (early subscribe + narrow)."""

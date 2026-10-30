@@ -400,7 +400,10 @@ class CodexAppServerClient:
         thread's frames are never counted by any receipt (each receipt
         scans only its own thread + unattributed). Only run while no
         placeholder exists so another task's in-flight window keeps its
-        store-kept frames."""
+        store-kept frames. (WP-B S4 note: an adversarial frame naming a
+        never-minted thread id never reaches this sweep — the read_loop
+        store gate already dropped it; see the S4 adjudication comment
+        there and the pinned gate test.)"""
         router = self._notification_router
         if router is None or router.has_placeholder():
             return
@@ -447,7 +450,20 @@ class CodexAppServerClient:
         # aggregate and retrievable from the on-disk frame log; drop them
         # (attributed frames stay until their thread's release). Legacy
         # mode keeps the store byte-identical to the old behavior.
-        if self._notification_router is not None and self._unattributed_cursor:
+        # WP-B N2 alignment: the store-side watermark rule is applied at
+        # this removal boundary in reverse — while ANY subscription still
+        # sits on a placeholder key, its rekey replay is the same-side
+        # consumer of exactly these below-cursor unattributed frames, so
+        # the drop waits for the window to close (the publish path and
+        # sweep_ownerless_frames already keep/gate on has_placeholder();
+        # this makes every removal site symmetric). Without the gate, a
+        # foreign task's merge landing inside another task's
+        # subscribe->rekey window pruned frames legacy's processed=0
+        # drain still delivered — the modes diverged on receipt turn
+        # bindings (N2 cross-window divergence, WP-B RED probe).
+        if (self._notification_router is not None
+                and self._unattributed_cursor
+                and not self._notification_router.has_placeholder()):
             kept, kept_seqs = [], []
             for index, frame in enumerate(self.notifications):
                 if index < self._unattributed_cursor and (
@@ -751,6 +767,22 @@ class CodexAppServerClient:
                         # future rekey and their receipts must still scan
                         # them. Handlers dispatch for EVERY frame —
                         # unchanged.
+                        # WP-B S4 adjudication (expected difference vs
+                        # legacy, pinned by
+                        # test_adversarial_future_thread_frame_differs_by_design):
+                        # a frame naming a thread id NO server response
+                        # ever minted (adversarial servers pre-deciding a
+                        # future thread/start id; a compliant server
+                        # cannot produce this) is DROPPED here — no
+                        # subscriber, no placeholder window. Legacy keeps
+                        # it and a later task's receipt scan mis-associates
+                        # it; incremental's drop is what keeps the
+                        # cross-task misassociation contract at exactly 0.
+                        # v1 alias frames (conversationId set, threadId
+                        # None) fall in the identity-None keep branch and
+                        # are retained for the client's lifetime in BOTH
+                        # modes — documented exemption, pinned by
+                        # test_v1_alias_frames_retained_identically_in_both_modes.
                         self._notification_seq += 1
                         self._notification_router.publish(
                             frame, seq=self._notification_seq)
@@ -1403,10 +1435,12 @@ class CodexAppServerDriver:
         unsubscribe_notification = \
             self.client.add_notification_handler(notification_handler)
         processed = 0
-        # P2.2 routed mode: one bounded subscription replaces the shared-list
-        # scan + 20 ms polling. Keyed None until thread/start returns the
-        # thread id, then rekeyed (with replay) to it. Duck-typed: clients
-        # and doubles without the API keep the exact legacy drain.
+        # P2.2 routed mode (default since 2026-10-30; explicit rollback
+        # CZS_EVENT_ROUTER=legacy): one bounded subscription replaces the
+        # shared-list scan + 20 ms polling. Keyed None until
+        # thread/start returns the thread id, then rekeyed (with
+        # replay) to it. Duck-typed: clients and doubles without the API
+        # keep the exact legacy drain.
         router_sub = None
         if (event_router_mode() == 'incremental'
                 and hasattr(self.client, 'subscribe_notifications')):

@@ -1302,6 +1302,20 @@ async def _cancel_round(resident, packets_dir, workspace, collector, client,
     return round_
 
 
+@contextmanager
+def _pinned_event_router_mode(mode):
+    """Bench-only env pin: force one CZS_EVENT_ROUTER mode (restored)."""
+    prior = os.environ.get('CZS_EVENT_ROUTER')
+    os.environ['CZS_EVENT_ROUTER'] = mode
+    try:
+        yield
+    finally:
+        if prior is None:
+            os.environ.pop('CZS_EVENT_ROUTER', None)
+        else:
+            os.environ['CZS_EVENT_ROUTER'] = prior
+
+
 async def bench_fake_resident(server_path, steady_rounds, *, scratch_dir=None,
                                cancel_reset_reply_delay_s=0.0):
     """Fake resident section: first create, steady resume/send, cancel, close.
@@ -1318,54 +1332,62 @@ async def bench_fake_resident(server_path, steady_rounds, *, scratch_dir=None,
              'rounds, one cancelled never-complete round, then stop; '
              'instrumentation wraps inventory/check_frozen/write_json/request '
              'at runtime (originals restored); zero model calls']
-    with _bench_workspace(scratch_dir, FAKE_RESIDENT) as root:
-        config = _fake_layout(server_path, root)
-        workspace = _fixture_workspace(root / 'work')
-        collector = _AuthorityCollector()
-        rounds, lag_samples = [], []
-        stop = asyncio.Event()
-        resident = ResidentZCode(config, root / 'work')
-        with _instrumented_resident(collector):
-            started = time.perf_counter()
-            await resident.start()
-            start_ms = (time.perf_counter() - started) * 1000.0
-            client = resident.client
-            heartbeat = asyncio.create_task(_heartbeat(0.02, lag_samples, stop))
-            try:
-                packet = _fixture_packet(root / 'packets', 'first', workspace)
-                first = await _resident_round(
-                    resident, packet, root / 'work' / 'run-first.json',
-                    None, collector, client, 'first-create')
-                rounds.append(first)
-                for index in range(steady_rounds):
-                    packet = _fixture_packet(root / 'packets',
-                                             f'steady-{index}', workspace)
-                    rounds.append(await _resident_round(
-                        resident, packet,
-                        root / 'work' / f'run-steady-{index}.json',
-                        first['session_id'], collector, client, 'steady-resume'))
-                rounds.append(await _cancel_round(
-                    resident, root / 'packets', workspace, collector, client,
-                    root / 'work',
-                    reset_reply_delay_s=cancel_reset_reply_delay_s))
-                counters = await _request(client, 'bench/counters', {})
-                retention = {'events_retained': len(client.events),
-                             'reverse_tasks': len(client.tasks)}
-            finally:
-                stop.set()
-                heartbeat.cancel()
-                try:
-                    await heartbeat
-                except asyncio.CancelledError:
-                    pass
+    # WP-B default flip (2026-10-30): this section's retention and
+    # rescan metrics (round_events_emitted / events_retained /
+    # evidence_scan_events) are DEFINED on the legacy shared event
+    # store (client.events) — the explicit CZS_EVENT_ROUTER=legacy
+    # rollback keeps this P0-era baseline measuring the same store;
+    # the routed mode's bounded-retention story is measured by the
+    # P2.2 soak tooling (tasks/P2.2/ab soak, WP-B codex soak).
+    with _bench_workspace(scratch_dir, FAKE_RESIDENT) as root, \
+            _pinned_event_router_mode('legacy'):
+            config = _fake_layout(server_path, root)
+            workspace = _fixture_workspace(root / 'work')
+            collector = _AuthorityCollector()
+            rounds, lag_samples = [], []
+            stop = asyncio.Event()
+            resident = ResidentZCode(config, root / 'work')
+            with _instrumented_resident(collector):
                 started = time.perf_counter()
-                await resident.stop()
-                stop_ms = (time.perf_counter() - started) * 1000.0
-        peak_rss = {
-            'self_maxrss': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
-            'children_maxrss': resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
-            'unit': 'bytes on macOS, KiB on Linux',
-        }
+                await resident.start()
+                start_ms = (time.perf_counter() - started) * 1000.0
+                client = resident.client
+                heartbeat = asyncio.create_task(_heartbeat(0.02, lag_samples, stop))
+                try:
+                    packet = _fixture_packet(root / 'packets', 'first', workspace)
+                    first = await _resident_round(
+                        resident, packet, root / 'work' / 'run-first.json',
+                        None, collector, client, 'first-create')
+                    rounds.append(first)
+                    for index in range(steady_rounds):
+                        packet = _fixture_packet(root / 'packets',
+                                                 f'steady-{index}', workspace)
+                        rounds.append(await _resident_round(
+                            resident, packet,
+                            root / 'work' / f'run-steady-{index}.json',
+                            first['session_id'], collector, client, 'steady-resume'))
+                    rounds.append(await _cancel_round(
+                        resident, root / 'packets', workspace, collector, client,
+                        root / 'work',
+                        reset_reply_delay_s=cancel_reset_reply_delay_s))
+                    counters = await _request(client, 'bench/counters', {})
+                    retention = {'events_retained': len(client.events),
+                                 'reverse_tasks': len(client.tasks)}
+                finally:
+                    stop.set()
+                    heartbeat.cancel()
+                    try:
+                        await heartbeat
+                    except asyncio.CancelledError:
+                        pass
+                    started = time.perf_counter()
+                    await resident.stop()
+                    stop_ms = (time.perf_counter() - started) * 1000.0
+            peak_rss = {
+                'self_maxrss': resource.getrusage(resource.RUSAGE_SELF).ru_maxrss,
+                'children_maxrss': resource.getrusage(resource.RUSAGE_CHILDREN).ru_maxrss,
+                'unit': 'bytes on macOS, KiB on Linux',
+            }
     phases = {
         'resident_start': phase_stats([start_ms]),
         'first_create': phase_stats([round_['total_wall_ms']

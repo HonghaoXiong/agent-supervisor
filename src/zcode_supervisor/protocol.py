@@ -65,11 +65,15 @@ EVENT_ROUTER_BOUND = 1024
 
 
 def event_router_mode():
-    """CZS_EVENT_ROUTER=incremental opts every consumer loop of this
-    process into the routed path; the default (and any other value) is
-    the legacy scan-and-sleep behavior — the rollback switch."""
-    return 'incremental' if os.environ.get('CZS_EVENT_ROUTER') == 'incremental' \
-        else 'legacy'
+    """CZS_EVENT_ROUTER=legacy is the rollback switch back to the legacy
+    scan-and-sleep consumer loops; the default (and any other value) is
+    the incremental routed path — flipped 2026-10-30 (WP-B) after the
+    P2.2 five-prerequisite gate (N2 cross-window alignment, N-R2a
+    mid-flight test hardening, codex 1000-task frozen-threshold soak,
+    v1-alias and S4 boundary adjudications) and the 9-scenario golden
+    re-run at 0 field diffs."""
+    return 'legacy' if os.environ.get('CZS_EVENT_ROUTER') == 'legacy' \
+        else 'incremental'
 
 
 class RouterOverflow(ValueError):
@@ -197,14 +201,29 @@ class BoundedSubscription:
         seq record; frames predating this subscription are recovered
         here). Pairs at/above ``_live_floor`` were already seen on the
         live wire (delivered or stashed) and are skipped, so replay can
-        never duplicate. The placeholder stash for the new key drains
-        last; stashes for other keys are dropped (their frames remain in
-        the store for their own subscribers' replay)."""
+        never duplicate.
+
+        WP-B repair1 (quality N-1): the rekey backlog — replayed
+        pre-subscription pairs, the live frames already sitting in
+        ``pending`` and the new key's stash — is delivered as ONE
+        sequence-ordered merge (all three sources are individually in
+        wire order, and replayed pairs are strictly below
+        ``_live_floor`` while every pending/stashed pair is at/above
+        it, so the merge simply restores the global wire order). Before
+        this, replay APPENDED after the live window frames: with two
+        unattributed turn/started candidates straddling the subscribe
+        boundary, last-candidate-wins consumers (publish_turn) bound
+        the EARLIER wire frame — legacy's processed=0 full-store drain
+        binds the last by wire order, so the receipts diverged on
+        turn_id with zero merge pruning involved. Stashes for other
+        keys are dropped (their frames remain in the store for their
+        own subscribers' replay)."""
         self.key = key
         if not replay_pairs and self._router is not None:
             replay_pairs = self._router.replay(
                 key, self.start_seq,
                 include_unattributed=self.deliver_unattributed)
+        replayed = []
         for seq, frame in replay_pairs:
             if seq is None or seq <= self.start_seq:
                 continue
@@ -214,10 +233,17 @@ class BoundedSubscription:
                 if self._router is not None else None
             if frame_key == key or (frame_key is None
                                     and self.deliver_unattributed):
-                self._offer(seq, frame)
-        for seq, frame in self._stash.pop(key, []):
-            self._offer(seq, frame)
+                replayed.append((seq, frame))
+        stashed = self._stash.pop(key, [])
         self._stash.clear()
+        merged = sorted([tuple(pair) for pair in self.pending]
+                        + replayed + stashed,
+                        key=lambda pair: (pair[0] is None,
+                                          pair[0] if pair[0] is not None
+                                          else 0))
+        self.pending = []
+        for seq, frame in merged:
+            self._offer(seq, frame)
         self._wakeup.set()
 
 
@@ -463,14 +489,16 @@ class ProtocolClient:
         self.wire = None
         self.reader = None
         self.closing = False
-        # P2.2: keyed bounded routing beside `events` (legacy consumers
-        # never touch it; subscribe_events creates it on first use)
+        # P2.2: keyed bounded routing beside `events` (the explicit
+        # CZS_EVENT_ROUTER=legacy rollback keeps the shared-list scan;
+        # subscribe_events creates the router on first use)
         self._event_router = None
 
     def subscribe_events(self, session_id, start_seq):
         """P2.2: one task's bounded subscription to this client's
         session/event stream, keyed by sessionId from ``start_seq`` on.
-        Under CZS_EVENT_ROUTER=legacy nothing routes and this is unused."""
+        Under the explicit rollback CZS_EVENT_ROUTER=legacy nothing
+        routes and this is unused."""
         if self._event_router is None:
             self._event_router = EventRouter(
                 key_of=lambda event: event.get('sessionId')
@@ -1007,10 +1035,12 @@ async def execute(args, config, ui_emitter=None):
                     and event.get('payload',{}).get('inputId') == input_id):
                 authority.turn_id = event['turnId']
         client.on_event = receive_event
-        # P2.2 routed mode: subscribe on the constructed client BEFORE any
-        # session traffic (the read loop starts routing from the first
-        # frame); the floor is narrowed once session/subscribe answers.
-        # Duck-typed: clients/doubles without the API keep the legacy path.
+        # P2.2 routed mode (default since 2026-10-30; the explicit
+        # rollback is CZS_EVENT_ROUTER=legacy): subscribe on the
+        # constructed client BEFORE any session traffic (the read loop
+        # starts routing from the first frame); the floor is narrowed
+        # once session/subscribe answers. Duck-typed: clients/doubles
+        # without the API keep the legacy path.
         router_sub = None  # declared here: the finally releases it
         if (event_router_mode() == 'incremental'
                 and hasattr(client, 'subscribe_events')):

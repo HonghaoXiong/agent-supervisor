@@ -42,6 +42,8 @@ observed = {"mode": MODE, "server_responses": [], "interrupt": None}
 # "dual" mode: two concurrent threads on one client. thread ids are pinned
 # by the thread/start cwd (wsA/wsB) so each driver maps to its own thread.
 DUAL = {"threads": [], "turns": [], "fired": False}
+# WP-B future-own / v1alias modes: sequential per-task thread ids
+FO = {"threads": []}
 
 
 def send(frame):
@@ -72,6 +74,44 @@ def ask(rid, method, params):
 
 
 def run_turn():
+    if MODE in ("mergewindow", "orderinv"):
+        # WP-B N2 / N-1 shapes: the task's own wire NEVER carries a turn
+        # id (neither the response nor the completed frame), so the only
+        # possible receipt turn bindings are the stale unattributed
+        # turn/started frames (pre-subscribe replay + live window)
+        note("turn/completed", {"threadId": THREAD,
+                                "turn": {"status": "completed"}})
+        return
+    if MODE == "future-own":
+        own = "th_fo_%d" % len(FO["threads"])
+        if len(FO["threads"]) == 1:
+            # task 1's turn: while its keyed subscriber is the ONLY one
+            # (no placeholder window open), the adversarial server emits
+            # a frame naming the id the NEXT thread/start will mint —
+            # dropped by the routed store rule, retained by legacy.
+            note("item/completed",
+                 {"threadId": "th_fo_2",
+                  "item": {"type": "agentMessage",
+                           "text": "FUTURE_OWN_MESSAGE"}})
+            note("item/completed",
+                 {"threadId": own,
+                  "item": {"type": "agentMessage",
+                           "text": "DONE_ONE"}})
+        # both tasks complete with their own turn/completed only — any
+        # task-2 final_message can only come from the future-named frame
+        note("turn/completed", {"threadId": own,
+                                "turn": {"id": TURN,
+                                         "status": "completed"}})
+        return
+    if MODE == "v1alias":
+        # WP-B v1-alias retention shape: every turn carries one
+        # conversationId-only frame (identity-set=1, threadId None)
+        note("turn/progress", {"conversationId": "conv_v1",
+                               "message": "v1 alias frame"})
+        note("turn/completed", {"threadId": "th_v1_%d" % len(FO["threads"]),
+                                "turn": {"id": TURN,
+                                         "status": "completed"}})
+        return
     if MODE == "p05":
         # P0.5: ONE identity-required approval request shaped by the test
         # env (missing / non-dict / conflicting / unknown / valid identity),
@@ -289,6 +329,22 @@ for line in sys.stdin:
             # subscribes (router not yet created -> legacy store branch)
             note("turn/progress", {"message": "pre-subscribe noise"})
             note("turn/progress", {"message": "pre-subscribe noise 2"})
+        if MODE == "presub":
+            # WP-B N-R2a/R-T1 hardening: one ATTRIBUTED pre-subscribe
+            # frame, so the mid-flight replay("th_stranger") assertion
+            # has a real (non-empty) target in this mode
+            note("item/completed",
+                 {"threadId": "th_stranger",
+                  "item": {"type": "agentMessage",
+                           "text": "PRE_SUB_STRANGER"}})
+        if MODE == "mergewindow":
+            # WP-B N2 shape: a pre-subscribe UNATTRIBUTED turn frame with
+            # a foreign turn id (the replay target of the crossing window)
+            note("turn/started", {"turnId": "turn_STALE"})
+        if MODE == "orderinv":
+            # WP-B repair1 (quality N-1): FIRST unattributed candidate,
+            # pre-subscribe (replay source)
+            note("turn/started", {"turnId": "turn_STALE_A"})
     elif method == "thread/start":
         observed["thread_params"] = params
         thread = THREAD
@@ -297,6 +353,11 @@ for line in sys.stdin:
                       else "th_dual_B")
             if thread not in DUAL["threads"]:
                 DUAL["threads"].append(thread)
+        if MODE in ("future-own", "v1alias"):
+            # per-task sequential thread ids (fresh session per task)
+            FO["threads"].append(len(FO["threads"]) + 1)
+            thread = ("th_fo_%d" if MODE == "future-own" else "th_v1_%d") \
+                % FO["threads"][-1]
         send({"id": frame["id"],
               "result": {"thread": {"id": thread},
                          "approvalPolicy": params.get("approvalPolicy"),
@@ -313,6 +374,11 @@ for line in sys.stdin:
                  {"threadId": thread,
                   "item": {"type": "agentMessage",
                            "text": "EARLY_MESSAGE_IN_WINDOW"}})
+        if MODE == "orderinv":
+            # WP-B repair1 (quality N-1): SECOND unattributed candidate
+            # batched with the thread/start response — it lands inside
+            # the subscribe->rekey window on the live wire
+            note("turn/started", {"turnId": "turn_STALE_B"})
         if MODE == "stranger-window":
             # repair2 F2: a foreign-thread frame rides every placeholder
             # window — ownerless once the window closes
@@ -331,6 +397,11 @@ for line in sys.stdin:
             if len(DUAL["turns"]) == 2 and not DUAL["fired"]:
                 DUAL["fired"] = True
                 dual_sequence()
+        elif MODE in ("mergewindow", "orderinv"):
+            # no turn id in the response: the only receipt turn binding
+            # possible is a stale unattributed frame (N2 / N-1 shapes)
+            send({"id": frame["id"], "result": {"turn": {}}})
+            run_turn()
         elif MODE == "p05cancel":
             # no turn id in the response: the driver never learns a live
             # turn, so the turnId-less approval parks in the 5s wait
@@ -341,7 +412,18 @@ for line in sys.stdin:
                                                          "status": "inProgress"}}})
             run_turn()
     elif method == "thread/read":
-        if MODE in ("dual", "p05dual"):
+        if MODE == "future-own":
+            # no turns/items: final_message can only come from the store
+            send({"id": frame["id"],
+                  "result": {"thread": {"id": str(params.get("threadId")),
+                                        "turns": []},
+                             "readState": {}}})
+        elif MODE == "v1alias":
+            send({"id": frame["id"],
+                  "result": {"thread": {"id": str(params.get("threadId")),
+                                        "turns": []},
+                             "readState": {}}})
+        elif MODE in ("dual", "p05dual"):
             thread = str(params.get("threadId"))
             send({"id": frame["id"],
                   "result": {"thread": {"id": thread, "turns": [
@@ -440,7 +522,7 @@ class FakeAppServerTests(unittest.TestCase):
         (root / "ws").mkdir()
         return root, fake, root / "diag.json"
 
-    def _drive(self, mode, timeout_s=8.0, authority=None):
+    def _drive(self, mode, timeout_s=8.0, authority=None, router_mode=None):
         root, fake, diag_path = self._prepare()
         if authority is None:
             authority = SimpleContractAuthority(["cat TASK.md"], ["OUT.md"])
@@ -453,8 +535,18 @@ class FakeAppServerTests(unittest.TestCase):
                      "FAKE_APPSERVER_SECRET": SECRET})
             try:
                 await client.start()
-                receipt = await CodexAppServerDriver(client).run_task(
-                    authority, root / "ws", "do the task", timeout_s=timeout_s)
+                if router_mode is None:
+                    receipt = await CodexAppServerDriver(client).run_task(
+                        authority, root / "ws", "do the task",
+                        timeout_s=timeout_s)
+                else:
+                    with mock.patch.dict(
+                            os.environ,
+                            {"CZS_EVENT_ROUTER": router_mode}):
+                        receipt = await CodexAppServerDriver(
+                            client).run_task(
+                                authority, root / "ws", "do the task",
+                                timeout_s=timeout_s)
             finally:
                 await client.close()
             return receipt
@@ -661,12 +753,20 @@ class FakeAppServerTests(unittest.TestCase):
             .get("item/completed"), 3)
 
     def test_pre_subscribe_frames_keep_store_seqs_aligned(self):
-        """repair2 F1: notifications arriving before the first routed
-        subscription (legacy store branch) must carry seq records —
-        store/seqs stay index-parallel and replay fabricates no
-        duplicate seqs."""
+        """repair2 F1, WP-B N-R2a hardening: MID-FLIGHT assertions.
+
+        The pre-fix version of this test asserted after run_task returned
+        — by then merge pruning + release + sweep had emptied the store
+        and ``0 == 0`` held even on the pre-F1 code (review-verified
+        vacuous). The assertions now snapshot at the FIRST subscription
+        creation and at rekey, while the pre-subscribe frames are still
+        in the store, and R-T1 gives the presub mode one ATTRIBUTED
+        stranger pre-frame so the replay dedup check is not an empty-set
+        tautology.
+        """
         root, fake, diag_path = self._prepare()
         import asyncio as _asyncio
+        snapshots = {}
 
         async def go():
             client = CodexAppServerClient(
@@ -675,6 +775,41 @@ class FakeAppServerTests(unittest.TestCase):
                      "FAKE_APPSERVER_DIAG": str(diag_path),
                      "FAKE_APPSERVER_SECRET": SECRET,
                      "PATH": os.environ.get("PATH", "")})
+            inner_subscribe = client.subscribe_notifications
+
+            def hooked_subscribe(key, start_seq,
+                                 deliver_unattributed=False):
+                sub = inner_subscribe(
+                    key, start_seq,
+                    deliver_unattributed=deliver_unattributed)
+                # (a) AT SUBSCRIPTION CREATION: the three presub frames
+                # took the legacy store branch — the seq record must be
+                # index-parallel, populated and duplicate-free here.
+                snapshots["at_subscribe"] = (len(client.notifications),
+                                             len(client._store_seqs),
+                                             list(client._store_seqs))
+                orig_rekey = sub.rekey
+
+                def rekey_with_assertions(new_key, replay_pairs=()):
+                    router = client._notification_router
+                    # (b) AT REKEY (store still full, pre-cleanup): the
+                    # per-pair snapshot — every store frame is paired
+                    # with ITS OWN arrival seq, and the attributed
+                    # stranger frame replays exactly once, no fabricated
+                    # duplicate seqs (repair2 F1 invariant).
+                    snapshots["store_at_rekey"] = (
+                        len(client.notifications),
+                        len(client._store_seqs))
+                    pairs = router.replay("th_stranger", 0)
+                    snapshots["stranger_replay"] = [
+                        (seq, frame.get("params", {}).get("threadId"))
+                        for seq, frame in pairs]
+                    return orig_rekey(new_key, replay_pairs)
+
+                sub.rekey = rekey_with_assertions
+                return sub
+
+            client.subscribe_notifications = hooked_subscribe
             try:
                 await client.start()
                 with mock.patch.dict(os.environ,
@@ -682,18 +817,247 @@ class FakeAppServerTests(unittest.TestCase):
                     await CodexAppServerDriver(client).run_task(
                         SimpleContractAuthority(["cat TASK.md"], ["OUT.md"]),
                         root / "ws", "do the task", timeout_s=8.0)
-                self.assertEqual(len(client.notifications),
-                                 len(client._store_seqs))
-                router = client._notification_router
-                self.assertIsNotNone(router)
-                pairs = router.replay("th_stranger", 0)
-                seqs = [seq for seq, _f in pairs]
-                self.assertEqual(len(seqs), len(set(seqs)),
-                                 "replay fabricated duplicate seqs")
             finally:
                 await client.close()
 
         _asyncio.run(go())
+        frames_n, seqs_n, seqs = snapshots["at_subscribe"]
+        self.assertEqual(frames_n, seqs_n,
+                         "store/seqs not index-parallel at subscribe")
+        self.assertGreaterEqual(seqs_n, 3,
+                                "presub frames missing from the store")
+        self.assertEqual(seqs, sorted(seqs),
+                         "seq records not in arrival order")
+        self.assertEqual(len(seqs), len(set(seqs)),
+                         "duplicate seq records")
+        store_frames, store_seqs = snapshots["store_at_rekey"]
+        self.assertEqual(store_frames, store_seqs,
+                         "store/seqs diverged before rekey")
+        replay = snapshots["stranger_replay"]
+        self.assertEqual(
+            replay, [(3, "th_stranger")],
+            "attributed presub frame must replay exactly once with its "
+            "own arrival seq (R-T1: non-empty target, no duplicates)")
+
+    def test_cross_window_merge_keeps_router_modes_aligned(self):
+        """WP-B prerequisite 1 (N2): another task's merge landing inside
+        this task's subscribe->rekey window must NOT prune the
+        unattributed frames its rekey replay needs — incremental now
+        matches legacy's processed=0 full-store drain on the receipt
+        turn binding (pre-fix: legacy bound the stale turn id while
+        incremental delivered nothing)."""
+        receipts = {}
+        for mode in ("legacy", "incremental"):
+            root, fake, diag_path = self._prepare()
+            import asyncio as _asyncio
+
+            async def go(mode=mode, root=root, fake=fake,
+                         diag_path=diag_path):
+                client = CodexAppServerClient(
+                    str(fake), root / "evidence",
+                    env={"FAKE_APPSERVER_MODE": "mergewindow",
+                         "FAKE_APPSERVER_DIAG": str(diag_path),
+                         "FAKE_APPSERVER_SECRET": SECRET,
+                         "PATH": os.environ.get("PATH", "")})
+                try:
+                    await client.start()
+                    orig_request = client.request
+
+                    async def merging_request(method, params, **kw):
+                        if method == "thread/start":
+                            # ANOTHER task's tail merge landing inside
+                            # THIS task's subscribe -> rekey window
+                            client.merge_unattributed_notifications()
+                        return await orig_request(method, params, **kw)
+
+                    client.request = merging_request
+                    with mock.patch.dict(os.environ,
+                                         {"CZS_EVENT_ROUTER": mode}):
+                        return await CodexAppServerDriver(
+                            client).run_task(
+                                SimpleContractAuthority(
+                                    ["cat TASK.md"], ["OUT.md"]),
+                                root / "ws", "do the task", timeout_s=8.0)
+                finally:
+                    await client.close()
+
+            receipts[mode] = _asyncio.run(go())
+        self.assertEqual(receipts["legacy"]["turn_id"], "turn_STALE")
+        self.assertEqual(receipts["incremental"]["turn_id"], "turn_STALE")
+        self.assertEqual(receipts["legacy"]["outcome"], "delivered")
+        self.assertEqual(receipts["incremental"]["outcome"], "delivered")
+        self.assertEqual(receipts["legacy"]["notification_counts"],
+                         receipts["incremental"]["notification_counts"])
+
+    def test_multi_candidate_stale_binding_matches_wire_order(self):
+        """WP-B repair1 (quality N-1): with two unattributed turn/started
+        candidates straddling the subscribe boundary (one pre-subscribe,
+        one inside the subscribe->rekey window) and the task's own wire
+        carrying no turn id, BOTH router modes bind the LAST candidate in
+        wire order. Pre-fix: incremental's rekey APPENDED the replayed
+        pre-subscribe frame after the live window frames, so the EARLIER
+        candidate won the last-candidate-wins binding — receipts diverged
+        on turn_id with zero merge pruning involved."""
+        receipts = {}
+        for mode in ("legacy", "incremental"):
+            root, fake, diag_path = self._prepare()
+            import asyncio as _asyncio
+
+            async def go(mode=mode, root=root, fake=fake,
+                         diag_path=diag_path):
+                client = CodexAppServerClient(
+                    str(fake), root / "evidence",
+                    env={"FAKE_APPSERVER_MODE": "orderinv",
+                         "FAKE_APPSERVER_DIAG": str(diag_path),
+                         "FAKE_APPSERVER_SECRET": SECRET,
+                         "PATH": os.environ.get("PATH", "")})
+                try:
+                    await client.start()
+                    with mock.patch.dict(os.environ,
+                                         {"CZS_EVENT_ROUTER": mode}):
+                        return await CodexAppServerDriver(
+                            client).run_task(
+                                SimpleContractAuthority(
+                                    ["cat TASK.md"], ["OUT.md"]),
+                                root / "ws", "do the task", timeout_s=8.0)
+                finally:
+                    await client.close()
+
+            receipts[mode] = _asyncio.run(go())
+        # wire order: A (pre-subscribe) then B (in-window) — the LAST
+        # candidate in wire order wins in BOTH modes (rekey delivers its
+        # backlog as one sequence-ordered merge)
+        self.assertEqual(receipts["legacy"]["turn_id"], "turn_STALE_B")
+        self.assertEqual(receipts["incremental"]["turn_id"],
+                         "turn_STALE_B")
+        self.assertEqual(receipts["legacy"]["outcome"], "delivered")
+        self.assertEqual(receipts["incremental"]["outcome"], "delivered")
+        self.assertEqual(receipts["legacy"]["notification_counts"],
+                         receipts["incremental"]["notification_counts"])
+
+    def test_adversarial_future_thread_frame_differs_by_design(self):
+        """WP-B prerequisite 5 (S4), pinned exemption: during task 1's
+        turn (keyed subscriber, NO placeholder window open), the
+        adversarial server emits a frame naming the thread id the NEXT
+        task's thread/start will mint. A compliant server mints ids at
+        thread/start and cannot produce this. The routed store rule
+        (no subscriber, no placeholder) DROPS it; legacy retains it and
+        the later task's receipt-counting scan (_collect) picks it up —
+        cross-task misassociation. The difference is the documented
+        expected behavior: incremental's drop is what keeps the
+        misassociation contract at exactly zero."""
+        receipts = {}
+        for mode in ("legacy", "incremental"):
+            root, fake, diag_path = self._prepare()
+            import asyncio as _asyncio
+
+            async def go(mode=mode, root=root, fake=fake,
+                         diag_path=diag_path):
+                client = CodexAppServerClient(
+                    str(fake), root / "evidence",
+                    env={"FAKE_APPSERVER_MODE": "future-own",
+                         "FAKE_APPSERVER_DIAG": str(diag_path),
+                         "FAKE_APPSERVER_SECRET": SECRET,
+                         "PATH": os.environ.get("PATH", "")})
+                try:
+                    await client.start()
+                    with mock.patch.dict(os.environ,
+                                         {"CZS_EVENT_ROUTER": mode}):
+                        await CodexAppServerDriver(client).run_task(
+                            SimpleContractAuthority(
+                                ["cat TASK.md"], ["OUT.md"]),
+                            root / "ws1", "task one", timeout_s=8.0)
+                        return await CodexAppServerDriver(
+                            client).run_task(
+                                SimpleContractAuthority(
+                                    ["cat TASK.md"], ["OUT.md"]),
+                                root / "ws2", "task two", timeout_s=8.0)
+                finally:
+                    await client.close()
+
+            receipts[mode] = _asyncio.run(go())
+        # legacy: the future-named frame is counted by the later task
+        self.assertEqual(receipts["legacy"]["final_message"],
+                         "FUTURE_OWN_MESSAGE")
+        # incremental: dropped at arrival — misassociation stays zero
+        self.assertIsNone(receipts["incremental"]["final_message"])
+        # the drop never breaks the task itself
+        self.assertEqual(receipts["incremental"]["outcome"], "delivered")
+        self.assertEqual(receipts["legacy"]["outcome"], "delivered")
+        # the misassociation is visible in legacy's own-frame counts
+        # (the future-named frame is counted by the later task) and
+        # absent in incremental — the pinned, expected difference
+        self.assertEqual(receipts["legacy"]["notification_counts"],
+                         {"item/completed": 1, "turn/completed": 1})
+        self.assertEqual(receipts["incremental"]["notification_counts"],
+                         {"turn/completed": 1})
+
+    def test_v1_alias_frames_retained_identically_in_both_modes(self):
+        """WP-B prerequisite 4, pinned exemption: v1 ``conversationId``
+        alias frames (identity-set=1, threadId None) are neither merge-
+        pruned nor swept in EITHER router mode — lifecycle retention on
+        the shared client, small magnitude, documented exemption. The
+        gate pins the exemption's two safety properties: both modes
+        behave identically (no divergence introduced), and the frames
+        never leak into any receipt (threadId None never matches)."""
+        outcomes = {}
+        for mode in ("legacy", "incremental"):
+            root, fake, diag_path = self._prepare()
+            import asyncio as _asyncio
+
+            async def go(mode=mode, root=root, fake=fake,
+                         diag_path=diag_path):
+                client = CodexAppServerClient(
+                    str(fake), root / "evidence",
+                    env={"FAKE_APPSERVER_MODE": "v1alias",
+                         "FAKE_APPSERVER_DIAG": str(diag_path),
+                         "FAKE_APPSERVER_SECRET": SECRET,
+                         "PATH": os.environ.get("PATH", "")})
+                try:
+                    await client.start()
+                    receipts = []
+                    with mock.patch.dict(os.environ,
+                                         {"CZS_EVENT_ROUTER": mode}):
+                        for index in range(3):
+                            receipts.append(
+                                await CodexAppServerDriver(
+                                    client).run_task(
+                                    SimpleContractAuthority(
+                                        ["cat TASK.md"], ["OUT.md"]),
+                                    root / f"ws{index}", "do the task",
+                                    timeout_s=8.0))
+                    return receipts, list(client.notifications)
+                finally:
+                    await client.close()
+
+            outcomes[mode] = _asyncio.run(go())
+        receipts_by_mode = {m: out[0] for m, out in outcomes.items()}
+        # no divergence: identical receipts (the alias frames are no-ops
+        # for every evidence field)
+        self.assertEqual(
+            [{k: r[k] for k in ("outcome", "final_message",
+                                "command_items", "notification_counts")}
+             for r in receipts_by_mode["legacy"]],
+            [{k: r[k] for k in ("outcome", "final_message",
+                                "command_items", "notification_counts")}
+             for r in receipts_by_mode["incremental"]])
+        # the exemption itself: the alias frames (identity-set=1,
+        # threadId None) are retained for the client's lifetime in BOTH
+        # modes — exactly one per task, never merge-pruned, never swept
+        for mode in ("legacy", "incremental"):
+            alias_frames = [
+                frame for frame in outcomes[mode][1]
+                if isinstance(frame.get("params"), dict)
+                and frame["params"].get("conversationId") == "conv_v1"]
+            self.assertEqual(
+                len(alias_frames), 3,
+                f"{mode}: v1 alias retention changed "
+                f"({len(alias_frames)} != 3) — exemption re-adjudication "
+                f"required, silent change forbidden")
+            # and the alias frames never reached any receipt
+            for receipt in receipts_by_mode[mode]:
+                self.assertNotIn("v1 alias frame",
+                                 json.dumps(receipt))
 
     def test_stranger_frames_do_not_accumulate_across_windows(self):
         """repair2 F2: foreign-thread frames riding placeholder windows

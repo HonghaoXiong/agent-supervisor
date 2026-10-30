@@ -2646,6 +2646,16 @@ def write_delayed_read_fake(root: Path, mode: str) -> Path:
 class Round4CancelMergeTests(unittest.TestCase):
     """Arrived physical orphan frames must survive cancel/exception exits
     exactly once (idempotent per-client cursor; no new waits on those paths).
+
+    Pinned to the explicit CZS_EVENT_ROUTER=legacy rollback (WP-B default
+    flip, 2026-10-30): these tests observe the shared notification STORE
+    (poll for the retained physical frame; the _BarrierRequest stub also
+    injects frames straight into it), which is the legacy retention
+    shape. The fold-once semantics they verify are mode-independent —
+    under the incremental default the same aggregate equality is gated
+    by the P2.2 golden (codex-unattributed / codex-merge-window, both
+    modes compared) and the WP-B codex soak (unattributed aggregate must
+    equal the task count exactly).
     """
 
     def setUp(self):
@@ -2654,6 +2664,15 @@ class Round4CancelMergeTests(unittest.TestCase):
         self.root = Path(self.temp.name).resolve()
         self.evidence = self.root / "evidence"
         self.evidence.mkdir()
+        self._prior_router = os.environ.get("CZS_EVENT_ROUTER")
+        os.environ["CZS_EVENT_ROUTER"] = "legacy"
+        self.addCleanup(self._restore_router_mode)
+
+    def _restore_router_mode(self):
+        if self._prior_router is None:
+            os.environ.pop("CZS_EVENT_ROUTER", None)
+        else:
+            os.environ["CZS_EVENT_ROUTER"] = self._prior_router
 
     def test_cancelled_task_folds_orphan_once_and_close_never_doubles(self):
         script = write_delayed_read_fake(self.root, "single")

@@ -265,11 +265,13 @@ class ResidentZCode:
         authority.provide_scan(await run_boundary_scan(inventory, workspace))
         authority.check_frozen()
         router_sub = None  # P2.2: declared pre-try; the finally releases it
-        # P2.2 routed mode: subscribe BEFORE any session traffic exists so
-        # no frame of this session can slip past the read loop; the floor
-        # is narrowed to the server's eventSeq once session/subscribe
-        # answers. Duck-typed: clients/doubles without the API keep the
-        # exact legacy scan path (router_sub stays None).
+        # P2.2 routed mode (default since 2026-10-30; explicit rollback
+        # CZS_EVENT_ROUTER=legacy): subscribe BEFORE any session traffic
+        # exists so no frame of this session can slip past the read
+        # loop; the floor is narrowed to the server's eventSeq once
+        # session/subscribe answers. Duck-typed: clients/doubles without
+        # the API keep the exact legacy scan path (router_sub stays
+        # None).
         if (event_router_mode() == 'incremental'
                 and hasattr(client, 'subscribe_events')):
             router_sub = client.subscribe_events(resume or '', 0)
