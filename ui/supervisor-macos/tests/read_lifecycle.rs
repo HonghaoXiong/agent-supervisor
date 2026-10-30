@@ -335,7 +335,6 @@ fn version_mismatch_hello_refused_envelope_refused_and_stale() {
 fn disconnect_to_stale_to_bounded_reconnect() {
     // connection 1: handshake, two tasks, then the socket dies;
     // connection 2: handshake again, one task, stays alive
-    // connection 2: handshake again, one task, stays alive
     let path = socket_path("reconnect");
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path).expect("bind");
@@ -411,11 +410,16 @@ fn disconnect_to_stale_to_bounded_reconnect() {
 // P3.3 N2: a server that ACCEPTS and then never answers must fail the
 // connection at the request deadline instead of blocking forever (the
 // RED demo captured pre-fix: connect sat out the server's whole 4 s
-// silence window and only the server's EOF unblocked it). The deadline
-// covers the REQUEST-RESPONSE phase only (hello / snapshot /
-// snapshot-events / subscribe): protocol v1 has NO heartbeat, so a
-// quiet EVENT STREAM after the handshake is legal and carries no
-// deadline (honest boundary — a v2 heartbeat is separate work).
+// silence window and only the server's EOF unblocked it). WP-A item 5
+// upgraded the deadline to a WHOLE-REQUEST wall clock (every read and
+// write syscall carries only the remaining budget, re-armed per
+// buffered fill — a drip-feeding server can no longer reset it), and
+// the WRITE side is symmetrically bounded (polish1 R2; tiny fixed
+// payloads make it practically unreachable). The deadline covers the
+// REQUEST-RESPONSE phase only (hello / snapshot / snapshot-events /
+// subscribe): protocol v1 has NO heartbeat, so a quiet EVENT STREAM
+// after the handshake is legal and carries no deadline (honest
+// boundary — a v2 heartbeat is separate work).
 
 /// Client level: hello silence → bounded TransportError naming the
 /// deadline and the op. The injected 250 ms budget stands in for the
@@ -484,4 +488,46 @@ fn snapshot_silence_deadline_returns_app_to_waiting() {
         .expect("bounded rescan scheduled")
         .saturating_duration_since(Instant::now());
     assert!(wait <= Duration::from_secs(4), "rescan bounded: {wait:?}");
+}
+
+/// WP-A item 5 (polish1 R1): the deadline is a WHOLE-REQUEST wall
+/// clock, not a per-read one. A lying server that DRIPS the answer —
+/// one byte every 60 ms, each delivered well inside any single read
+/// window — reset the per-read timer with every fragment under the
+/// polish1 shape and could stretch one request without bound (the RED
+/// run against the per-read version: connect SUCCEEDED after ~3 s of
+/// dripping despite the 300 ms budget). Under the wall clock the round
+/// fails bounded at the total budget on the client's OWN clock (the
+/// server never EOFs — it parks for 3 s after the last byte).
+#[test]
+fn drip_fed_answer_hits_whole_request_wall_clock() {
+    let path = scripted_server("drip-hello", |stream| {
+        let _ = read_line(stream); // swallow the hello request…
+        let answer = format!("{HELLO}\n");
+        for byte in answer.as_bytes() {
+            let _ = stream.write_all(&[*byte]);
+            let _ = stream.flush();
+            std::thread::sleep(Duration::from_millis(60));
+        }
+        // hold the socket open: no EOF rescue, the client must fail on
+        // its own budget
+        std::thread::sleep(Duration::from_secs(3));
+    });
+    wait_bound(&path, Duration::from_secs(5));
+    let start = Instant::now();
+    let error = UiClient::connect_with_request_deadline(
+        &path,
+        Duration::from_millis(300),
+    )
+    .expect_err(
+        "a drip-fed answer stretching past the whole-request budget \
+         must fail bounded",
+    );
+    assert!(error.0.contains("deadline"), "{}", error.0);
+    assert!(error.0.contains("hello"), "{}", error.0);
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "bounded return, not a block: {:?}",
+        start.elapsed()
+    );
 }

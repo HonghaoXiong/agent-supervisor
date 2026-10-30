@@ -36,18 +36,22 @@
 //! server is therefore ALWAYS observable — a delivered Reset, a
 //! Disconnected channel, or both — never silence.
 //!
-//! Request-phase deadline (polish1, P3.3 N2): every REQUEST-RESPONSE
-//! op (hello / snapshot / snapshot-events / subscribe) waits for its
-//! answer under [`REQUEST_DEADLINE`] — a server is expected to answer
-//! these immediately, so a server that accepts and then stays silent
-//! fails the connection bounded (TransportError → stale → the existing
-//! bounded reconnect), instead of blocking app startup forever.
-//! The EVENT-STREAM read loop deliberately carries NO idle deadline:
-//! protocol v1 has no heartbeat, so a quiet stream after the handshake
-//! is LEGAL and its silence is undetectable at this layer (an honest
-//! boundary — a v2 heartbeat is separate protocol work, not a client
-//! change). `request` therefore clears the socket read timeout again
-//! before the subscribe phase hands the reader to the read loop.
+//! Request-phase deadline (polish1 P3.3 N2; WP-A item 5 = whole-request
+//! wall clock): every REQUEST-RESPONSE op (hello / snapshot /
+//! snapshot-events / subscribe) runs under ONE wall-clock budget of
+//! [`REQUEST_DEADLINE`] — the clock starts when the request begins,
+//! and every socket read AND write syscall carries the REMAINING
+//! budget as its SO_*TIMEO (re-armed per buffered fill, so a
+//! drip-feeding server that always answers within any single syscall
+//! window still cannot stretch one request past the budget). Budget
+//! exhausted = TransportError → stale → the existing bounded
+//! reconnect. The EVENT-STREAM read loop deliberately carries NO idle
+//! deadline: protocol v1 has no heartbeat, so a quiet stream after the
+//! handshake is LEGAL and its silence is undetectable at this layer
+//! (an honest boundary — a v2 heartbeat is separate protocol work, not
+//! a client change). `request` therefore clears the socket read and
+//! write timeouts again before the subscribe phase hands the reader to
+//! the read loop.
 //!
 //! Read-only surface: hello / snapshot / snapshot-events / subscribe.
 //! There is no write-back, control, approval, tool, shell or file op
@@ -59,7 +63,7 @@ use std::sync::mpsc::{
     sync_channel, Receiver, SyncSender, TryRecvError, TrySendError,
 };
 use std::thread;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// One server-sent line, parsed. Subscribe frames carry the raw event
 /// object; responses carry their full JSON body.
@@ -91,15 +95,20 @@ pub const CHANNEL_BOUND: usize = 1024;
 /// discarded up to the newline, then the reader stops with a marker).
 pub const MAX_LINE_BYTES: usize = 256 * 1024;
 
-/// Hard budget for one request-response round (hello / snapshot /
-/// snapshot-events / subscribe). Rationale: a server answers these
-/// IMMEDIATELY — they are table lookups plus a channel registration,
-/// never user work — so anything still unanswered after 10 s is a
-/// silent/lying server, not a slow one. The deadline fails the
-/// connection (TransportError → stale → bounded reconnect); it NEVER
-/// applies to the event-stream read loop (protocol v1 has no
-/// heartbeat — a quiet stream is legal; see the module docs).
-/// Tests inject smaller budgets via
+/// Hard WALL-CLOCK budget for one whole request-response round (hello /
+/// snapshot / snapshot-events / subscribe), covering the write of the
+/// request AND the read of its answer: the clock starts when the
+/// request begins and every syscall gets only the remaining budget
+/// (re-armed per buffered fill — polish1's per-read arming let a
+/// drip-feeding server reset the timer with every partial answer; the
+/// whole-request wall clock closes that, WP-A item 5 / polish1 R1).
+/// Rationale: a server answers these IMMEDIATELY — they are table
+/// lookups plus a channel registration, never user work — so anything
+/// still unanswered after 10 s is a silent/lying server, not a slow
+/// one. The deadline fails the connection (TransportError → stale →
+/// bounded reconnect); it NEVER applies to the event-stream read loop
+/// (protocol v1 has no heartbeat — a quiet stream is legal; see the
+/// module docs). Tests inject smaller budgets via
 /// [`UiClient::connect_with_request_deadline`] instead of sleeping.
 pub const REQUEST_DEADLINE: Duration = Duration::from_secs(10);
 
@@ -215,11 +224,14 @@ impl UiClient {
     /// events / subscribe). Reads EXACTLY one line from the shared
     /// persistent reader, so any coalesced bytes past the newline stay
     /// buffered for the next request or the read loop. Only legal
-    /// before `subscribe_all` claims the reader. The read waits under
-    /// `self.request_deadline` (per-op budget; a silent server fails
-    /// bounded — see the module docs) and the timeout is CLEARED again
-    /// before returning, so the deadline-free event-stream read loop
-    /// never inherits it.
+    /// before `subscribe_all` claims the reader. The WHOLE round trip
+    /// (write + read) runs under one wall-clock budget of
+    /// `self.request_deadline` (WP-A item 5 / polish1 R1+R2): the
+    /// write side and every buffered read fill carry only the
+    /// REMAINING budget as their SO_*TIMEO, and a budget exhausted at
+    /// any point fails bounded as a TransportError. Both timeouts are
+    /// CLEARED again on every path before returning, so the
+    /// deadline-free event-stream read loop never inherits them.
     pub fn request(
         &mut self,
         op: &str,
@@ -233,22 +245,67 @@ impl UiClient {
         let mut line = serde_json::to_string(&params)
             .map_err(|e| TransportError(format!("encode: {e}")))?;
         line.push('\n');
-        self.writer
-            .write_all(line.as_bytes())
-            .map_err(|e| TransportError(format!("write {op}: {e}")))?;
+        // WP-A item 5 (polish1 R1): ONE wall clock for the whole
+        // request — every syscall below gets only what is left of it.
+        let start = Instant::now();
+        let budget = self.request_deadline;
+        let remaining = || {
+            budget.checked_sub(start.elapsed())
+                .filter(|left| !left.is_zero())
+        };
+        let deadline_error = |phase: &str| {
+            TransportError(format!(
+                "{phase} {op}: request deadline exceeded after \
+                 {budget:?} — server accepted but never answered"
+            ))
+        };
+        // WP-A item 5 (polish1 R2): the WRITE side is symmetrically
+        // bounded. Today's request payloads are tiny fixed JSON lines
+        // (they fit any kernel send buffer, so the timeout is
+        // practically unreachable), but a wedged peer must not be able
+        // to park write_all/flush forever either.
+        match remaining() {
+            Some(left) => {
+                self.writer.set_write_timeout(Some(left)).map_err(
+                    |e| TransportError(format!("deadline {op}: {e}")),
+                )?;
+            }
+            None => return Err(deadline_error("write")),
+        }
+        let write = self.writer.write_all(line.as_bytes());
+        let write_timed_out = matches!(
+            write,
+            Err(ref e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock
+                        | std::io::ErrorKind::TimedOut
+                )
+        );
+        // Disarm on EVERY path (success, IO error, deadline) before
+        // mapping: a surviving connection must never leak the send
+        // timeout into a later phase.
+        let _ = self.writer.set_write_timeout(None);
+        if write_timed_out {
+            return Err(deadline_error("write"));
+        }
+        write.map_err(|e| TransportError(format!("write {op}: {e}")))?;
         self.writer
             .flush()
             .map_err(|e| TransportError(format!("flush {op}: {e}")))?;
         let reader = self.reader.as_mut().ok_or_else(|| {
             TransportError("request after subscribe".into())
         })?;
-        // polish1 (P3.3 N2): arm the per-request read budget. WouldBlock
-        // on a blocking socket means the budget expired (SO_RCVTIMEO).
-        reader
-            .get_ref()
-            .set_read_timeout(Some(self.request_deadline))
-            .map_err(|e| TransportError(format!("deadline {op}: {e}")))?;
-        let read = read_line_capped(reader);
+        // polish1 (P3.3 N2): arm the read budget. WouldBlock on a
+        // blocking socket means the budget expired (SO_RCVTIMEO).
+        match remaining() {
+            Some(left) => reader
+                .get_ref()
+                .set_read_timeout(Some(left))
+                .map_err(|e| TransportError(format!("deadline {op}: {e}")))?,
+            None => return Err(deadline_error("read")),
+        }
+        let read = read_line_capped(reader, Some((start, budget)));
         // Disarm on EVERY path (success, IO error, deadline) before
         // mapping: a surviving connection must never leak the timeout
         // into the subscribe read loop — an idle event stream is legal.
@@ -262,11 +319,7 @@ impl UiClient {
                         | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                return Err(TransportError(format!(
-                    "read {op}: request deadline exceeded after {:?} \
-                     — server accepted but never answered",
-                    self.request_deadline
-                )));
+                return Err(deadline_error("read"));
             }
             Err(e) => {
                 return Err(TransportError(format!("read {op}: {e}")))
@@ -337,8 +390,10 @@ pub fn drain_frames(
 /// guaranteed marker. Silence is impossible by construction.
 fn read_loop(mut reader: BufReader<UnixStream>, sender: SyncSender<Frame>) {
     loop {
-        let (payload, overflow, eof) = match read_line_capped(&mut reader)
-        {
+        // deadline-free by contract (protocol v1: a quiet stream is
+        // legal; see the module docs) — budget is None here
+        let (payload, overflow, eof) =
+            match read_line_capped(&mut reader, None) {
             Ok(triple) => triple,
             Err(_) => {
                 deliver_final_marker(&sender);
@@ -412,12 +467,45 @@ fn deliver_final_marker(sender: &SyncSender<Frame>) {
 ///   bounded; the caller treats this as a protocol error);
 /// * `eof` — the stream ended; a non-empty `payload` then is a
 ///   truncated (half) line.
+///
+/// `budget = Some((start, total))` (WP-A item 5 / polish1 R1) makes
+/// every buffered read fill carry only the REMAINING wall clock as its
+/// SO_RCVTIMEO — a server dripping one byte at a time, each within any
+/// single syscall window, still cannot stretch the request past
+/// `total`; exhausting the budget surfaces as a WouldBlock-kind error
+/// the caller maps to the deadline TransportError. The event-stream
+/// read loop passes `None` (deadline-free by contract).
 fn read_line_capped(
     reader: &mut BufReader<UnixStream>,
+    budget: Option<(Instant, Duration)>,
 ) -> std::io::Result<(Vec<u8>, bool, bool)> {
     let mut line: Vec<u8> = Vec::with_capacity(1024);
     let mut overflow = false;
     loop {
+        // re-arm the REMAINING budget before every fill: SO_RCVTIMEO
+        // alone bounds a single syscall, not the whole request
+        if let Some((start, total)) = budget {
+            let remaining = total
+                .checked_sub(start.elapsed())
+                .filter(|left| !left.is_zero());
+            match remaining {
+                Some(left) => reader
+                    .get_ref()
+                    .set_read_timeout(Some(left))
+                    .map_err(|e| {
+                        std::io::Error::new(
+                            std::io::ErrorKind::WouldBlock,
+                            format!("deadline arm: {e}"),
+                        )
+                    })?,
+                None => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "request wall-clock budget exhausted",
+                    ))
+                }
+            }
+        }
         let done = {
             let buf = reader.fill_buf()?;
             if buf.is_empty() {
@@ -535,14 +623,14 @@ mod tests {
     #[test]
     fn read_line_capped_normal_lines() {
         let mut reader = reader_over(b"{\"a\":1}\n{\"a\":2}\n");
-        let (l1, o1, e1) = read_line_capped(&mut reader).unwrap();
+        let (l1, o1, e1) = read_line_capped(&mut reader, None).unwrap();
         assert_eq!(l1, b"{\"a\":1}");
         assert!(!o1);
         assert!(!e1);
-        let (l2, _, e2) = read_line_capped(&mut reader).unwrap();
+        let (l2, _, e2) = read_line_capped(&mut reader, None).unwrap();
         assert_eq!(l2, b"{\"a\":2}");
         assert!(!e2);
-        let (l3, _, e3) = read_line_capped(&mut reader).unwrap();
+        let (l3, _, e3) = read_line_capped(&mut reader, None).unwrap();
         assert!(l3.is_empty());
         assert!(e3); // clean EOF
     }
@@ -552,7 +640,7 @@ mod tests {
         // truncated final line: non-empty payload + eof flag — the
         // caller turns it into an observable marker, never silence
         let mut reader = reader_over(b"{\"type\":\"trun");
-        let (l, o, e) = read_line_capped(&mut reader).unwrap();
+        let (l, o, e) = read_line_capped(&mut reader, None).unwrap();
         assert!(!o);
         assert!(e);
         assert!(!l.is_empty());
@@ -562,15 +650,16 @@ mod tests {
     fn read_line_capped_marks_overflow_and_discards() {
         let mut blob = vec![b'a'; MAX_LINE_BYTES + 4096];
         blob.push(b'\n');
-        blob.extend_from_slice(b"{}\n");
+        blob.extend(b"{}\n");
         let mut reader = reader_over(&blob);
-        let (payload, overflow, eof) = read_line_capped(&mut reader).unwrap();
+        let (payload, overflow, eof) =
+            read_line_capped(&mut reader, None).unwrap();
         assert!(overflow);
         assert!(!eof);
         assert!(payload.len() <= MAX_LINE_BYTES); // memory stayed bounded
         // the newline was consumed exactly: the NEXT line parses fine
         let (payload2, overflow2, eof2) =
-            read_line_capped(&mut reader).unwrap();
+            read_line_capped(&mut reader, None).unwrap();
         assert!(!overflow2);
         assert_eq!(payload2, b"{}");
         assert!(!eof2);
@@ -588,6 +677,8 @@ mod tests {
     /// read timeout is DISARMED after a successful request — the
     /// event-stream read loop must never inherit an idle deadline
     /// (protocol v1 has no heartbeat; a quiet stream is legal).
+    /// WP-A item 5: the WRITE timeout (polish1 R2) is disarmed too —
+    /// neither SO_*TIMEO may leak past the request phase.
     #[test]
     fn request_deadline_armed_then_cleared_for_event_stream() {
         assert_eq!(REQUEST_DEADLINE, Duration::from_secs(10));
@@ -612,7 +703,7 @@ mod tests {
             .request("hello", serde_json::json!({"v": 1}))
             .expect("answered request succeeds well inside the budget");
         assert_eq!(response.get("ok"), Some(&serde_json::Value::Bool(true)));
-        let timeout = client
+        let read_timeout = client
             .reader
             .as_ref()
             .unwrap()
@@ -620,8 +711,18 @@ mod tests {
             .read_timeout()
             .expect("read_timeout query");
         assert!(
-            timeout.is_none(),
-            "timeout CLEARED after the request (event stream stays deadline-free)"
+            read_timeout.is_none(),
+            "read timeout CLEARED after the request (event stream stays \
+             deadline-free)"
+        );
+        let write_timeout = client
+            .writer
+            .write_timeout()
+            .expect("write_timeout query");
+        assert!(
+            write_timeout.is_none(),
+            "write timeout CLEARED after the request (no SO_SNDTIMEO \
+             leak past the request phase)"
         );
         drop(client);
         let _ = _answered.join();

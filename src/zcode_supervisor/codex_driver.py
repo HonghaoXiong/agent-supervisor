@@ -33,6 +33,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from .splitlines_stream import eof_segments, scan_new
 from .worker_health import ExitProjection
 
 SANDBOX_MODE = "read-only"
@@ -227,7 +228,18 @@ def _pump_stdout_streaming(stream, raw_path, accumulator,
     ended mid-codepoint) stops the pump SILENTLY, exactly like the old
     whole-buffer pump — the old run delivered its receipt with the
     undecodable tail dropped and no signal; that acceptance set is
-    preserved here on purpose. The drop is flagged for metrics only."""
+    preserved here on purpose. The drop is flagged for metrics only.
+
+    WP-A item 1 (P2.3 remark 2, declared parity): an ABANDONED pump
+    (stuck at the join window, see run_readonly) that records an error
+    AFTER the run returned never has that error raised — the old
+    whole-buffer pump was a plain daemon thread whose late death was
+    equally invisible to the caller (parity accepted in P2.3 repair2);
+    the late error only lands in the metrics sink's captured
+    ``stdout_pump``/``stderr_pump`` snapshots. The former
+    ``pump_error['closing']`` guards (set by a caller force-close that
+    repair2 N1 removed with ``stream.close``) were dead code and are
+    deleted (WP-A item 1 remark 1)."""
     try:
         with open(raw_path, "w", encoding="utf-8") as raw:
             for line in stream:
@@ -250,13 +262,9 @@ def _pump_stdout_streaming(stream, raw_path, accumulator,
     except OSError as error:
         # repair1 D2/R3: the partial evidence path itself failed
         # (uncreatable/unwritable) — degrade, never crash past the exit
-        if not pump_error.get("closing"):
-            pump_error["degraded"] = pump_error.get("degraded") or str(error)
+        pump_error["degraded"] = pump_error.get("degraded") or str(error)
     except Exception as error:  # noqa: BLE001 — recorded, never silent
-        # F1 unwind: errors seen while the caller force-closes the read
-        # end (stuck-pump recovery) are expected, not task errors
-        if not pump_error.get("closing"):
-            pump_error["error"] = pump_error["error"] or error
+        pump_error["error"] = pump_error["error"] or error
     finally:
         try:
             stream.close()
@@ -268,7 +276,9 @@ def _pump_stderr_streaming(stream, raw_path, pump_error) -> None:
     """P2.3 stderr pump: stream lines into the private partial file —
     the whole stderr NEVER lives in memory (bounded structure = the disk
     file plus the bounded excerpt read at finalize time). Errors are
-    recorded into ``pump_error`` (repair1 F2), never swallowed."""
+    recorded into ``pump_error`` (repair1 F2), never swallowed. The
+    late-error and dead-``closing``-guard notes of the stdout pump
+    (WP-A item 1) apply identically here."""
     try:
         with open(raw_path, "w", encoding="utf-8") as raw:
             for line in stream:
@@ -277,11 +287,9 @@ def _pump_stderr_streaming(stream, raw_path, pump_error) -> None:
     except UnicodeDecodeError:
         pump_error["decode_drop"] = True  # repair2 N3/G2: old parity
     except OSError as error:
-        if not pump_error.get("closing"):
-            pump_error["degraded"] = pump_error.get("degraded") or str(error)
+        pump_error["degraded"] = pump_error.get("degraded") or str(error)
     except Exception as error:  # noqa: BLE001 — recorded, never silent
-        if not pump_error.get("closing"):
-            pump_error["error"] = pump_error["error"] or error
+        pump_error["error"] = pump_error["error"] or error
     finally:
         try:
             stream.close()
@@ -544,6 +552,27 @@ def run_readonly(
     # run past any budget). The daemon pump is simply abandoned, exactly
     # like the old implementation's whole-buffer pump: it can only ever
     # append to the PRIVATE partial, never to finalized evidence.
+    #
+    # WP-A item 1 remark 3 (declared boundary, not "eliminated"): the
+    # snapshot below is a byte-PREFIX of the still-growing private
+    # partial, and the leftover dot-partial may outgrow the finalized
+    # file (an orphan keeps appending after the run returns). P2.3
+    # repair2 measured the tear window as unhittable in practice
+    # (per-line writes + flush; 727k polling rounds and 300 concurrent
+    # snapshots, 0 torn tails). Eliminating the prefix property would
+    # need either an unbounded wait (violates the bounded settle above)
+    # or unlinking the path mid-flight — which re-enters the FIFO-preset
+    # shape below with platform-dependent open() semantics for no
+    # parity anchor; the private dot-name never impersonates evidence.
+    #
+    # WP-A item 1 remark 4 (declared platform semantics): when the
+    # private partial path is a preset FIFO (join-window worst shape),
+    # bounded finalize relies on the platform's FIFO open-pairing
+    # semantics (verified safe on macOS/CPython: copyfile ends with a
+    # 0-byte regular finalized file and the run returns bounded). A
+    # cross-platform hard guarantee would need an S_ISFIFO precheck in
+    # the D2 degrade family — deliberately NOT added here (behavior
+    # change without a parity anchor; registered boundary instead).
     finalize_note = None
     if stdout_pump.is_alive() or stderr_pump.is_alive():
         finalize_note = "pump(s) stuck at join window; snapshot delivered"
@@ -709,6 +738,15 @@ def _index_hints(codex_home: Path, thread_id: str) -> list[Path]:
     # multibyte char is held by the decoder, never replaced) and split
     # each chunk scanning ONLY its new bytes (linear in the new input).
     # Admission is unchanged (the old read_text had none here).
+    #
+    # WP-A item 3: the scanning engine is the SHARED
+    # zcode_supervisor.splitlines_stream implementation (converged with
+    # hub_server's copy; segment order and boundaries are byte-identical).
+    # WP-A item 4: the EOF rule is now EXACTLY str.splitlines — a lone
+    # trailing \r at EOF terminates one (possibly empty) segment; the
+    # repair3 R4/N3 "one lost trailing empty" exemption is closed. The
+    # empty segments are consumer-neutral here (json.loads('') fails,
+    # the entry is skipped).
     try:
         import codecs
         decoder = codecs.getincrementaldecoder("utf-8")(errors="replace")
@@ -720,66 +758,18 @@ def _index_hints(codex_home: Path, thread_id: str) -> list[Path]:
                 if not chunk:
                     break
                 pending += decoder.decode(chunk)
-                segments, rest = _split_index_segments(pending, scanned)
+                segments, rest, scanned = scan_new(pending, scanned)
                 if segments:
                     pending = rest
-                    scanned = 0
                     for line in segments:
                         _absorb_index_line(line, thread_id, hints)
-                else:
-                    # repair3 R3/N6: a DANGLING trailing \r (no segment
-                    # emitted) must stay out of the scanned prefix — it
-                    # may still pair into \r\n or split standalone with
-                    # the next chunk; folding it into scanned made it
-                    # inert and glued records across the chunk boundary.
-                    scanned = (len(rest) - 1) if rest.endswith("\r") \
-                        else len(rest)
-        # EOF: flush the decoder, force the tail out (drop the
-        # sentinel's empty segment)
+        # EOF: flush the decoder, then the exact splitlines tail rule
         pending += decoder.decode(b"", True)
-        segments, _tail = _split_index_segments(pending + "\n", scanned)
-        if segments and segments[-1] == "":
-            segments.pop()
-        for line in segments:
+        for line in eof_segments(pending, scanned):
             _absorb_index_line(line, thread_id, hints)
     except OSError:
         return hints
     return hints
-
-
-_INDEX_LINE_SEPARATORS = frozenset(
-    "\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
-
-
-def _split_index_segments(text, _scanned=0):
-    """str.splitlines-order splitting for the streamed session index —
-    single pass scanning only ``text[_scanned:]`` (repair2 R1 linear);
-    returns complete segments plus a possible \r-pair tail. Callers
-    must keep a dangling trailing \r OUT of the scanned prefix
-    (repair3 R3/N6) or it stops acting as a separator."""
-    segments = []
-    rest = text
-    start = _scanned
-    while True:
-        cut = None
-        for index in range(start, len(rest)):
-            if rest[index] in _INDEX_LINE_SEPARATORS:
-                cut = index
-                break
-        if cut is None:
-            break
-        if rest[cut] == "\r":
-            if cut + 1 == len(rest):
-                break  # may become \r\n with the next chunk
-            if rest[cut + 1] == "\n":
-                segments.append(rest[:cut])
-                rest = rest[cut + 2:]
-                start = 0
-                continue
-        segments.append(rest[:cut])
-        rest = rest[cut + 1:]
-        start = 0
-    return segments, rest
 
 
 def _absorb_index_line(line, thread_id, hints):

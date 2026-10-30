@@ -61,6 +61,7 @@ import re
 import shutil
 import stat
 import sys
+import threading
 import time
 import uuid
 from datetime import datetime, timezone
@@ -72,6 +73,7 @@ from .authority import Authority, inventory
 from .codex_driver import locate_rollout, run_readonly
 from .deadline import CallBudget
 from .session_reader import read_context as read_session_context
+from .splitlines_stream import eof_segments, scan_new as _scan_new
 from . import ui_projection
 from . import worker_health
 
@@ -362,23 +364,46 @@ _READ_EXECUTOR_WORKERS = 2
 _READ_CONCURRENCY = 4
 _read_executor: concurrent.futures.ThreadPoolExecutor | None = None
 _read_semaphore_state: tuple[object, asyncio.Semaphore] | None = None
+# WP-A item 2 (P2.4 N1/N2): creation of BOTH the process-wide executor
+# and the per-loop semaphore state is guarded by one lock. N1: the old
+# check-then-create let two threads racing on the first call build two
+# pools (barrier hammer hit 1/20 double-build; transient execution
+# concurrency could exceed the worker cap). N2: _offload_read used to
+# re-read the global state AFTER deciding, so an interleaved overwrite
+# by another loop could hand it the OTHER loop's semaphore; it now
+# proceeds from its own local tuple.
+_read_executor_lock = threading.Lock()
 
 
 def read_executor_pool() -> concurrent.futures.ThreadPoolExecutor:
-    """The process-wide bounded executor for hub read paths (lazy)."""
+    """The process-wide bounded executor for hub read paths (lazy).
+
+    WP-A item 2 (N1): creation is under ``_read_executor_lock`` —
+    concurrent first uses (multi-threaded, multi-loop embedding shapes)
+    can no longer double-build the pool; every caller of one race
+    window receives the SAME pool object. Shutdown still swaps the
+    global to None under the same lock (rebuild crosses generations
+    safely), and the shutdown join happens outside it.
+    """
     global _read_executor
-    if _read_executor is None:
-        _read_executor = concurrent.futures.ThreadPoolExecutor(
-            max_workers=_READ_EXECUTOR_WORKERS,
-            thread_name_prefix='czs-hub-read')
-    return _read_executor
+    pool = _read_executor
+    if pool is None:
+        with _read_executor_lock:
+            pool = _read_executor
+            if pool is None:
+                pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_READ_EXECUTOR_WORKERS,
+                    thread_name_prefix='czs-hub-read')
+                _read_executor = pool
+    return pool
 
 
 def shutdown_read_executor(wait: bool = True) -> None:
     """Close the bounded read executor (idempotent; for tests/shutdown)."""
     global _read_executor, _read_semaphore_state
-    pool, _read_executor = _read_executor, None
-    _read_semaphore_state = None
+    with _read_executor_lock:
+        pool, _read_executor = _read_executor, None
+        _read_semaphore_state = None
     if pool is not None:
         pool.shutdown(wait=wait)
 
@@ -391,13 +416,24 @@ async def _offload_read(func, *args):
     their first waiting loop; a process-level one breaks any second
     loop lifetime, e.g. repeated asyncio.run in one process).
     Concurrency within one loop stays capped at _READ_CONCURRENCY.
+
+    WP-A item 2 (N2): the per-loop state tuple is captured into a
+    LOCAL variable; an interleaved global overwrite by another loop
+    can no longer make this coroutine acquire the OTHER loop's
+    semaphore (RuntimeError / transient quota miscount). Creation is
+    under ``_read_executor_lock`` (N1), so simultaneous first uses on
+    one loop also share a single semaphore.
     """
     global _read_semaphore_state
     loop = asyncio.get_running_loop()
-    if _read_semaphore_state is None \
-            or _read_semaphore_state[0] is not loop:
-        _read_semaphore_state = (loop, asyncio.Semaphore(_READ_CONCURRENCY))
-    semaphore = _read_semaphore_state[1]
+    state = _read_semaphore_state
+    if state is None or state[0] is not loop:
+        with _read_executor_lock:
+            state = _read_semaphore_state
+            if state is None or state[0] is not loop:
+                state = (loop, asyncio.Semaphore(_READ_CONCURRENCY))
+                _read_semaphore_state = state
+    semaphore = state[1]
     async with semaphore:
         return await loop.run_in_executor(
             read_executor_pool(), func, *args)
@@ -409,60 +445,16 @@ async def _offload_read(func, *args):
 # stream the file in bounded chunks through an incremental decoder and
 # split on the FULL splitlines set, so exotic separators keep the old
 # record boundaries (and malformed classifications).
-_LINE_SEPARATORS = frozenset("\n\r\v\f\x1c\x1d\x1e\x85\u2028\u2029")
-
-
-def _split_segments(text, _scanned=0):
-    """Split ``text[ _scanned: ]`` on the str.splitlines set — single
-    pass, LINEAR in the NEW bytes only (repair2 R1).
-
-    ``_scanned`` is the prefix length already known separator-free
-    (only a trailing lone ``\r`` can pair into ``\r\n`` across a
-    chunk boundary, so at most one character of history matters);
-    callers must keep that dangling trailing ``\r`` OUT of the scanned
-    prefix (see _scan_new) or it stops acting as a separator.
-    Returns ``(segments, tail_wait)``: complete lines plus the
-    remainder that cannot yet be emitted.
-    """
-    segments = []
-    rest = text
-    start = _scanned
-    while True:
-        cut = None
-        for index in range(start, len(rest)):
-            if rest[index] in _LINE_SEPARATORS:
-                cut = index
-                break
-        if cut is None:
-            break
-        if rest[cut] == "\r":
-            if cut + 1 == len(rest):
-                break  # may become \r\n with the next chunk
-            if rest[cut + 1] == "\n":
-                segments.append(rest[:cut])
-                rest = rest[cut + 2:]
-                start = 0
-                continue
-        segments.append(rest[:cut])
-        rest = rest[cut + 1:]
-        start = 0
-    return segments, rest
-
-
-def _scan_new(buffer, scanned):
-    """Split ``buffer`` continuing from ``scanned`` (see
-    _split_segments); returns (segments, rest, new_scanned)."""
-    segments, rest = _split_segments(buffer, scanned)
-    if segments:
-        return segments, rest, 0
-    # repair3 R3/N6: with no segment emitted, a DANGLING trailing \r
-    # (the "may become \r\n" break) must stay OUT of the scanned
-    # prefix — it still acts as a separator (or pairs into \r\n) once
-    # the next chunk arrives. Folding it into the scanned prefix made
-    # it inert and glued records across the chunk boundary.
-    if rest.endswith("\r"):
-        return segments, rest, len(rest) - 1
-    return segments, rest, len(rest)
+#
+# WP-A item 3: the engine CONVERGED into the shared
+# :mod:`zcode_supervisor.splitlines_stream` module (the hub copy and
+# the codex_driver inline copy were byte-equivalent duplicates); the
+# import above binds this module's historical private scan name
+# (``_scan_new``) to the shared implementation, so callers and tests
+# are unchanged. WP-A item 4: the EOF rule is now EXACTLY
+# str.splitlines — a lone trailing \r at EOF terminates one (possibly
+# empty) segment; the repair3 R4/N3 "one lost trailing empty"
+# exemption is closed.
 
 
 def _splitlines_streaming(path, chunk_bytes=256 * 1024):
@@ -499,15 +491,15 @@ def _splitlines_streaming(path, chunk_bytes=256 * 1024):
             if segments:
                 pending = rest
                 yield from segments
-        # EOF: flush the decoder, then emit the remainder (a trailing
-        # separator would leave a final empty segment — drop it; a lone
-        # trailing \r IS a separator for splitlines and was already
-        # flushed by the sentinel split)
+        # EOF (WP-A item 4): flush the decoder, then the EXACT
+        # str.splitlines tail rule — separator-terminated segments
+        # plus the unterminated tail only when non-empty. A dangling
+        # lone trailing \r IS a separator at EOF ('X\r' -> ['X'],
+        # '…\x0b\r' -> ['…', ''], '\r\r\r' -> ['', '', '']); the old
+        # sentinel-"\n" pairing swallowed one trailing empty segment
+        # (the repair3 R4/N3 exemption) and is gone.
         pending += decoder.decode(b"", True)
-        segments, _tail, _ = _scan_new(pending + "\n", scanned)
-        if segments and segments[-1] == "":
-            segments.pop()
-        yield from segments
+        yield from eof_segments(pending, scanned)
     finally:
         try:
             os.close(fd)

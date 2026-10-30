@@ -293,6 +293,124 @@ fn dead_registry_socket_keeps_waiting_then_recovers() {
     assert_eq!(app.reducer.projection.health, Some(Health::Live));
 }
 
+/// P3.3 R3 / WP-A item 6: the PERMISSION-DENIED socket variant — a
+/// registry entry whose socket file sits in a directory the client
+/// cannot search (chmod 000) — rides the same bounded path as the
+/// ENOENT variant above: the raw client fails fast with a connect
+/// TransportError, the app keeps the waiting posture with a bounded
+/// rescan (no panic, no retry storm), and recovery is proven by
+/// re-granting search permission to the SAME listener (bound before
+/// the lockdown): the next round attaches Live.
+///
+/// The environment is SELF-VALIDATED: after chmod 000 the test
+/// verifies the socket is actually unreachable for this process;
+/// if DAC is not enforceable (root, or an odd filesystem), the test
+/// restores permissions and SKIPS with an explicit printed reason
+/// instead of pretending to cover the EACCES path.
+#[test]
+fn eacces_registry_socket_keeps_waiting_then_recovers() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let dir = std::env::temp_dir()
+        .join(format!("oneclick-attach-{}", std::process::id()))
+        .join("eacces-lock");
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let sock = dir.join("eacces.sock");
+    let sock_str = sock.to_str().unwrap().to_string();
+    let _ = std::fs::remove_file(&sock);
+    // the listener binds BEFORE the lockdown; accept() never needs
+    // path permissions again, so re-granting them revives this hub
+    let listener = UnixListener::bind(&sock).expect("bind");
+    std::thread::spawn(move || loop {
+        if let Ok((mut stream, _)) = listener.accept() {
+            std::thread::spawn(move || {
+                handshake(&mut stream);
+                let mut buf = [0u8; 64];
+                let _ = std::io::Read::read(&mut stream, &mut buf);
+            });
+        }
+    });
+
+    // ---- lockdown: the parent directory denies search+read ----
+    std::fs::set_permissions(
+        &dir,
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .expect("chmod 000");
+
+    // self-validation: is DAC actually enforced for THIS process?
+    let denied = std::fs::metadata(&sock).is_err();
+    if !denied {
+        std::fs::set_permissions(
+            &dir,
+            std::fs::Permissions::from_mode(0o755),
+        )
+        .ok();
+        eprintln!(
+            "SKIPPED (eacces_registry_socket…): chmod 000 did not \
+             deny this process (root or non-DAC filesystem) — the \
+             EACCES variant is NOT covered by this run"
+        );
+        return;
+    }
+
+    // ---- raw client: bounded, explicit connect failure ----
+    let start = Instant::now();
+    let error = ipc::UiClient::connect_with_request_deadline(
+        &sock_str,
+        Duration::from_secs(2),
+    )
+    .expect_err("EACCES socket must fail the connect, not block");
+    assert!(
+        error.0.contains("connect"),
+        "error names the connect phase: {}",
+        error.0
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(2),
+        "EACCES fails bounded: {:?}",
+        start.elapsed()
+    );
+
+    // ---- app level: waiting posture + bounded rescan, no panic ----
+    let (_, reader) = sequenced(vec![
+        DiscoveryOutcome::Registry(vec![
+            hub_entry(&sock_str, "/Users/x/eacces", 5.0),
+        ]),
+        DiscoveryOutcome::Registry(vec![
+            hub_entry(&sock_str, "/Users/x/eacces", 5.0),
+        ]),
+    ]);
+    let mut app = SupervisorApp::default();
+    app.discover_fn = Some(reader);
+    app.reconnect_round(Instant::now()); // must RETURN bounded
+    let waiting = app.waiting;
+    let status = app.status_line.clone();
+    let rescan = app.reconnect_at;
+    let health = app.reducer.projection.health;
+
+    // ---- unlock BEFORE asserting, so a panic cannot leak 000 ----
+    std::fs::set_permissions(
+        &dir,
+        std::fs::Permissions::from_mode(0o755),
+    )
+    .expect("chmod 755 restore");
+
+    assert!(waiting, "permission-denied attach keeps waiting");
+    assert!(status.contains("waiting"), "status: {status}");
+    assert_eq!(health, Some(Health::Stale));
+    let wait = rescan
+        .expect("bounded rescan scheduled (no retry storm)")
+        .saturating_duration_since(Instant::now());
+    assert!(wait <= Duration::from_secs(4), "rescan bounded: {wait:?}");
+
+    // ---- recovery: same listener, permissions restored ----
+    app.pump_with_clock(due(&app) + Duration::from_millis(1));
+    assert!(!app.waiting);
+    assert_eq!(app.reducer.projection.health, Some(Health::Live));
+}
+
 #[test]
 fn two_live_hubs_cycle_on_demand() {
     let older = scripted_hub("older");

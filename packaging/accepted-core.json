@@ -35,8 +35,8 @@
   },
   "src/zcode_supervisor/codex_driver.py": {
    "mode": "100644",
-   "blob": "9f58046a740c82a0a0954d3cca18d651ca65e228",
-   "sha256": "7d77b15436f9c32060cbc677d592b8a9c3d1a84b7062d2434333240842decd76"
+   "blob": "098d2641f1bf92cd40ece6013195f2c2eca4a849",
+   "sha256": "c353076e817418dcddebe83dd873e46d67e7551a3e83555648da6d19ecbe454d"
   },
   "src/zcode_supervisor/common.py": {
    "mode": "100644",
@@ -65,8 +65,8 @@
   },
   "src/zcode_supervisor/hub_server.py": {
    "mode": "100644",
-   "blob": "3d0c0e0cfc2780b7d20e58ff51bdfa6d353fdfe3",
-   "sha256": "3d29bebc89e53874d1c7659c1ab54b61879af497767c234f097150b9172c1b53"
+   "blob": "bb820b16346b2219b8c86a2ffed7a58b1ba5743f",
+   "sha256": "871d678bd4d845cc200d0487b3cc80c9298a2efeca9de5c0de62be35c985d14f"
   },
   "src/zcode_supervisor/mcp_readonly.py": {
    "mode": "100644",
@@ -122,8 +122,12 @@
    "mode": "100644",
    "blob": "b7a65baef7137733bccb7fbb980ede32dcc7a4d7",
    "sha256": "0d601d64ee4bee4982ffa49c799c04c66035941320409bef19974375dca1f139"
+  },
+  "src/zcode_supervisor/splitlines_stream.py": {
+   "blob": "b527a90aa38e551c0eb56d93946da4c5e27c75e6",
+   "sha256": "2ba69e64e4f4f0dbf499ef7a39acdefa48627ea62e906440535f455ba90eaa1f"
   }
  },
- "refreshed_at": "2026-10-29",
- "refresh_reason": "UI-events default flip (comment-only change to hub_server.py); independent review controller-reviews/uidefault-on/"
+ "refreshed_at": "2026-10-30",
+ "refresh_reason": "WP-A cleanup round (splitter convergence etc.); review controller-reviews/wp-a/; new module splitlines_stream.py pinned (shipped in plugin lib)"
 }

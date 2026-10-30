@@ -272,23 +272,36 @@ class Repair3DanglingCrBoundaryTests(unittest.TestCase):
                     self.assertEqual(self._hub_segments(data, chunk), want)
                     self.assertEqual(self._hints_segments(data, chunk), want)
 
-    def test_eof_trailing_lone_cr_loses_only_one_tail_empty(self):
-        """Registered exemption R4/N3: a lone trailing \\r at EOF loses
-        exactly ONE trailing empty segment (stream == truth[:-1] with
-        truth[-1] == '') — the consumer layers skip blank lines, so the
-        loss is invisible there. This asserts the exemption shape itself
-        so any widening of the divergence fails here."""
-        data = b"\r\r\r"
-        decoded = data.decode("utf-8", "replace")
-        truth = decoded.splitlines()
-        self.assertEqual(truth, ["", "", ""])
-        for chunk in range(1, len(data) + 2):
-            with self.subTest(chunk=chunk):
-                self.assertTrue(decoded.endswith("\r") and truth[-1] == "")
-                self.assertEqual(self._hub_segments(data, chunk),
-                                 truth[:-1])
-                self.assertEqual(self._hints_segments(data, chunk),
-                                 truth[:-1])
+    def test_eof_trailing_lone_cr_exact_splitlines_parity(self):
+        """WP-A item 4: a lone trailing \\r at EOF now reproduces
+        str.splitlines EXACTLY on both product sides — the P2.4
+        repair3 R4/N3 exemption (one lost trailing empty segment) is
+        CLOSED. Any divergence from the real oracle is a failure."""
+        shapes = (b"\r\r\r",
+                  "\u200b\r\r\r".encode(),
+                  b"\r",
+                  b"X\r",
+                  b"X\r\r",
+                  b"1}\x0b\r",
+                  b"X\n",
+                  b"\n",
+                  b"")
+        for data in shapes:
+            decoded = data.decode("utf-8", "replace")
+            truth = decoded.splitlines()
+            with self.subTest(data=decoded.encode("unicode_escape")):
+                for chunk in range(1, len(data) + 2):
+                    with self.subTest(chunk=chunk):
+                        self.assertEqual(
+                            self._hub_segments(data, chunk), truth)
+                        self.assertEqual(
+                            self._hints_segments(data, chunk), truth)
+        # dispatch-named anchors, pinned to the REAL oracle semantics
+        # ('X\r' -> ['X'] — a single trailing separator does not keep a
+        # trailing empty; '\u200b\r\r\r' -> content + three empties):
+        self.assertEqual(b"X\r".decode("utf-8").splitlines(), ["X"])
+        self.assertEqual("\u200b\r\r\r".splitlines(),
+                     ["\u200b", "", ""])
 
     # ---- dispatch shape 5: real 256KiB boundary, end to end --------
     def test_real_256kib_boundary_end_to_end(self):
@@ -447,6 +460,95 @@ class BoundedReadOffloadTests(unittest.TestCase):
         async def main():
             return await H._offload_read(lambda: 'rebuilt')
         self.assertEqual(asyncio.run(main()), 'rebuilt')
+        H.shutdown_read_executor(wait=True)
+
+    def test_concurrent_first_use_builds_exactly_one_pool(self):
+        """WP-A item 2 (P2.4 N1): N threads hitting the LAZY first use
+        of read_executor_pool() through a barrier must all receive the
+        SAME pool object — the old check-then-create let two threads
+        double-build (controller probe12: 1/20 rounds returned two
+        distinct pools). Hammered across shutdown/rebuild generations
+        (wait=False) so the swap itself races the create path too."""
+        workers = 8
+        rounds = 20
+
+        def grab(index, barrier, pools):
+            barrier.wait(timeout=5)
+            pools[index] = H.read_executor_pool()
+
+        for round_index in range(rounds):
+            H.shutdown_read_executor(wait=True)
+            barrier = threading.Barrier(workers)
+            pools: list = [None] * workers
+            threads = [threading.Thread(target=grab,
+                                        args=(i, barrier, pools))
+                       for i in range(workers)]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=5)
+            self.assertFalse(any(t.is_alive() for t in threads))
+            self.assertEqual(len({id(pool) for pool in pools}), 1,
+                             f"round {round_index}: double-built pool")
+            self.assertIs(pools[0], H._read_executor)
+            # half the rounds rebuild through the racy wait=False path
+            H.shutdown_read_executor(wait=(round_index % 2 == 0))
+        H.shutdown_read_executor(wait=True)
+
+    def test_offload_semaphore_state_is_loop_consistent_under_race(self):
+        """WP-A item 2 (P2.4 N2): with two THREADS each running their
+        own event loop and calling _offload_read concurrently from a
+        standing start, every coroutine must acquire a semaphore used
+        by ITS OWN loop only — the old code re-read the global state
+        after deciding, so an interleaved overwrite by the other loop
+        could hand back the wrong loop's semaphore (asyncio then
+        raises RuntimeError, or transiently miscounts the quota). A
+        tracing Semaphore records the RUNNING loop at every acquire:
+        each semaphore instance must be acquired from exactly ONE
+        loop, and both loops must complete with zero errors."""
+        real_semaphore = asyncio.Semaphore
+        acquired_on: list = []
+
+        class TracingSemaphore(real_semaphore):
+            async def acquire(self):
+                acquired_on.append((id(self),
+                                    id(asyncio.get_running_loop())))
+                return await super().acquire()
+
+        barrier = threading.Barrier(2)
+        errors: list = []
+
+        def runner():
+            async def one():
+                return await H._offload_read(lambda: 'ok')
+
+            async def main():
+                return await asyncio.gather(*(one() for _ in range(4)))
+
+            try:
+                barrier.wait(timeout=5)
+                self.assertEqual(asyncio.run(main()), ['ok'] * 4)
+            except BaseException as error:  # noqa: BLE001 - recorded
+                errors.append(error)
+
+        threads = [threading.Thread(target=runner) for _ in range(2)]
+        with mock.patch.object(asyncio, "Semaphore", TracingSemaphore):
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+        self.assertFalse(errors, f"loop errors: {errors!r}")
+        self.assertFalse(any(t.is_alive() for t in threads))
+        # the N2 invariant: no semaphore instance was ever acquired
+        # from two different loops (cross-loop pickup)
+        per_semaphore: dict = {}
+        for semaphore_id, loop_id in acquired_on:
+            per_semaphore.setdefault(semaphore_id, set()).add(loop_id)
+        for semaphore_id, loop_ids in per_semaphore.items():
+            self.assertEqual(
+                len(loop_ids), 1,
+                f"semaphore {semaphore_id} crossed loops: {loop_ids}")
+        self.assertGreaterEqual(len(per_semaphore), 1)
         H.shutdown_read_executor(wait=True)
 
 
