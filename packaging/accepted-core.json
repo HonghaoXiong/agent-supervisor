@@ -24,12 +24,12 @@
    "sha256": "c9a2c8cc7e4edde362d8863c37b67c908be14dc0dab80cf1faf8c25a7aa26354"
   },
   "src/zcode_supervisor/codex_appserver.py": {
-   "blob": "1d18d710b9173670839585a277a7334e3214f885",
-   "sha256": "88ed85e92e7df618a86e2bdacccbbf5174a0a53c4977c09dd4170e586d3d9d70"
+   "blob": "db99fb6e47628fc556ac424b89e9a52fce3ff0f8",
+   "sha256": "a57f3ef0706a08e75f1c8f110ba60135047873cf6633cd5d9d25abeba7125983"
   },
   "src/zcode_supervisor/codex_driver.py": {
-   "blob": "098d2641f1bf92cd40ece6013195f2c2eca4a849",
-   "sha256": "c353076e817418dcddebe83dd873e46d67e7551a3e83555648da6d19ecbe454d"
+   "blob": "00f4660317c56d8d08601046edd9f1fe7606639c",
+   "sha256": "e04ff623c556195235ce40e13c09fdd41db0356a73f89689810714917f766470"
   },
   "src/zcode_supervisor/common.py": {
    "blob": "457a02627ba5e091531f99353209357b5c60eb06",
@@ -105,5 +105,5 @@
   }
  },
  "refreshed_at": "2026-10-30",
- "refresh_reason": "pin manifest realignment to committed HEAD blobs: the WP-B pin refresh read a stash-contaminated index (stray parallel-session stash pop), leaving bench/protocol/zcode_resident/codex_appserver pins mismatched to the committed content; content itself is dual-review verified, manifest only"
+ "refresh_reason": "WP-C receipt metadata governance (caps + truncation markers); dual review controller-reviews/wp-c/"
 }

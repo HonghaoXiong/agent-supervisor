@@ -94,6 +94,27 @@ if mode == "noisy":
         handle.write(json.dumps({"summary": "ok", "files": ["a"]}))
     sys.exit(0)
 
+if mode == "govflood":
+    # WP-C governance shape: exact counts of distinct synthetic types /
+    # command items / hard errors from the environment, so tests can sit
+    # precisely at / one over / far over each entry cap.
+    events = [{"type": "thread.started", "thread_id": THREAD_ID}]
+    events += [{"type": "synthetic.%04d" % n} for n in range(
+        int(os.environ.get("FAKE_CODEX_GOV_TYPES", "0")))]
+    events += [{"type": "item.completed",
+                "item": {"type": "command_execution",
+                         "command": "gov-cmd-%03d" % n, "exit_code": 0,
+                         "status": "completed"}} for n in range(
+        int(os.environ.get("FAKE_CODEX_GOV_ITEMS", "0")))]
+    events += [{"type": "error", "message": "gov hard error %03d" % n}
+               for n in range(
+        int(os.environ.get("FAKE_CODEX_GOV_ERRORS", "0")))]
+    events.append({"type": "turn.completed"})
+    emit(events)
+    with open(last_message, "w") as handle:
+        handle.write(json.dumps({"summary": "ok", "files": ["a"]}))
+    sys.exit(0)
+
 emit([
     {"type": "thread.started", "thread_id": THREAD_ID},
     {"type": "turn.started", "model": "fake-model-x"},
@@ -211,7 +232,10 @@ class CodexDriverTests(unittest.TestCase):
         self.assertTrue(Path(receipt.last_message_path).is_file())
 
         saved = json.loads((evidence / "receipt.json").read_text())
-        self.assertEqual(saved, dataclasses.asdict(receipt))
+        # WP-C: the file <-> object equivalence holds under the governance
+        # serialization rule (falsy marker fields never persist) — the
+        # driver's own payload builder IS that rule.
+        self.assertEqual(saved, codex_driver._receipt_payload(receipt))
         self.assertTrue((evidence / "output-schema.json").is_file())
 
         diag = json.loads((self.root / "diag-delivered.json").read_text())
@@ -347,8 +371,11 @@ class StreamingEvidenceTests(unittest.TestCase):
             '{"type": "turn.completed"}',
             '{"type": "turn.completed"}',  # no trailing newline variant
         ]
-        counts, thread, model, items, retries, hard = codex_driver \
-            ._parse_events(lines)
+        # WP-C: _parse_events/result now carries the three governance
+        # drop counters after the six pre-governance slots; this
+        # under-cap edge shape must drop NOTHING (all counters zero).
+        counts, thread, model, items, retries, hard, counts_dropped, \
+            command_dropped, hard_dropped = codex_driver._parse_events(lines)
         self.assertEqual(counts, {"thread.started": 1, "<invalid-json>": 1,
                                   "<non-object>": 2, "<no-type>": 1,
                                   "error": 2, "item.completed": 1,
@@ -358,6 +385,8 @@ class StreamingEvidenceTests(unittest.TestCase):
         self.assertEqual(hard, ["real failure"])
         self.assertEqual(items, [{"command": "ls", "exit_code": 0,
                                   "status": "completed"}])
+        self.assertEqual((counts_dropped, command_dropped, hard_dropped),
+                         (0, 0, 0))
         # incremental feed order must not matter for the result
         acc = codex_driver._EventAccumulator()
         for line in reversed(lines):
@@ -870,6 +899,171 @@ class SummarizeRolloutTests(unittest.TestCase):
     def test_unreadable_path_reports_error(self):
         summary = codex_driver.summarize_rollout(self.directory / "missing.jsonl")
         self.assertIn("error", summary)
+
+
+class ReceiptGovernanceTests(unittest.TestCase):
+    """WP-C (PLAN §9.8 contract): receipt metadata entry caps.
+
+    event_counts <= 256 entries, command_items <= 64, hard_errors <= 32;
+    over-cap truncation is keep-first and loss-visible via
+    ``<name>_truncated: true`` / ``<name>_dropped: <int>`` marker keys
+    that appear in the persisted receipt ONLY on truncation (under-cap
+    receipts stay byte-identical to the pre-governance shape)."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.root = Path(temporary.name)
+        self.workspace = self.root / "workspace"
+        self.workspace.mkdir()
+        self.codex = self.root / "fake-codex"
+        self.codex.write_text(FAKE_CODEX_SOURCE)
+        self.codex.chmod(0o755)
+        self.schema = {"type": "object",
+                       "properties": {"summary": {"type": "string"},
+                                      "files": {"type": "array"}},
+                       "required": ["summary", "files"]}
+
+    def _run(self, types_=0, items=0, errors=0):
+        evidence = self.root / (
+            f"evidence-gov-{types_}-{items}-{errors}")
+        receipt = codex_driver.run_readonly(
+            self.codex, self.workspace, "governance task", self.schema,
+            evidence, timeout_s=30.0,
+            env={"FAKE_CODEX_MODE": "govflood",
+                 "FAKE_CODEX_GOV_TYPES": str(types_),
+                 "FAKE_CODEX_GOV_ITEMS": str(items),
+                 "FAKE_CODEX_GOV_ERRORS": str(errors),
+                 "CODEX_HOME": str(self.root / "codex-home")})
+        payload = json.loads((evidence / "receipt.json").read_text())
+        return receipt, payload
+
+    def test_contract_caps_are_pinned(self):
+        self.assertEqual(codex_driver.EVENT_COUNTS_ENTRY_CAP, 256)
+        self.assertEqual(codex_driver.COMMAND_ITEMS_ENTRY_CAP, 64)
+        self.assertEqual(codex_driver.HARD_ERRORS_ENTRY_CAP, 32)
+
+    def test_under_threshold_receipt_keyset_is_pre_governance(self):
+        receipt, payload = self._run(types_=10, items=5, errors=3)
+        self.assertEqual(receipt.outcome, "delivered")
+        self.assertEqual(
+            sorted(payload),
+            ["command_items", "duration_s", "error", "event_counts",
+             "events_path", "exit_code", "hard_errors", "last_message_path",
+             "model_observed", "ok", "outcome", "sandbox",
+             "schema_normalized", "structured", "thread_id",
+             "transport_retries"])
+        self.assertFalse(receipt.event_counts_truncated)
+        self.assertEqual(receipt.event_counts_dropped, 0)
+        self.assertFalse(receipt.command_items_truncated)
+        self.assertEqual(receipt.command_items_dropped, 0)
+        self.assertFalse(receipt.hard_errors_truncated)
+        self.assertEqual(receipt.hard_errors_dropped, 0)
+
+    def test_event_counts_at_limit_keeps_every_entry(self):
+        # 254 synthetic + thread.started + turn.completed == exactly 256
+        receipt, payload = self._run(types_=254)
+        self.assertEqual(len(receipt.event_counts),
+                         codex_driver.EVENT_COUNTS_ENTRY_CAP)
+        self.assertIn("thread.started", receipt.event_counts)
+        self.assertIn("synthetic.0253", receipt.event_counts)
+        self.assertNotIn("event_counts_truncated", payload)
+        self.assertNotIn("event_counts_dropped", payload)
+
+    def test_event_counts_over_by_one_truncates_with_markers(self):
+        # 255 synthetic + 2 infrastructure == 257 distinct -> one over
+        receipt, payload = self._run(types_=255)
+        self.assertEqual(len(receipt.event_counts), 256)
+        self.assertTrue(receipt.event_counts_truncated)
+        self.assertEqual(receipt.event_counts_dropped, 1)
+        self.assertIs(payload["event_counts_truncated"], True)
+        self.assertEqual(payload["event_counts_dropped"], 1)
+        # keep-first: the late turn.completed type is the dropped one
+        self.assertIn("thread.started", receipt.event_counts)
+        self.assertNotIn("turn.completed", receipt.event_counts)
+
+    def test_command_items_at_limit_and_one_over(self):
+        at_limit, payload_at = self._run(items=64)
+        self.assertEqual(len(at_limit.command_items), 64)
+        self.assertFalse(at_limit.command_items_truncated)
+        self.assertEqual(at_limit.command_items_dropped, 0)
+        self.assertNotIn("command_items_truncated", payload_at)
+
+        over, payload_over = self._run(items=65)
+        self.assertEqual(len(over.command_items), 64)
+        self.assertTrue(over.command_items_truncated)
+        self.assertEqual(over.command_items_dropped, 1)
+        self.assertEqual(payload_over["command_items_truncated"], True)
+        self.assertEqual(payload_over["command_items_dropped"], 1)
+        # keep-first: gov-cmd-000..gov-cmd-063 retained in arrival order
+        self.assertEqual(
+            [item["command"] for item in over.command_items],
+            [f"gov-cmd-{n:03d}" for n in range(64)])
+
+    def test_hard_errors_at_limit_and_one_over(self):
+        at_limit, payload_at = self._run(errors=32)
+        self.assertEqual(len(at_limit.hard_errors), 32)
+        self.assertFalse(at_limit.hard_errors_truncated)
+        self.assertEqual(at_limit.hard_errors_dropped, 0)
+        self.assertNotIn("hard_errors_truncated", payload_at)
+
+        over, payload_over = self._run(errors=33)
+        self.assertEqual(len(over.hard_errors), 32)
+        self.assertTrue(over.hard_errors_truncated)
+        self.assertEqual(over.hard_errors_dropped, 1)
+        self.assertEqual(payload_over["hard_errors_truncated"], True)
+        self.assertEqual(payload_over["hard_errors_dropped"], 1)
+        self.assertEqual(over.hard_errors[0], "gov hard error 000")
+        self.assertEqual(over.hard_errors[-1], "gov hard error 031")
+
+    def test_far_over_contract_shape_all_three_fields(self):
+        # the WP-C RED shape: 300 types / 100 items / 40 errors
+        receipt, payload = self._run(types_=300, items=100, errors=40)
+        self.assertEqual(receipt.outcome, "delivered")
+        # event_counts: 304 distinct emitted -> 256 kept; the 186 events
+        # whose type key is past the cap are dropped (45 later synthetic
+        # types + 100 item.completed + 40 error + 1 turn.completed)
+        self.assertEqual(len(receipt.event_counts), 256)
+        self.assertTrue(receipt.event_counts_truncated)
+        self.assertEqual(receipt.event_counts_dropped, 186)
+        # command_items: 100 emitted -> 64 kept, 36 dropped
+        self.assertEqual(len(receipt.command_items), 64)
+        self.assertTrue(receipt.command_items_truncated)
+        self.assertEqual(receipt.command_items_dropped, 36)
+        # hard_errors: 40 emitted -> 32 kept, 8 dropped
+        self.assertEqual(len(receipt.hard_errors), 32)
+        self.assertTrue(receipt.hard_errors_truncated)
+        self.assertEqual(receipt.hard_errors_dropped, 8)
+        # all six markers land in the persisted receipt
+        for key in ("event_counts_truncated", "event_counts_dropped",
+                    "command_items_truncated", "command_items_dropped",
+                    "hard_errors_truncated", "hard_errors_dropped"):
+            self.assertIn(key, payload)
+        self.assertEqual(
+            [item["command"] for item in receipt.command_items][-1],
+            "gov-cmd-063")
+        self.assertEqual(receipt.hard_errors[-1], "gov hard error 031")
+
+    def test_retained_type_counts_stay_exact_under_cap(self):
+        # a retained type's occurrences all count; nothing is dropped
+        source = FAKE_CODEX_SOURCE.replace(
+            'events += [{"type": "synthetic.%04d" % n} for n in range(\n'
+            '        int(os.environ.get("FAKE_CODEX_GOV_TYPES", "0")))]',
+            'events += [{"type": "synthetic.repeated"} for n in range(5)]')
+        self.codex.write_text(source)
+        self.codex.chmod(0o755)
+        receipt, _payload = self._run()
+        self.assertEqual(receipt.event_counts.get("synthetic.repeated"), 5)
+        self.assertFalse(receipt.event_counts_truncated)
+
+    def test_marker_only_for_the_field_that_truncated(self):
+        receipt, payload = self._run(items=65)
+        self.assertTrue(receipt.command_items_truncated)
+        self.assertFalse(receipt.event_counts_truncated)
+        self.assertFalse(receipt.hard_errors_truncated)
+        self.assertIn("command_items_dropped", payload)
+        self.assertNotIn("event_counts_dropped", payload)
+        self.assertNotIn("hard_errors_dropped", payload)
 
 
 if __name__ == "__main__":  # pragma: no cover

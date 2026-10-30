@@ -15,6 +15,7 @@ import unittest
 from unittest import mock
 from pathlib import Path
 
+from zcode_supervisor import codex_driver
 from zcode_supervisor.codex_appserver import (
     ApprovalBridge,
     AppServerError,
@@ -74,6 +75,22 @@ def ask(rid, method, params):
 
 
 def run_turn():
+    if MODE == "govitems":
+        # WP-C governance shape: 100 commandExecution items (over the 64
+        # command_items receipt cap) + one agentMessage so the receipt's
+        # final_message still resolves.
+        for n in range(100):
+            note("item/completed",
+                 {"threadId": THREAD, "turnId": TURN,
+                  "item": {"type": "commandExecution",
+                           "command": "gov-cmd-%03d" % n, "exitCode": 0,
+                           "status": "completed"}})
+        note("item/completed",
+             {"threadId": THREAD, "turnId": TURN,
+              "item": {"type": "agentMessage", "text": "gov done"}})
+        note("turn/completed", {"threadId": THREAD,
+                                "turn": {"id": TURN, "status": "completed"}})
+        return
     if MODE in ("mergewindow", "orderinv"):
         # WP-B N2 / N-1 shapes: the task's own wire NEVER carries a turn
         # id (neither the response nor the completed frame), so the only
@@ -655,6 +672,9 @@ class FakeAppServerTests(unittest.TestCase):
         self.assertEqual(receipt["command_items"],
                          [{"command": "cat TASK.md", "exit_code": 0,
                            "status": "completed"}])
+        # WP-C: an under-cap task carries NO governance marker keys
+        self.assertNotIn("command_items_truncated", receipt)
+        self.assertNotIn("command_items_dropped", receipt)
         self.assertEqual(receipt["final_message"], "done summary")
         self.assertEqual(receipt["notification_counts"].get("item/completed"), 2)
         self.assertEqual(receipt["notification_counts"].get("turn/completed"), 1)
@@ -676,6 +696,28 @@ class FakeAppServerTests(unittest.TestCase):
         frames_text = (root / "evidence" / "appserver-frames.jsonl").read_text()
         self.assertNotIn(SECRET, frames_text)
         self.assertNotIn(SECRET, receipt_file.read_text())
+
+    def test_command_items_receipt_cap_is_loss_visible(self):
+        # WP-C governance: 100 commandExecution items -> keep-first cap
+        # at codex_driver.COMMAND_ITEMS_ENTRY_CAP with explicit markers;
+        # the raw frames log keeps every item (loss visible in evidence).
+        receipt, root, _diag = self._drive("govitems")
+        cap = codex_driver.COMMAND_ITEMS_ENTRY_CAP
+        self.assertEqual(receipt["outcome"], "delivered")
+        self.assertEqual(len(receipt["command_items"]), cap)
+        self.assertEqual(
+            [item["command"] for item in receipt["command_items"]],
+            [f"gov-cmd-{n:03d}" for n in range(cap)])
+        self.assertIs(receipt["command_items_truncated"], True)
+        self.assertEqual(receipt["command_items_dropped"], 100 - cap)
+        self.assertEqual(receipt["final_message"], "gov done")
+        # every dropped item is still in the on-disk raw frame log
+        frames_text = (root / "evidence" / "appserver-frames.jsonl").read_text()
+        self.assertIn("gov-cmd-099", frames_text)
+        persisted = json.loads(
+            (root / "evidence" / "appserver-receipt.json").read_text())
+        self.assertIs(persisted["command_items_truncated"], True)
+        self.assertEqual(persisted["command_items_dropped"], 100 - cap)
 
     def test_turn_failed_outcome(self):
         receipt, _root, diag = self._drive("failed")

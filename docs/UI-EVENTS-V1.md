@@ -164,9 +164,23 @@ outcome, delivery_ok, duration_ms, error, data
   的 accepted 事件。
 - `notification_counts`（app-server receipt）只统计 thread/conversation 精确命中
   本 task 的帧；他 task 的帧留给其自身 receipt；无身份帧进
-  `notification_unattributed`（独立桶，绝不猜给“唯一 active task”）。顺序与交错
+  `notification_unattributed`（独立桶，绝不猜给”唯一 active task”）。顺序与交错
   线程零串线；`attribute_notification` 的固定原因码：
   `identity_missing`/`identity_unknown`/`identity_ambiguous`。
+- **WP-C receipt 元数据治理（PLAN §9.8 另立合同，默认开启、无环境开关，回滚=
+  代码 revert）**：cold `codex exec` receipt 的 `event_counts`/`command_items`/
+  `hard_errors` 与 app-server receipt 的 `command_items` 各有**条目上限**——
+  256 / 64 / 32 / 64（常量 `codex_driver.EVENT_COUNTS_ENTRY_CAP` /
+  `COMMAND_ITEMS_ENTRY_CAP` / `HARD_ERRORS_ENTRY_CAP`，app-server 复用
+  command 上限；依据 P3.2 soak 实测分布 ≈4 条 event_counts/任务 × 安全余量）。
+  超阈=**保序截断（keep-first）+ 显式溢出标记**：被截断 receipt 同字段旁出现
+  `”<name>_truncated”: true` 与 `”<name>_dropped”: <int>`（未计入的源事件数；
+  列表 1 丢弃条=1 事件；`event_counts` 为类型键不再保留的出现次数——精确的
+  丢弃键数需无界 distinct 集合，与上限自相矛盾）；不静默、不报错、每条目消息
+  仍按原 300 字符上限截断。未超阈 receipt 与治理前逐字节一致（标记键只在截断
+  时出现）；上限在累加期生效（accumulator/收集扫描中即有界），原始证据
+  （codex-events.jsonl / appserver-frames.jsonl / thread read）永远全量落盘，
+  截断仅作用于 receipt 摘要字段。
 - `process.exited` 只能来自 P0.3 `ExitProjection` 的真实 awaited wait 记录
   （每 `{process_scope, generation}` 恰一次）；EOF、task 完成、returncode 赋值、
   重复 close 均不发射。

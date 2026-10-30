@@ -30,7 +30,9 @@ import signal
 import time
 from pathlib import Path
 
-from . import __version__, ui_projection
+from . import __version__, codex_driver, ui_projection
+
+# WP-C: codex_driver supplies the shared receipt metadata entry caps
 from .authority import worker_response
 from .deadline import (
     BudgetExhausted,
@@ -1641,8 +1643,13 @@ class CodexAppServerDriver:
                 # evidence, never a crash of the read loop or of a sibling.
                 receipt['handler_errors'] = handler_errors
                 receipt.setdefault('error', '; '.join(handler_errors)[:300])
-            receipt['command_items'], agent_texts, receipt['token_usage'] = \
-                self._collect(receipt['thread_id'])
+            receipt['command_items'], agent_texts, receipt['token_usage'], \
+                command_items_dropped = self._collect(receipt['thread_id'])
+            # WP-C governance: loss-visible markers ONLY when the cap bit —
+            # under-threshold receipts keep their exact pre-governance keys
+            if command_items_dropped:
+                receipt['command_items_truncated'] = True
+                receipt['command_items_dropped'] = command_items_dropped
             receipt['final_message'] = agent_texts[-1] if agent_texts else None
             receipt['approvals'] = bridge.decisions
             # P0.1: the closing evidence RPC is a normal-completion segment —
@@ -1711,8 +1718,16 @@ class CodexAppServerDriver:
             merge()
 
     def _collect(self, thread_id):
-        """command items, agent message texts, latest token usage from notifications."""
+        """command items, agent message texts, latest token usage from notifications.
+
+        WP-C governance: ``command_items`` is capped at
+        ``codex_driver.COMMAND_ITEMS_ENTRY_CAP`` entries (keep-first,
+        arrival order); the scan itself still walks every frame so
+        agent_texts/token_usage stay exact, and the caller stamps the
+        receipt with ``command_items_truncated`` / ``command_items_dropped``
+        when anything was dropped (markers only on truncation)."""
         command_items, agent_texts, token_usage = [], [], None
+        command_items_dropped = 0
         for frame in self.client.notifications:
             method, params = frame.get('method'), frame.get('params')
             if not isinstance(params, dict) or params.get('threadId') != thread_id:
@@ -1722,15 +1737,18 @@ class CodexAppServerDriver:
                 if not isinstance(item, dict):
                     continue
                 if item.get('type') == 'commandExecution':
-                    command_items.append({
-                        'command': item.get('command'),
-                        'exit_code': item.get('exitCode', item.get('exit_code')),
-                        'status': item.get('status')})
+                    if len(command_items) < codex_driver.COMMAND_ITEMS_ENTRY_CAP:
+                        command_items.append({
+                            'command': item.get('command'),
+                            'exit_code': item.get('exitCode', item.get('exit_code')),
+                            'status': item.get('status')})
+                    else:
+                        command_items_dropped += 1
                 elif item.get('type') == 'agentMessage' and isinstance(item.get('text'), str):
                     agent_texts.append(item['text'])
             elif method == 'thread/tokenUsage/updated':
                 token_usage = params.get('tokenUsage')
-        return command_items, agent_texts, token_usage
+        return command_items, agent_texts, token_usage, command_items_dropped
 
     async def _dump_thread_read(self, thread_id, path, timeout=30):
         """One thread/read (v2/ThreadReadParams.json: {threadId, includeTurns}) as evidence."""

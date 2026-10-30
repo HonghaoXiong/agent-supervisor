@@ -13,6 +13,14 @@ Single-shot task dispatch through the official non-interactive entry point
   ``-o <file>`` and validated against the caller-supplied schema's
   ``required`` keys.
 
+WP-C receipt metadata governance (PLAN §9.8 contract): the receipt's
+``event_counts`` / ``command_items`` / ``hard_errors`` are capped at
+``EVENT_COUNTS_ENTRY_CAP`` / ``COMMAND_ITEMS_ENTRY_CAP`` /
+``HARD_ERRORS_ENTRY_CAP`` entries (256 / 64 / 32); over-cap truncation is
+keep-first and loss-visible via ``<name>_truncated`` / ``<name>_dropped``
+marker keys that appear in the persisted receipt ONLY on truncation, so
+under-threshold receipts stay byte-identical to the pre-governance shape.
+
 Public surface: :class:`CodexExecError`, :class:`CodexRunReceipt`,
 :func:`build_argv`, :func:`normalize_strict_schema`, :func:`run_readonly`,
 :func:`locate_rollout`, :func:`summarize_rollout`.
@@ -58,6 +66,29 @@ _TERMINATE_GRACE_S = 5.0
 _COMBINATOR_KEYS = ("anyOf", "oneOf", "allOf")
 _DEFINITION_KEYS = ("$defs", "definitions")
 
+# WP-C receipt metadata governance (the PLAN §9.8 "separate contract"):
+# per-field ENTRY caps on the output-driven receipt metadata that P2.3's
+# raw-buffer bounding deliberately did NOT cover. Over-cap fields are
+# truncated keep-first (arrival order) and the loss is made explicit —
+# the receipt gains ``<name>_truncated: true`` plus
+# ``<name>_dropped: <int>`` (source events not retained: for the lists one
+# dropped entry == one dropped event; for ``event_counts`` the count of
+# occurrences whose type key is no longer retained — an exact dropped-KEY
+# count would need an unbounded distinct-type set, defeating the cap).
+# Caps sized from the P3.2 soak distribution (92 tasks / 370 total
+# event_counts entries ≈ 4 entries per task; command_items ≈ 1/task;
+# hard_errors ≈ 0-3/task) with a wide safety margin; no env switch —
+# rollback is a code revert. Under-threshold receipts are byte-identical
+# to the pre-governance shape (markers appear ONLY on truncation).
+EVENT_COUNTS_ENTRY_CAP = 256
+COMMAND_ITEMS_ENTRY_CAP = 64
+HARD_ERRORS_ENTRY_CAP = 32
+_RECEIPT_MARKER_KEYS = (
+    "event_counts_truncated", "event_counts_dropped",
+    "command_items_truncated", "command_items_dropped",
+    "hard_errors_truncated", "hard_errors_dropped",
+)
+
 
 class CodexExecError(Exception):
     """Driver misuse (bad arguments); never raised for a codex run outcome."""
@@ -83,6 +114,15 @@ class CodexRunReceipt:
     transport_retries: int = 0  # "Reconnecting..." events: transport layer, not failures
     hard_errors: list = dataclasses.field(default_factory=list)  # other error-event messages
     schema_normalized: bool = False  # strict normalization changed the schema
+    # WP-C governance markers: present in the persisted receipt ONLY when
+    # the same-named field was truncated (falsy markers are stripped at
+    # write time, so under-threshold receipts stay byte-identical).
+    event_counts_truncated: bool = False
+    event_counts_dropped: int = 0
+    command_items_truncated: bool = False
+    command_items_dropped: int = 0
+    hard_errors_truncated: bool = False
+    hard_errors_dropped: int = 0
 
 
 def normalize_strict_schema(schema: dict) -> dict:
@@ -368,7 +408,13 @@ class _EventAccumulator:
     pump flushes it. Identical whitelist semantics to the former
     whole-list parse: unknown types are counted, never fatal;
     ``Reconnecting`` errors are transport retries; every other error
-    contributes a truncated message to ``hard_errors``."""
+    contributes a truncated message to ``hard_errors``.
+
+    WP-C governance: the three output-driven metadata structures are
+    capped DURING accumulation (never only at receipt time — a hostile
+    stream cannot grow the accumulator past the caps). Over-cap entries
+    are dropped keep-first; the ``*_dropped`` counters make the loss
+    visible (source events not retained, see the module constants)."""
 
     def __init__(self):
         self.counts: Counter = Counter()
@@ -378,25 +424,42 @@ class _EventAccumulator:
         self.command_items: list = []
         self.transport_retries = 0
         self.hard_errors: list = []
+        self.event_counts_dropped = 0
+        self.command_items_dropped = 0
+        self.hard_errors_dropped = 0
+
+    def _count_type(self, key: str) -> None:
+        """Count one event under the ``event_counts`` entry cap.
+
+        A retained key (or a new key while the cap has room) counts
+        normally; an event whose type key is past the cap is NOT silently
+        counted — it bumps ``event_counts_dropped`` so the receipt can
+        flag the truncation."""
+        if key in self.counts or len(self.counts) < EVENT_COUNTS_ENTRY_CAP:
+            self.counts[key] += 1
+        else:
+            self.event_counts_dropped += 1
 
     def feed(self, raw) -> None:
         try:
             event = json.loads(raw)
         except (json.JSONDecodeError, TypeError):
-            self.counts["<invalid-json>"] += 1
+            self._count_type("<invalid-json>")
             return
         if not isinstance(event, dict):
-            self.counts["<non-object>"] += 1
+            self._count_type("<non-object>")
             return
         etype = event.get("type")
-        self.counts[str(etype) if etype is not None else "<no-type>"] += 1
+        self._count_type(str(etype) if etype is not None else "<no-type>")
         if etype == "error":
             message = event.get("message")
             text = message if isinstance(message, str) else "<error without message>"
             if text.startswith("Reconnecting"):
                 self.transport_retries += 1
-            else:
+            elif len(self.hard_errors) < HARD_ERRORS_ENTRY_CAP:
                 self.hard_errors.append(text[:_HARD_ERROR_LIMIT])
+            else:
+                self.hard_errors_dropped += 1
         candidate = event.get("thread_id")
         if self.thread_id_any is None and isinstance(candidate, str) and candidate:
             self.thread_id_any = candidate
@@ -413,23 +476,48 @@ class _EventAccumulator:
             and isinstance(item, dict)
             and item.get("type") == "command_execution"
         ):
-            self.command_items.append({
-                key: item[key]
-                for key in ("command", "exit_code", "status") if key in item
-            })
+            if len(self.command_items) < COMMAND_ITEMS_ENTRY_CAP:
+                self.command_items.append({
+                    key: item[key]
+                    for key in ("command", "exit_code", "status") if key in item
+                })
+            else:
+                self.command_items_dropped += 1
 
-    def result(self) -> tuple[dict, str | None, str | None, list, int, list]:
+    def result(self) -> tuple[dict, str | None, str | None, list, int, list,
+                             int, int, int]:
         return (dict(self.counts), self.thread_id or self.thread_id_any,
                 self.model_observed, self.command_items,
-                self.transport_retries, self.hard_errors)
+                self.transport_retries, self.hard_errors,
+                self.event_counts_dropped, self.command_items_dropped,
+                self.hard_errors_dropped)
 
 
-def _parse_events(lines) -> tuple[dict, str | None, str | None, list, int, list]:
-    """Whitelist-parse JSONL events (whole-list compat wrapper)."""
+def _parse_events(lines) -> tuple[dict, str | None, str | None, list, int, list,
+                                  int, int, int]:
+    """Whitelist-parse JSONL events (whole-list compat wrapper).
+
+    WP-C: the result carries the three governance drop counters after
+    the six pre-governance slots."""
     accumulator = _EventAccumulator()
     for raw in lines:
         accumulator.feed(raw)
     return accumulator.result()
+
+
+def _receipt_payload(receipt: CodexRunReceipt) -> dict:
+    """WP-C: ``asdict`` with falsy governance markers stripped.
+
+    This IS the persisted-receipt serialization rule: the
+    ``<name>_truncated`` / ``<name>_dropped`` pair appears beside a
+    field ONLY when that field was actually truncated, so an
+    under-threshold receipt stays byte-identical to the pre-governance
+    shape."""
+    payload = dataclasses.asdict(receipt)
+    for marker_key in _RECEIPT_MARKER_KEYS:
+        if not payload.get(marker_key):
+            del payload[marker_key]
+    return payload
 
 
 def _stderr_excerpt(stderr_lines: list) -> str:
@@ -598,7 +686,8 @@ def run_readonly(
     duration = time.monotonic() - started
     exit_code = process.returncode
 
-    event_counts, thread_id, model_observed, command_items, transport_retries, hard_errors = \
+    event_counts, thread_id, model_observed, command_items, transport_retries, \
+        hard_errors, counts_dropped, command_dropped, hard_dropped = \
         accumulator.result()
 
     raw_stderr_size = (raw_stderr_path.stat().st_size
@@ -639,6 +728,12 @@ def run_readonly(
         transport_retries=transport_retries,
         hard_errors=hard_errors,
         schema_normalized=schema_normalized,
+        event_counts_truncated=counts_dropped > 0,
+        event_counts_dropped=counts_dropped,
+        command_items_truncated=command_dropped > 0,
+        command_items_dropped=command_dropped,
+        hard_errors_truncated=hard_dropped > 0,
+        hard_errors_dropped=hard_dropped,
     )
     if raw_stderr_path.exists():
         # no excerpt was taken (delivered / timeout paths): the private
@@ -661,6 +756,24 @@ def run_readonly(
         # repair1 F3: the sink is caller-injected — a raising sink must
         # never take the receipt down (same isolation as the exit sink).
         with contextlib.suppress(Exception):
+            receipt_meta = {
+                "event_counts": event_counts,
+                "command_items": command_items,
+                "hard_errors": hard_errors,
+                "transport_retries": transport_retries,
+            }
+            # WP-C: truncation markers ride along ONLY when a field was
+            # actually truncated, so the common (under-cap) metrics shape
+            # is unchanged.
+            if counts_dropped:
+                receipt_meta["event_counts_truncated"] = True
+                receipt_meta["event_counts_dropped"] = counts_dropped
+            if command_dropped:
+                receipt_meta["command_items_truncated"] = True
+                receipt_meta["command_items_dropped"] = command_dropped
+            if hard_dropped:
+                receipt_meta["hard_errors_truncated"] = True
+                receipt_meta["hard_errors_dropped"] = hard_dropped
             metrics_sink.update({
                 "first_partial_s": (round(first_partial["at_s"], 3)
                                     if first_partial["at_s"] is not None
@@ -668,20 +781,18 @@ def run_readonly(
                 "raw_stdout_bytes": (events_file.stat().st_size
                                      if events_file.exists() else 0),
                 "raw_stderr_bytes": raw_stderr_size,
-                "receipt_meta": {
-                    "event_counts": event_counts,
-                    "command_items": command_items,
-                    "hard_errors": hard_errors,
-                    "transport_retries": transport_retries,
-                },
+                "receipt_meta": receipt_meta,
                 # repair2 N4/G3: degraded/settle/decode observations are
                 # CONSUMED here (receipt schema stays untouched)
                 "finalize_note": finalize_note,
                 "stdout_pump": dict(stdout_pump_error),
                 "stderr_pump": dict(stderr_pump_error),
             })
+    # WP-C: persisted receipt — falsy governance markers are STRIPPED, so
+    # an under-threshold receipt is byte-identical to the pre-governance
+    # shape (the marker pair appears beside a field only on truncation).
     (evidence_dir / RECEIPT_FILENAME).write_text(
-        json.dumps(dataclasses.asdict(receipt), indent=2, sort_keys=True) + "\n",
+        json.dumps(_receipt_payload(receipt), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
     return receipt
