@@ -122,11 +122,42 @@ impl Reducer {
         for record in states {
             let task_id = record.get("task_id").and_then(|v| v.as_str());
             let Some(task_id) = task_id else { continue };
-            let status = record
+            let raw_status = record
                 .get("status")
                 .and_then(|v| v.as_str())
-                .unwrap_or("running")
-                .to_string();
+                .unwrap_or("running");
+            // ui-polish1 + repair1 (R1): the server's reduce_stream
+            // (ui_journal.py) words an accepted-only stream `running`
+            // with session_id / turn_id / outcome all null — that SHAPE
+            // alone is NOT sufficient. The journal's global FIFO
+            // retention (§6.3) can evict a stream's accepted/bound/
+            // turn.started prefix BEFORE the cut; `new_cut` silently
+            // rebases above the loss (no reset_required — §6.2's
+            // completeness covers only the cut's promised range), and
+            // the folded suffix of a GENUINELY RUNNING task carries the
+            // exact same shape. The discriminator is
+            // `accepted_event_id`: a true accepted-only stream folds
+            // its `task.accepted` event into a non-null value; an
+            // eviction-rebased record never saw the event (null). The
+            // display word `accepted` derives ONLY when the shape AND
+            // the discriminator agree; ambiguous records fall back to
+            // the server word (`running`) — never a wrong `accepted`.
+            let has_accepted_event_id = record
+                .get("accepted_event_id")
+                .and_then(|v| v.as_str())
+                .is_some();
+            let status = if accepted_only_state_page(
+                raw_status,
+                str_field(record, "session_id").is_none()
+                    && str_field(record, "turn_id").is_none()
+                    && str_field(record, "outcome").is_none(),
+                has_accepted_event_id,
+            ) {
+                "accepted"
+            } else {
+                raw_status
+            }
+            .to_string();
             let entry = self
                 .projection
                 .tasks
@@ -238,7 +269,10 @@ impl Reducer {
                         }
                     });
                 if entry.status.is_empty() {
-                    entry.status = "running".into();
+                    // ui-polish1: accepted is a first-class display
+                    // state (UI-EVENTS-V1 §5.2); the word stays until
+                    // the first session/turn activity promotes it
+                    entry.status = "accepted".into();
                 }
                 entry.worker = str_field(event, "worker");
                 entry.mode = str_field(event, "mode");
@@ -272,6 +306,14 @@ impl Reducer {
                         if let Some(status) = str_field(event, "status") {
                             entry.turn_status = Some(status);
                         }
+                    }
+                    // ui-polish1: session/turn activity is the first
+                    // lifecycle fact past acceptance — `accepted`
+                    // promotes to `running` here (never rolls a
+                    // terminal back: those were handled above and this
+                    // arm only narrows the accepted word).
+                    if entry.status == "accepted" {
+                        entry.status = "running".into();
                     }
                 }
             }
@@ -370,6 +412,25 @@ fn str_field(record: &Value, key: &str) -> Option<String> {
         .get(key)
         .and_then(|v| v.as_str())
         .map(|s| s.to_string())
+}
+
+/// A state-page record is "accepted-only" when the server word is
+/// `running`, no session/turn/outcome fact exists, AND the record
+/// actually folded its `task.accepted` event (`accepted_event_id`
+/// non-null). The last clause is the R1 discriminator: without it, a
+/// stream whose accepted/bound/turn.started prefix was evicted by the
+/// global FIFO retention (§6.3) before the cut — silently rebased by
+/// `new_cut`, no `reset_required` — folds its retained suffix into the
+/// same shape while the task is GENUINELY RUNNING. Ambiguous records
+/// must fall back to the server word, never derive `accepted`. Pure
+/// function so the mapping is unit-testable headless (ui-polish1,
+/// repair1 R1).
+fn accepted_only_state_page(
+    raw_status: &str,
+    no_activity_facts: bool,
+    has_accepted_event_id: bool,
+) -> bool {
+    raw_status == "running" && no_activity_facts && has_accepted_event_id
 }
 
 #[cfg(test)]
@@ -540,7 +601,10 @@ mod tests {
             "v": 1, "event_id": "a/3/done", "stream_id": "a", "seq": 3,
             "kind": "task.completed", "task_id": "a", "status": "completed",
         }));
-        assert_eq!(reducer.projection.tasks["a"].status, "running");
+        // ui-polish1: the bare accepted event leaves the task in its
+        // OWN display state — `accepted`, NOT `running` (the old
+        // assertion pinned the collapsed mapping the live session saw)
+        assert_eq!(reducer.projection.tasks["a"].status, "accepted");
         assert_eq!(reducer.projection.gaps.len(), 1);
         // events PAST the gap still flow normally
         reducer.apply_event(&json!({
@@ -560,5 +624,90 @@ mod tests {
         }
         assert_eq!(reducer.projection.gaps.len(), MAX_GAP_MARKERS);
         assert_eq!(reducer.projection.dropped_gap_markers, 5);
+    }
+
+    // -- ui-polish1: `accepted` is a first-class display state -------------
+    //
+    // UI-EVENTS-V1 §5.2 lists `task.accepted` as its own lifecycle kind
+    // and §5.4 orders it BEFORE any session/turn activity. The reducer
+    // therefore keeps an accepted-only task in its own state word until
+    // the first activity fact arrives; it never collapses it to
+    // `running` (the live-session defect: accepted rows displayed
+    // "running").
+
+    #[test]
+    fn accepted_is_distinct_display_state() {
+        let mut reducer = Reducer::new();
+        reducer.apply_event(&event("a", 1, "task.accepted"));
+        assert_eq!(
+            reducer.projection.tasks["a"].status,
+            "accepted",
+            "bare task.accepted must display as its own state, not running"
+        );
+        // task.completed still wins (later authoritative fact)
+        reducer.apply_event(&json!({
+            "v": 1, "event_id": "a/2/done", "stream_id": "a", "seq": 2,
+            "kind": "task.completed", "task_id": "a", "status": "completed",
+        }));
+        assert_eq!(reducer.projection.tasks["a"].status, "completed");
+    }
+
+    #[test]
+    fn accepted_promotes_to_running_on_first_activity() {
+        for kind in ["session.bound", "turn.started"] {
+            let mut reducer = Reducer::new();
+            reducer.apply_event(&event("a", 1, "task.accepted"));
+            reducer.apply_event(&event("a", 2, kind));
+            assert_eq!(
+                reducer.projection.tasks["a"].status,
+                "running",
+                "{kind} is the first activity fact — accepted promotes"
+            );
+        }
+        // without activity the word stays
+        let mut reducer = Reducer::new();
+        reducer.apply_event(&event("b", 1, "task.accepted"));
+        assert_eq!(reducer.projection.tasks["b"].status, "accepted");
+    }
+
+    #[test]
+    fn state_page_accepted_only_shape_maps_to_accepted() {
+        // The server's reduce_stream (ui_journal.py) words an accepted-only
+        // stream `running` with session_id/turn_id/outcome all null AND
+        // `accepted_event_id` set (it folded the task.accepted event) —
+        // only THEN does the UI derive the display word `accepted`
+        // (repair1 R1: the shape alone is ambiguous under §6.3 retention
+        // eviction, see the fixture-driven regression in
+        // tests/eviction_rebased_state.rs).
+        let mut reducer = Reducer::new();
+        reducer.apply_state_pages(&[json!({
+            "task_id": "echo", "worker": "codex", "status": "running",
+            "session_id": null, "turn_id": null, "outcome": null,
+            "accepted_event_id": "h/1/echo/1", "last_seq": 1,
+        })]);
+        assert_eq!(reducer.projection.tasks["echo"].status, "accepted");
+        // eviction-rebased / pre-discriminator records (accepted_event_id
+        // absent or null) keep the server word: a genuinely running task
+        // must never display `accepted` (R1)
+        reducer.apply_state_pages(&[json!({
+            "task_id": "hotel", "worker": "codex", "status": "running",
+            "session_id": null, "turn_id": null, "outcome": null,
+            "accepted_event_id": null, "last_seq": 5,
+        })]);
+        assert_eq!(reducer.projection.tasks["hotel"].status, "running");
+        // a session-bearing record is genuinely running
+        reducer.apply_state_pages(&[json!({
+            "task_id": "bravo", "worker": "codex", "status": "running",
+            "session_id": "s1", "turn_id": "t1",
+            "accepted_event_id": "h/1/bravo/1", "last_seq": 3,
+        })]);
+        assert_eq!(reducer.projection.tasks["bravo"].status, "running");
+        // a LATER state page with activity promotes an accepted task
+        reducer.apply_state_pages(&[json!({
+            "task_id": "echo", "worker": "codex", "status": "running",
+            "session_id": "s2", "turn_id": "t2",
+            "accepted_event_id": "h/1/echo/1", "last_seq": 4,
+        })]);
+        assert_eq!(reducer.projection.tasks["echo"].status, "running");
     }
 }

@@ -1,0 +1,63 @@
+{
+ "_provenance": "Generated 2026-10-30 by controller-reviews R1 repair via the REAL retention-eviction path: zcode_supervisor.ui_journal.UiJournal(max_events=64) -> ingest -> global FIFO eviction -> new_cut -> snapshot -> reduce_stream state records (the exact op ui_server.py snapshot serves). task-evict-running is GENUINELY RUNNING (turn-1 open, tool.scheduled firing) but its accepted/bound/turn.started prefix was evicted BEFORE the cut, so its record carries the accepted-only SHAPE with accepted_event_id=null. task-accepted-only is a true accepted-only stream and carries accepted_event_id != null. R1 fix contract: the accepted display word derives ONLY when accepted_event_id is present.",
+ "records": [
+  {
+   "accepted_event_id": "h/1/task-accepted-only/1",
+   "delivery_ok": null,
+   "last_seq": 1,
+   "mode": "app-server",
+   "outcome": null,
+   "session_id": null,
+   "status": "running",
+   "task_id": "task-accepted-only",
+   "turn_id": null,
+   "turn_status": null,
+   "worker": "codex"
+  },
+  {
+   "accepted_event_id": "h/1/task-completed/1",
+   "delivery_ok": true,
+   "last_seq": 5,
+   "mode": "app-server",
+   "outcome": "ok",
+   "session_id": "sess-C",
+   "status": "completed",
+   "task_id": "task-completed",
+   "turn_id": "turn-C",
+   "turn_status": "completed",
+   "worker": "codex"
+  },
+  {
+   "accepted_event_id": null,
+   "delivery_ok": null,
+   "last_seq": 5,
+   "mode": "app-server",
+   "outcome": null,
+   "session_id": null,
+   "status": "running",
+   "task_id": "task-evict-running",
+   "turn_id": null,
+   "turn_status": null,
+   "worker": "codex"
+  },
+  {
+   "accepted_event_id": null,
+   "delivery_ok": null,
+   "last_seq": 56,
+   "mode": "app-server",
+   "outcome": null,
+   "session_id": null,
+   "status": "running",
+   "task_id": "task-filler",
+   "turn_id": null,
+   "turn_status": null,
+   "worker": "codex"
+  }
+ ],
+ "retention_floors": {
+  "task-accepted-only": 1,
+  "task-completed": 1,
+  "task-evict-running": 4,
+  "task-filler": 1
+ }
+}

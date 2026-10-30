@@ -425,6 +425,50 @@ pub fn monotonic_ns() -> u128 {
     origin.elapsed().as_nanos()
 }
 
+// -- ui-polish1 draw helpers (single source for tiers and hues) ---------
+
+/// Blend the theme text color toward the panel background by a
+/// [`view::TEXT_TIER_*`] factor — one definition of the three-level
+/// gray ladder (item 8), theme-safe in light AND dark mode.
+pub(crate) fn text_color(ui: &egui::Ui, tier: f32) -> egui::Color32 {
+    let fg = ui.visuals().text_color();
+    let bg = ui.visuals().panel_fill;
+    let c = view::tier_color(
+        (fg.r(), fg.g(), fg.b()),
+        (bg.r(), bg.g(), bg.b()),
+        tier,
+    );
+    egui::Color32::from_rgb(c.0, c.1, c.2)
+}
+
+/// ONE place mapping semantic [`view::ColorRole`]s to concrete colors
+/// (item 1). Mid-tone hues chosen to read on both the light and dark
+/// themes the app follows; `Neutral` deliberately has no hue of its
+/// own — it renders as the status text tier.
+pub(crate) fn role_color(ui: &egui::Ui, role: view::ColorRole) -> egui::Color32 {
+    match role {
+        view::ColorRole::Green => egui::Color32::from_rgb(21, 132, 67),
+        view::ColorRole::Amber => egui::Color32::from_rgb(176, 108, 9),
+        view::ColorRole::Red => egui::Color32::from_rgb(196, 48, 48),
+        view::ColorRole::Neutral => {
+            text_color(ui, view::TEXT_TIER_STATUS)
+        }
+    }
+}
+
+/// A `key: value` line of the detail block — key in the status tier,
+/// value in the body tier (item 8).
+fn detail_line(ui: &mut egui::Ui, key: &str, value: &str) {
+    ui.horizontal(|ui| {
+        ui.label(egui::RichText::new(format!("{key}:")).color(
+            text_color(ui, view::TEXT_TIER_STATUS),
+        ));
+        ui.label(egui::RichText::new(value).color(
+            text_color(ui, view::TEXT_TIER_BODY),
+        ));
+    });
+}
+
 impl eframe::App for SupervisorApp {
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.pump_with_clock(Instant::now());
@@ -442,10 +486,31 @@ impl eframe::App for SupervisorApp {
         // the renderer/compositor present probe does not exist yet, so
         // end-to-end latency remains "unavailable" (§5.3.5).
         self.ui_drawn_ns = Some(monotonic_ns());
+        self.draw(ui);
+        // Present probe LAST: the paint callback is registered as the
+        // final shape of the top layer, so it executes inside this
+        // frame's render pass after every other draw command was
+        // recorded (see probe.rs for the honesty boundary: this is a
+        // pre-submit/pre-present mark, not `frame_submitted`).
+        self.probe.paint_probe(ui.ctx(), ui.max_rect());
+    }
+}
 
+impl SupervisorApp {
+    /// The frame's whole drawing, extracted from [`eframe::App::ui`]
+    /// (ui-polish1) so the headless shape audit
+    /// (`tests/render_shape_audit.rs`) can drive the EXACT production
+    /// draw pass through `egui::Context::run_ui` with no window.
+    pub fn draw(&mut self, ui: &mut egui::Ui) {
+        // -- top status bar (title tier; item 8) ------------------------
         egui::Panel::top("status").show(ui, |ui| {
             ui.horizontal(|ui| {
-                ui.label(&self.status_line);
+                let title_tier = text_color(ui, view::TEXT_TIER_TITLE);
+                let status_tier = text_color(ui, view::TEXT_TIER_STATUS);
+                ui.label(
+                    egui::RichText::new(&self.status_line)
+                        .color(title_tier),
+                );
                 // one-click multi-hub: the badge is the SINGLE source
                 // of `hub: <name>` (polish1 — the status line no
                 // longer embeds a second copy). Single instance: plain
@@ -455,9 +520,12 @@ impl eframe::App for SupervisorApp {
                 if let Some(badge) =
                     view::hub_badge_text(self.hub_label.as_deref())
                 {
+                    let badge_text =
+                        egui::RichText::new(badge.clone())
+                            .color(status_tier);
                     if self.hub_candidates.len() > 1 {
                         if ui
-                            .selectable_label(false, badge.clone())
+                            .selectable_label(false, badge_text)
                             .on_hover_text(
                                 "click to switch to the next hub",
                             )
@@ -466,26 +534,79 @@ impl eframe::App for SupervisorApp {
                             self.cycle_hub();
                         }
                     } else {
-                        ui.label(badge);
+                        ui.label(badge_text);
                     }
                 }
                 let banners = view::banners(&self.reducer.projection);
                 if banners.stale {
-                    ui.colored_label(egui::Color32::RED, "stale/reconnecting");
+                    ui.colored_label(
+                        role_color(ui, view::ColorRole::Red),
+                        "stale/reconnecting",
+                    );
                 } else if banners.live {
-                    ui.colored_label(egui::Color32::GREEN, "live");
+                    ui.colored_label(
+                        role_color(ui, view::ColorRole::Green),
+                        "live",
+                    );
                 }
-                ui.label(format!("gaps: {}", banners.gap_count));
-                ui.label(
-                    format!("unattributed: {}", banners.unattributed_count),
-                );
+                ui.label(egui::RichText::new(format!(
+                    "gaps: {}",
+                    banners.gap_count
+                ))
+                .color(status_tier));
+                ui.label(egui::RichText::new(format!(
+                    "unattributed: {}",
+                    banners.unattributed_count
+                ))
+                .color(status_tier));
             });
         });
+        // -- bottom footer summary (item 5: no large dead space below
+        //    the list — the counts always mirror the FILTERED set) ----
+        egui::Panel::bottom("summary").show(ui, |ui| {
+            let counts =
+                view::footer_of(&self.reducer.projection, &self.filter);
+            ui.label(egui::RichText::new(view::footer_text(&counts)).color(
+                text_color(ui, view::TEXT_TIER_STATUS),
+            ));
+        });
         egui::CentralPanel::default().show(ui, |ui| {
+            // -- filter row (items 2 + 9: hint text + visible focus) --
             ui.horizontal(|ui| {
-                ui.label("filter:");
-                ui.text_edit_singleline(&mut self.filter.query);
+                ui.label(egui::RichText::new("filter:").color(
+                    text_color(ui, view::TEXT_TIER_STATUS),
+                ));
+                let edit = ui.add(
+                    egui::TextEdit::singleline(&mut self.filter.query)
+                        .hint_text(view::FILTER_HINT)
+                        .desired_width(f32::INFINITY),
+                );
+                // Focus ring painted AFTER the widget so nothing can
+                // cover it: 2px theme-selection stroke when focused,
+                // the theme's ordinary 1px border otherwise. The caret
+                // itself is stock egui behavior; this ring is the
+                // always-visible focus affordance the live session
+                // found missing.
+                let visuals = ui.style().visuals.clone();
+                let stroke = if edit.has_focus() {
+                    egui::Stroke::new(
+                        2.0,
+                        visuals.selection.stroke.color,
+                    )
+                } else {
+                    egui::Stroke::new(
+                        1.0,
+                        visuals.widgets.noninteractive.bg_stroke.color,
+                    )
+                };
+                ui.painter().rect_stroke(
+                    edit.rect,
+                    4,
+                    stroke,
+                    egui::StrokeKind::Inside,
+                );
             });
+            ui.add_space(view::SECTION_SPACING);
             let total =
                 view::filtered_count(&self.reducer.projection, &self.filter);
             let max_offset = total.saturating_sub(VISIBLE_ROWS);
@@ -506,58 +627,91 @@ impl eframe::App for SupervisorApp {
                     if ui.button("down").clicked() {
                         self.offset = (self.offset + 1).min(max_offset);
                     }
-                    ui.label(format!(
+                    ui.label(egui::RichText::new(format!(
                         "rows {}-{} of {}",
                         self.offset + 1,
                         (self.offset + rows.len()).min(total),
                         total
-                    ));
+                    ))
+                    .color(text_color(ui, view::TEXT_TIER_STATUS)));
                 });
             }
-            ui.separator();
+            // -- task rows (items 1 + 3) ---------------------------------
             for row in &rows {
-                let selected =
-                    self.selected.as_deref() == Some(row.task_id.as_str());
-                if ui
-                    .selectable_label(
-                        selected,
-                        format!(
-                            "{}  [{}]  {}",
-                            row.task_id,
-                            row.worker,
-                            if row.running { "running" } else { &row.status }
-                        ),
-                    )
-                    .clicked()
-                {
+                let is_selected = self
+                    .selected
+                    .as_deref()
+                    == Some(row.task_id.as_str());
+                // status dot + verbatim word, hue from the shared
+                // table; the word stays beside the dot so color is
+                // never the sole carrier
+                let status_color = role_color(
+                    ui,
+                    view::status_kind(&row.status).color_role(),
+                );
+                let atoms = (
+                    egui::RichText::new(format!(
+                        "{}  [{}]  ",
+                        row.task_id, row.worker
+                    ))
+                    .color(text_color(ui, view::TEXT_TIER_BODY)),
+                    egui::RichText::new(format!("● {}", row.status))
+                        .color(status_color),
+                );
+                let mut button = egui::Button::selectable(is_selected, atoms);
+                if !is_selected {
+                    // item 3: an unselected row paints NO frame in any
+                    // interaction state — the residual gray bands were
+                    // the stock button frame's hover/active styles. The
+                    // selection band stays the ONLY row band.
+                    button = button
+                        .fill(egui::Color32::TRANSPARENT)
+                        .stroke(egui::Stroke::NONE);
+                }
+                let response = ui.add(button);
+                // one visual state per row, selected first; a genuine
+                // hover renders cursor-only (no paint), so a stale
+                // hover position can never leave a band behind
+                let _visual =
+                    view::row_visual_state(is_selected, response.hovered());
+                if response.clicked() {
                     self.selected = Some(row.task_id.clone());
                 }
             }
-            ui.separator();
+            ui.add_space(view::SECTION_SPACING);
+            // -- selected-task details -----------------------------------
             if let Some(sel) = &self.selected {
                 if let Some(task) = self.reducer.projection.tasks.get(sel) {
                     let d = view::details_of(task);
-                    ui.label(format!("task: {}", d.task_id));
-                    ui.label(format!("worker: {}", d.worker));
-                    ui.label(format!("mode: {}", d.mode));
-                    ui.label(format!("status: {}", d.status));
+                    detail_line(ui, "task", &d.task_id);
+                    detail_line(ui, "worker", &d.worker);
+                    detail_line(ui, "mode", &d.mode);
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("status:").color(
+                            text_color(ui, view::TEXT_TIER_STATUS),
+                        ));
+                        ui.label(egui::RichText::new(&d.status).color(
+                            role_color(
+                                ui,
+                                view::status_kind(&d.status).color_role(),
+                            ),
+                        ));
+                    });
                     if !d.outcome.is_empty() {
-                        ui.label(format!("outcome: {}", d.outcome));
+                        detail_line(ui, "outcome", &d.outcome);
                     }
                     if !d.delivery_ok.is_empty() {
-                        ui.label(format!("delivery_ok: {}", d.delivery_ok));
+                        detail_line(ui, "delivery_ok", &d.delivery_ok);
                     }
                     if !d.session_id.is_empty() {
-                        ui.label(format!("session: {}", d.session_id));
+                        detail_line(ui, "session", &d.session_id);
                     }
                     if !d.turn_id.is_empty() {
-                        ui.label(format!(
-                            "turn {} ({})",
-                            d.turn_id, d.turn_status
-                        ));
+                        detail_line(ui, "turn", &d.turn_id);
                     }
                 }
             }
+            ui.add_space(view::SECTION_SPACING);
             // bounded gap display: a few markers + honest summary line
             for gap in self
                 .reducer
@@ -567,7 +721,7 @@ impl eframe::App for SupervisorApp {
                 .take(VISIBLE_GAP_MARKERS)
             {
                 ui.colored_label(
-                    egui::Color32::YELLOW,
+                    role_color(ui, view::ColorRole::Amber),
                     view::gap_label(gap),
                 );
             }
@@ -579,15 +733,12 @@ impl eframe::App for SupervisorApp {
                 .saturating_sub(VISIBLE_GAP_MARKERS)
                 + self.reducer.projection.dropped_gap_markers;
             if extra_gaps > 0 {
-                ui.label(format!("… +{extra_gaps} more gap markers"));
+                ui.label(egui::RichText::new(format!(
+                    "… +{extra_gaps} more gap markers"
+                ))
+                .color(text_color(ui, view::TEXT_TIER_STATUS)));
             }
         });
-        // Present probe LAST: the paint callback is registered as the
-        // final shape of the top layer, so it executes inside this
-        // frame's render pass after every other draw command was
-        // recorded (see probe.rs for the honesty boundary: this is a
-        // pre-submit/pre-present mark, not `frame_submitted`).
-        self.probe.paint_probe(ui.ctx(), ui.max_rect());
     }
 }
 

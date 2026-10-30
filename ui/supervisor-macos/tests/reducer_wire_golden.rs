@@ -91,9 +91,24 @@ fn golden_live_stream_discovers_then_reset_discards() {
         }
     }
     assert!(reducer.knows_task("task-discovered"));
+    // ui-polish1: the golden's own wire data pins the accepted display
+    // word — after ONLY `task.accepted` (the first live frame) the
+    // task's state is its own `accepted`, and the fixture's later
+    // `turn.started` promotes it to `running`. The old assertion only
+    // saw the collapsed final word and masked the distinction.
+    {
+        let mut fresh = Reducer::new();
+        fresh.apply_event(&flow[0]["event"]); // task.accepted, seq 1
+        assert_eq!(
+            fresh.projection.tasks["task-discovered"].status,
+            "accepted",
+            "wire: bare task.accepted must display as accepted"
+        );
+    }
     assert_eq!(
         reducer.projection.tasks["task-discovered"].status,
-        "running"
+        "running",
+        "wire: turn.started (seq 2) promoted accepted → running"
     );
     // phase 2 — the oversize-loss reset_required: the projection is
     // DISCARDED (PLAN §4.5.9) and the loss is honestly stale
