@@ -70,7 +70,7 @@ class DistributionTests(unittest.TestCase):
         script = relocated / 'plugins/zcode-supervisor/scripts/czs.py'
         result = subprocess.run([sys.executable, '-I', '-B', str(script), '--version'],
                                 cwd='/', capture_output=True, text=True, check=True)
-        self.assertEqual(result.stdout.strip(), '0.1.0')
+        self.assertEqual(result.stdout.strip(), '0.2.0')
 
     def test_checksum_tamper_and_unexpected_private_file_are_rejected(self):
         modified = self.copy_release('modified')
@@ -204,7 +204,7 @@ class DistributionTests(unittest.TestCase):
         actual = self.installer.environment_report(self.release, '/missing-codex', '/missing-node', '/missing-cli')
         self.assertEqual(actual, expected)
         self.assertEqual(actual['plugin_version'], self.version)
-        self.assertEqual(actual['core_version'], '0.1.0')
+        self.assertEqual(actual['core_version'], '0.2.0')
         self.assertEqual(actual['model_requests'], 0)
 
 

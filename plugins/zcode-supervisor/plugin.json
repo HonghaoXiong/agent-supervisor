@@ -1,20 +1,24 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "zcode-supervisor",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Delegate bounded development tasks from Codex to a local ZCode installation and review retained execution evidence.",
-  "author": {"name": "HonghaoXiong"},
+  "author": {
+    "name": "HonghaoXiong"
+  },
   "license": "Apache-2.0",
   "extensions": {
     "com.openai": {
       "requires_local_executor": true,
       "interface": {
         "displayName": "ZCode Supervisor",
-        "shortDescription": "让 Codex 委派 ZCode 并核对交付证据",
+        "shortDescription": "\u8ba9 Codex \u59d4\u6d3e ZCode \u5e76\u6838\u5bf9\u4ea4\u4ed8\u8bc1\u636e",
         "longDescription": "Local macOS delegation through the reviewed ZCode app-server bridge. Includes the supervisor runtime and a discoverable workflow skill. Requires Python 3.11+, Node.js and a separately installed, signed-in, supported ZCode build.",
         "developerName": "HonghaoXiong",
         "category": "Developer tools",
-        "defaultPrompt": ["使用 ZCode Supervisor 检查本机环境，然后把这个有明确范围的开发任务委派给 ZCode。"]
+        "defaultPrompt": [
+          "\u4f7f\u7528 ZCode Supervisor \u68c0\u67e5\u672c\u673a\u73af\u5883\uff0c\u7136\u540e\u628a\u8fd9\u4e2a\u6709\u660e\u786e\u8303\u56f4\u7684\u5f00\u53d1\u4efb\u52a1\u59d4\u6d3e\u7ed9 ZCode\u3002"
+        ]
       }
     }
   }

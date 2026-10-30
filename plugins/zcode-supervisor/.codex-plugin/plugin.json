@@ -1,17 +1,21 @@
 {
   "name": "zcode-supervisor",
-  "version": "0.1.4",
+  "version": "0.2.0",
   "description": "Delegate bounded tasks from Codex to local ZCode and independently review execution evidence.",
-  "author": {"name": "HonghaoXiong"},
+  "author": {
+    "name": "HonghaoXiong"
+  },
   "license": "Apache-2.0",
   "skills": "./skills/",
   "requires_local_executor": true,
   "interface": {
     "displayName": "ZCode Supervisor",
-    "shortDescription": "让 Codex 委派 ZCode 并核对交付证据",
+    "shortDescription": "\u8ba9 Codex \u59d4\u6d3e ZCode \u5e76\u6838\u5bf9\u4ea4\u4ed8\u8bc1\u636e",
     "longDescription": "Bundled supervisor and workflow skill for local ZCode delegation. Python 3.11+, Node.js and a signed-in, fingerprint-reviewed ZCode installation are required.",
     "developerName": "HonghaoXiong",
     "category": "Developer tools",
-    "defaultPrompt": ["使用 ZCode Supervisor 检查环境并委派这个开发任务。"]
+    "defaultPrompt": [
+      "\u4f7f\u7528 ZCode Supervisor \u68c0\u67e5\u73af\u5883\u5e76\u59d4\u6d3e\u8fd9\u4e2a\u5f00\u53d1\u4efb\u52a1\u3002"
+    ]
   }
 }

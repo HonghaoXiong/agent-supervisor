@@ -4,8 +4,8 @@
  "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
  "files": {
   "src/zcode_supervisor/__init__.py": {
-   "blob": "2967bca4c15ec14f1527b466667d7403ca8d026c",
-   "sha256": "e410a040c0527a55488847402bedf19863aff0ded234905a80cd1c7065c143ba"
+   "blob": "9a8f4cabe3d83ce4ac3dc43ea1ffb709079d9eeb",
+   "sha256": "391d0d31df3a211df81a38bd57a7a6a0680aa550187e707624f9204c66f5ba5f"
   },
   "src/zcode_supervisor/__main__.py": {
    "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -105,5 +105,5 @@
   }
  },
  "refreshed_at": "2026-10-30",
- "refresh_reason": "WP-C receipt metadata governance (caps + truncation markers); dual review controller-reviews/wp-c/"
+ "refresh_reason": "v0.2.0 release: version bump across plugin manifests, python package, UI app"
 }

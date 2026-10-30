@@ -16,7 +16,7 @@ Python 包名为 `codex-zcode-supervisor`（仓库名 agent-supervisor），命�
 
 ## 安装与首次使用
 
-多台 Mac 使用 Codex 插件时，优先使用已构建的 `zcode-supervisor-macos-0.1.4.zip`：
+多台 Mac 使用 Codex 插件时，优先使用已构建的 `zcode-supervisor-macos-0.2.0.zip`：
 解压后运行 `Install.command`，重启 Codex 并开新聊天，对它说“使用 ZCode Supervisor 检查环境并委派任务”。
 `Check.command` 生成无模型环境诊断；`Validate.command` 验证本机技能发现并生成可回传报告。
 插件内含已审核心与自动发现技能，无需克隆本仓或单独 pip 安装。
