@@ -4,8 +4,8 @@
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "89717a953bdda10c924019a2f602cc28f466f8f6",
-      "sha256": "0c5ee01acc339ab6f7833927e7e6dc1ed400ff2c23c29aeb92e8f27afaad46bb"
+      "blob": "878f7a0f469f8f7ac300a0580177a2fc30ec99d9",
+      "sha256": "fcdef0df9d54c2616eb98cb280d027f8fe5b46f24111b8231fad55bb8c9eb73d"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -20,8 +20,8 @@
       "sha256": "5ed161b2583797c00405a4615bbb67be6a85a7943df546f3f3f890047c983a21"
     },
     "src/zcode_supervisor/cli.py": {
-      "blob": "d47a803e6f1457f80146c63fe68b0a50454d3b10",
-      "sha256": "89a700e9a4dd18bd919d75a5c476f12a09ad10ce045a98a361c5a0dbe2655c64"
+      "blob": "2353612d9e877eab2d3fdb865963086c316db5b2",
+      "sha256": "83359b56a88d584c865acb2170480966d737943ab86dcb6730d3d388487c7b1c"
     },
     "src/zcode_supervisor/codex_appserver.py": {
       "blob": "db99fb6e47628fc556ac424b89e9a52fce3ff0f8",
@@ -64,8 +64,8 @@
       "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
     },
     "src/zcode_supervisor/hub_server.py": {
-      "blob": "e09ddd03699410244fbaf051af3b81594cfdf4be",
-      "sha256": "28d2f605c8fae9190e01d54b8fea108b12b099dd92215a1f836af84c9f95bfdb"
+      "blob": "d45cbe831b178c0c56937413d520de85fb422637",
+      "sha256": "9c7d3cfa72eef00e4f8898f456702ed70675c644e186e667b28a77d914bd660b"
     },
     "src/zcode_supervisor/mcp_readonly.py": {
       "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
@@ -145,5 +145,5 @@
     }
   },
   "refreshed_at": "2026-11-03",
-  "refresh_reason": "v0.2.1 final: code-review fixes (dsh process-group kill + stream settlement before publishing, locked inventory attribution, ledger token whitelist, monitor/bounded-reader hardening); 1156 offline tests green"
+  "refresh_reason": "v0.2.2 release: skills visibility closure (dsh roots, dedupe, frontmatter descriptions, mtime cache), czs skills CLI, hub task_status, delegate worker_skills receipts, resident guidance"
 }
