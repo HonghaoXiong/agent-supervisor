@@ -43,6 +43,20 @@ CACHE_LAYOUT = 3
 # carried from the single-pin releases, NOT a claim that every pinned CLI is
 # 0.16.9 — fingerprints remain the authority.
 REVIEWED_BUNDLES = {
+    "9afd565a104d660259e6bdeeaa5cb8abc74a908559e21aa3c5f6a06f2a9da6c6": {
+        "patched_sha256": "90795d1864cb2430e5357bc091f967a6554c76b7933e4157317c150852729e47",
+        "upstream_commit": None,
+        "reviewed": "2026-10-31",
+        "provenance": (
+            "Desktop 3.17.1 / build 3.17.1.9553, CLI 0.17.1; source revision unknown. "
+            "Exact allowlist conversion and build permission ordering statically reviewed. "
+            "Accepted after 465 related offline tests, fixed GLM-5.3 live Write/Bash "
+            "allow, registered resume/Edit, Write/Edit/Bash denial, bounded turn timeout "
+            "with actual child exit, and source/cache tamper rejection. Evidence: "
+            "out/zcode-compatibility-20261031 in the UW2 workspace."
+        ),
+        "cli_version": "0.17.1",
+    },
     "b816e38656e70fb585fe2ab1ea010da89cda928dac1ccb5d83255fd18796da6e": {
         "patched_sha256": "31ef7f33f40591303047db5135845bd39b47399372110483fe6cf6c2df4328d2",
         "upstream_commit": "aac4755666d09fdcd70272fcf063c077a639015f",
