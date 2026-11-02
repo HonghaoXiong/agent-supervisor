@@ -1,109 +1,149 @@
 {
- "schema_version": 1,
- "acceptance": "2026-10-26b acceptance: tri-agent hub P0-P3 (MCP control plane, codex exec + concurrent app-server drivers with approval bridge, resident zcode multi-session driver, contract modes with write-path rules, tri-probe/health fail-closed routing, permission bypass probes, bench); 594 tests pass on Python 3.11 and 3.13 (hub extra mcp>=2.3,<3 installed); turnId-less approvals now wait for the published turn id (fixes the Python 3.11 wait_for ordering race where the placeholder identity reached the authority); live evidence under underworld2 out/tri-agent-p0-20261025, -p1-20261026, -p2-20261026, -p3-20261026",
- "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
- "files": {
-  "src/zcode_supervisor/__init__.py": {
-   "blob": "9a8f4cabe3d83ce4ac3dc43ea1ffb709079d9eeb",
-   "sha256": "391d0d31df3a211df81a38bd57a7a6a0680aa550187e707624f9204c66f5ba5f"
+  "schema_version": 1,
+  "acceptance": "2026-11-03 acceptance: v0.2.1 stall-timeout progress ledger (per-event heartbeats to <out>.progress.jsonl, wall fuse default 86400 under stall), czs progress + codex-status read-only views, and the dsh headless hub worker (third worker; NDJSON event wire live-probed 2026-11-03, exit code 0 even on error, success judged from events). Offline suite: 1136 tests green in the hub venv (Python 3.12, mcp installed), including 34 new tests for ledger/stall/dsh driver/dsh contracts; test_distribution requires a real git checkout and runs at release build time. NOT re-qualified live in this batch: no live zcode model run, no live dsh model run, no codex app-server round trip — prior live evidence (2026-10-26/31) covers those channels' unchanged paths.",
+  "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
+  "files": {
+    "src/zcode_supervisor/__init__.py": {
+      "blob": "89717a953bdda10c924019a2f602cc28f466f8f6",
+      "sha256": "0c5ee01acc339ab6f7833927e7e6dc1ed400ff2c23c29aeb92e8f27afaad46bb"
+    },
+    "src/zcode_supervisor/__main__.py": {
+      "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
+      "sha256": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
+    },
+    "src/zcode_supervisor/authority.py": {
+      "blob": "a568872d0f671f771b78ce3efda4aaa25b4d190c",
+      "sha256": "df7bd87f9659cb89ff0261207d2d88b0fbbaa15966d4e3c69e1030a8293f471c"
+    },
+    "src/zcode_supervisor/bench.py": {
+      "blob": "36bed8353a5bf773efba28250e3376d5444bdd5e",
+      "sha256": "5ed161b2583797c00405a4615bbb67be6a85a7943df546f3f3f890047c983a21"
+    },
+    "src/zcode_supervisor/cli.py": {
+      "blob": "d47a803e6f1457f80146c63fe68b0a50454d3b10",
+      "sha256": "89a700e9a4dd18bd919d75a5c476f12a09ad10ce045a98a361c5a0dbe2655c64"
+    },
+    "src/zcode_supervisor/codex_appserver.py": {
+      "blob": "db99fb6e47628fc556ac424b89e9a52fce3ff0f8",
+      "sha256": "a57f3ef0706a08e75f1c8f110ba60135047873cf6633cd5d9d25abeba7125983"
+    },
+    "src/zcode_supervisor/codex_driver.py": {
+      "blob": "00f4660317c56d8d08601046edd9f1fe7606639c",
+      "sha256": "e04ff623c556195235ce40e13c09fdd41db0356a73f89689810714917f766470"
+    },
+    "src/zcode_supervisor/codex_monitor.py": {
+      "blob": "c653a49c2b9b4ba43901b92a3d71f42dd8749236",
+      "sha256": "869abd7d62c372a28baa7bb530f54aa3ff5d1d5d768fdaf53ac5f2b7fdf82ce9"
+    },
+    "src/zcode_supervisor/common.py": {
+      "blob": "457a02627ba5e091531f99353209357b5c60eb06",
+      "sha256": "06379f7cc49aef82c60d3732e9aa36b8d0b9e630f62c62ff2ff2deed04709cae"
+    },
+    "src/zcode_supervisor/contracts.py": {
+      "blob": "cae8e63136236a5c5009999904bc425f899763b8",
+      "sha256": "5431b26bda5dc7b419a31fece2e85a410bdec313464028e9fe7f021788d56fcf"
+    },
+    "src/zcode_supervisor/deadline.py": {
+      "blob": "af08b7b93f2b6b83cd8c4d75836e47bf80c314f7",
+      "sha256": "d752ac2c86ce6ba7fe66b99c83eb1ee4ad841850fae2f98707e84660d335fb48"
+    },
+    "src/zcode_supervisor/digest.py": {
+      "blob": "0d7f359764ecd3ff3cf0a9cee5f54208a4ec359c",
+      "sha256": "c362c7e14634e31d69e24d1097bf8b5b99b41abf5c12db71ca5dc55a1ca03fce"
+    },
+    "src/zcode_supervisor/dsh_driver.py": {
+      "blob": "91f9ace07122aed742f729f9a5ad6ad89d74cc28",
+      "sha256": "cc7c0bd8ae009f671fb9af2a0aba0c6970de27674c143e9e441fde793a04f79f"
+    },
+    "src/zcode_supervisor/habits.py": {
+      "blob": "e0e336240ed21934c01144e68396a6721dcb2ae3",
+      "sha256": "d29900a60c63bedab1fe4b164c1aad13fb4dbb4b48c98bc35fbf78b8122b475d"
+    },
+    "src/zcode_supervisor/health.py": {
+      "blob": "7ef71321ca99991058f017be5a66797e00b9ed8a",
+      "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
+    },
+    "src/zcode_supervisor/hub_server.py": {
+      "blob": "669da72e8245b7c7595edb4fb4d45e09580e0701",
+      "sha256": "d9f4b42fd98846fe40b7beeacd4dcf6aa30d32644cd119d55414d4a53106a164"
+    },
+    "src/zcode_supervisor/mcp_readonly.py": {
+      "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
+      "sha256": "6a47a099f4c51a4bb49de1b0ab32c6e2908d77a2f0833dfea309fd7f80789d14"
+    },
+    "src/zcode_supervisor/notify.py": {
+      "blob": "255344734dc05a8a5bbc0df98dae90723f91473c",
+      "sha256": "7f2ac2c261a9d1459dcfba2cf2585783291cf7caa0c2403e58a19806d4e1b5d6"
+    },
+    "src/zcode_supervisor/orchestration.py": {
+      "blob": "9f18808ca0e3454b1ccac9a6823935d9703ec2b1",
+      "sha256": "ff752c3a27ff3f577c51b94c7a89e1c945649b2b398fd465fe68798f5279c60d"
+    },
+    "src/zcode_supervisor/patches/zcode-permission-allowlist.patch": {
+      "blob": "8792f8ec94b1d2697bd981edd3529de3863fb33c",
+      "sha256": "4f5a1e2b28b27cc90401f5edbe61605e48a7289db56f6b31f9f74f1521a6eff4"
+    },
+    "src/zcode_supervisor/permission_probe.py": {
+      "blob": "a209c2341aa8114a57fc8fb5c1e20d3d4c6f49b0",
+      "sha256": "101f9dd82fa313fd36c0ca2f3074142b89ab22c33bcb16161a97fb0a996ef9dd"
+    },
+    "src/zcode_supervisor/profile.py": {
+      "blob": "24620c3d009487d11e914b462a274a3dd5ad0c3d",
+      "sha256": "349baef41ec575b49cda4c75fb1fc5a7d9a81ed20abae7e19803563b0e3a28fe"
+    },
+    "src/zcode_supervisor/progress.py": {
+      "blob": "8b43ed34aac70dc94fac227b9749d7c21b6634ad",
+      "sha256": "33d52e48afa37025084999c1e46b192c79d193bed57bebf572e45f776e73772e"
+    },
+    "src/zcode_supervisor/protocol.py": {
+      "blob": "a5eeb21dd743d69d9c2d3c49c4ceb4077f66b3d7",
+      "sha256": "620d0630a7e33b41b0eb205ac2478f32522ba4cd1462d53335ab212fa9047100"
+    },
+    "src/zcode_supervisor/runtime.py": {
+      "blob": "0abb53b7b75050a045f62f3d3e3fa548c9e36b89",
+      "sha256": "5c87a9fd3725ccade0c0d8dffb0711bba17fe0b7b4f17d70cdec0ff94eba12ab"
+    },
+    "src/zcode_supervisor/session_reader.py": {
+      "blob": "68d0ae3ee7a80bcc3cf9cfe5afc643d05b35f6f1",
+      "sha256": "a7242dc705939030cfa5d503ba89d5a3db50412b6da619f276ea2242a85b7fa9"
+    },
+    "src/zcode_supervisor/splitlines_stream.py": {
+      "blob": "b527a90aa38e551c0eb56d93946da4c5e27c75e6",
+      "sha256": "2ba69e64e4f4f0dbf499ef7a39acdefa48627ea62e906440535f455ba90eaa1f"
+    },
+    "src/zcode_supervisor/tri_probe.py": {
+      "blob": "e602529ab3591b73d893554a8a85516898f3525a",
+      "sha256": "f8f00a727a1bf131fcc93ad804ab1ed761c25e234cdfe8fb34b325ed47de3426"
+    },
+    "src/zcode_supervisor/ui_events.py": {
+      "blob": "eb263fad02277aea55468644ab49e5cb254bc643",
+      "sha256": "e988a08d50650157c0069e6dd64ea429a140e2a29763d5711640b1bdb5155c42"
+    },
+    "src/zcode_supervisor/ui_journal.py": {
+      "blob": "331beb90c1cf2bf0425f61712ffb804c68df3393",
+      "sha256": "023df641273e65e18a66fd13fd39a496fb074df7014b2e7ac9a65d0fe1664d38"
+    },
+    "src/zcode_supervisor/ui_projection.py": {
+      "blob": "2abd53a820a2db15c30646ce13867a1cadc86e81",
+      "sha256": "7e3680bd1527f5d94f4264bd7115e6a767b0384dfddf9c8acfe990f23d0dbe98"
+    },
+    "src/zcode_supervisor/ui_registry.py": {
+      "blob": "3c51cab3108e9a6f73b8f320ae5da39dbb313287",
+      "sha256": "c0acb57f30f25f6864e71d4465fbfc72df93993b87eaae01d1d6752017aaef1b"
+    },
+    "src/zcode_supervisor/ui_server.py": {
+      "blob": "d16d33da51602cb57a5ae74326fedfe20aa6c2d6",
+      "sha256": "ebb3666013bcb9a84342a5d990018dd1e1a466d0bac55c2838f338c4e8c6de61"
+    },
+    "src/zcode_supervisor/worker_health.py": {
+      "blob": "0694e5beb7f81859fcad2f99504f96c6ba028b64",
+      "sha256": "6ceeca261cab71e206d6e8e182d3ea192001d1950957dc81c2a17fdafca1a8f3"
+    },
+    "src/zcode_supervisor/zcode_resident.py": {
+      "blob": "d5a90aa80287d415fcafe34e4ae9f2e62475007d",
+      "sha256": "f541992385d4e9677e2e16a6898e451231caa7803e584ee3ebf5c430b7643943"
+    }
   },
-  "src/zcode_supervisor/__main__.py": {
-   "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
-   "sha256": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
-  },
-  "src/zcode_supervisor/authority.py": {
-   "blob": "a568872d0f671f771b78ce3efda4aaa25b4d190c",
-   "sha256": "df7bd87f9659cb89ff0261207d2d88b0fbbaa15966d4e3c69e1030a8293f471c"
-  },
-  "src/zcode_supervisor/bench.py": {
-   "blob": "36bed8353a5bf773efba28250e3376d5444bdd5e",
-   "sha256": "5ed161b2583797c00405a4615bbb67be6a85a7943df546f3f3f890047c983a21"
-  },
-  "src/zcode_supervisor/cli.py": {
-   "blob": "40c356bba829b3a8db3898918dd5baaa06397a2b",
-   "sha256": "c9a2c8cc7e4edde362d8863c37b67c908be14dc0dab80cf1faf8c25a7aa26354"
-  },
-  "src/zcode_supervisor/codex_appserver.py": {
-   "blob": "db99fb6e47628fc556ac424b89e9a52fce3ff0f8",
-   "sha256": "a57f3ef0706a08e75f1c8f110ba60135047873cf6633cd5d9d25abeba7125983"
-  },
-  "src/zcode_supervisor/codex_driver.py": {
-   "blob": "00f4660317c56d8d08601046edd9f1fe7606639c",
-   "sha256": "e04ff623c556195235ce40e13c09fdd41db0356a73f89689810714917f766470"
-  },
-  "src/zcode_supervisor/common.py": {
-   "blob": "457a02627ba5e091531f99353209357b5c60eb06",
-   "sha256": "06379f7cc49aef82c60d3732e9aa36b8d0b9e630f62c62ff2ff2deed04709cae"
-  },
-  "src/zcode_supervisor/contracts.py": {
-   "blob": "6a3d53f5e20a7c4352d0a20c8e0b19b678a7c141",
-   "sha256": "7a6bf9ec72c4b81653495613ae04ad8cd0cef3fa8731a2f6a1c15c90b79d54bd"
-  },
-  "src/zcode_supervisor/digest.py": {
-   "blob": "0d7f359764ecd3ff3cf0a9cee5f54208a4ec359c",
-   "sha256": "c362c7e14634e31d69e24d1097bf8b5b99b41abf5c12db71ca5dc55a1ca03fce"
-  },
-  "src/zcode_supervisor/habits.py": {
-   "blob": "e0e336240ed21934c01144e68396a6721dcb2ae3",
-   "sha256": "d29900a60c63bedab1fe4b164c1aad13fb4dbb4b48c98bc35fbf78b8122b475d"
-  },
-  "src/zcode_supervisor/health.py": {
-   "blob": "7ef71321ca99991058f017be5a66797e00b9ed8a",
-   "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
-  },
-  "src/zcode_supervisor/hub_server.py": {
-   "blob": "bb820b16346b2219b8c86a2ffed7a58b1ba5743f",
-   "sha256": "871d678bd4d845cc200d0487b3cc80c9298a2efeca9de5c0de62be35c985d14f"
-  },
-  "src/zcode_supervisor/mcp_readonly.py": {
-   "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
-   "sha256": "6a47a099f4c51a4bb49de1b0ab32c6e2908d77a2f0833dfea309fd7f80789d14"
-  },
-  "src/zcode_supervisor/notify.py": {
-   "blob": "255344734dc05a8a5bbc0df98dae90723f91473c",
-   "sha256": "7f2ac2c261a9d1459dcfba2cf2585783291cf7caa0c2403e58a19806d4e1b5d6"
-  },
-  "src/zcode_supervisor/orchestration.py": {
-   "blob": "9f18808ca0e3454b1ccac9a6823935d9703ec2b1",
-   "sha256": "ff752c3a27ff3f577c51b94c7a89e1c945649b2b398fd465fe68798f5279c60d"
-  },
-  "src/zcode_supervisor/patches/zcode-permission-allowlist.patch": {
-   "blob": "8792f8ec94b1d2697bd981edd3529de3863fb33c",
-   "sha256": "4f5a1e2b28b27cc90401f5edbe61605e48a7289db56f6b31f9f74f1521a6eff4"
-  },
-  "src/zcode_supervisor/permission_probe.py": {
-   "blob": "a209c2341aa8114a57fc8fb5c1e20d3d4c6f49b0",
-   "sha256": "101f9dd82fa313fd36c0ca2f3074142b89ab22c33bcb16161a97fb0a996ef9dd"
-  },
-  "src/zcode_supervisor/profile.py": {
-   "blob": "24620c3d009487d11e914b462a274a3dd5ad0c3d",
-   "sha256": "349baef41ec575b49cda4c75fb1fc5a7d9a81ed20abae7e19803563b0e3a28fe"
-  },
-  "src/zcode_supervisor/protocol.py": {
-   "blob": "2b8681b47769a8e3a86cdbbfbe4c150040b23a50",
-   "sha256": "f29b039f86b12cb5e8321d664f0c0ffd27d3cd5a179d57f13f7ca458e52517db"
-  },
-  "src/zcode_supervisor/runtime.py": {
-   "blob": "0abb53b7b75050a045f62f3d3e3fa548c9e36b89",
-   "sha256": "5c87a9fd3725ccade0c0d8dffb0711bba17fe0b7b4f17d70cdec0ff94eba12ab"
-  },
-  "src/zcode_supervisor/session_reader.py": {
-   "blob": "68d0ae3ee7a80bcc3cf9cfe5afc643d05b35f6f1",
-   "sha256": "a7242dc705939030cfa5d503ba89d5a3db50412b6da619f276ea2242a85b7fa9"
-  },
-  "src/zcode_supervisor/tri_probe.py": {
-   "blob": "e602529ab3591b73d893554a8a85516898f3525a",
-   "sha256": "f8f00a727a1bf131fcc93ad804ab1ed761c25e234cdfe8fb34b325ed47de3426"
-  },
-  "src/zcode_supervisor/zcode_resident.py": {
-   "blob": "d5a90aa80287d415fcafe34e4ae9f2e62475007d",
-   "sha256": "f541992385d4e9677e2e16a6898e451231caa7803e584ee3ebf5c430b7643943"
-  },
-  "src/zcode_supervisor/splitlines_stream.py": {
-   "blob": "b527a90aa38e551c0eb56d93946da4c5e27c75e6",
-   "sha256": "2ba69e64e4f4f0dbf499ef7a39acdefa48627ea62e906440535f455ba90eaa1f"
-  }
- },
- "refreshed_at": "2026-10-30",
- "refresh_reason": "v0.2.0 release: version bump across plugin manifests, python package, UI app"
+  "refreshed_at": "2026-11-03",
+  "refresh_reason": "v0.2.1 release: progress ledger + stall semantics, monitor commands, dsh hub worker; template docs and plugin manifests bumped"
 }
