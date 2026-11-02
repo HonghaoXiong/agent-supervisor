@@ -93,11 +93,13 @@ class ValidateContractTests(unittest.TestCase):
         self.assertIn("allowed_files must be empty", message)
         self.assertIn('"app-server"', message)
 
-    def test_dsh_worker_is_rejected_as_absent(self):
-        contract = codex_contract(self.ws, worker="dsh")
-        with self.assertRaises(ContractError) as caught:
-            contracts.validate_contract(contract)
-        self.assertIn("worker 'dsh' is absent on this host", str(caught.exception))
+    def test_dsh_worker_now_validated_as_third_worker(self):
+        # 2026-11-03: dsh became a registered hub worker (headless mode);
+        # it is no longer rejected as absent. Cross-worker rules (commands,
+        # model, output_schema) live in tests/test_contracts_dsh.py.
+        contract = zcode_contract(self.ws, worker="dsh", model=None)
+        validated = contracts.validate_contract(contract)
+        self.assertEqual(validated["worker"], "dsh")
 
     def test_unknown_worker_is_rejected(self):
         with self.assertRaises(ContractError):

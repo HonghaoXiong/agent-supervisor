@@ -71,6 +71,7 @@ from types import SimpleNamespace
 from . import __version__, common, contracts
 from .authority import Authority, inventory
 from .codex_driver import locate_rollout, run_readonly
+from . import dsh_driver
 from .deadline import CallBudget
 from .session_reader import read_context as read_session_context
 from .splitlines_stream import eof_segments, scan_new as _scan_new
@@ -91,6 +92,7 @@ __all__ = [
     "read_context_impl",
     "list_skills_impl",
     "delegate_impl",
+    "default_dsh_runner",
     "default_zcode_runner",
 ]
 
@@ -699,6 +701,21 @@ async def default_zcode_runner(config, task_id: str, contract: dict,
     }
 
 
+def default_dsh_runner(dsh_path, workspace, task, evidence_dir, *,
+                       wall_timeout_s, stall_timeout_s=None):
+    """Sync thin wrapper so _invoke can offload the blocking dsh dispatch.
+
+    ``stall_timeout_s`` forwards only when provided: the contract's optional
+    ``stall_timeout_ms`` overrides the driver's generous default, and absent
+    contracts keep that default instead of zeroing it.
+    """
+    kwargs = {"wall_timeout_s": wall_timeout_s}
+    if stall_timeout_s is not None:
+        kwargs["stall_timeout_s"] = stall_timeout_s
+    return dsh_driver.run_headless(dsh_path, workspace, task, evidence_dir,
+                                   **kwargs)
+
+
 async def _invoke(runner, *args, **kwargs):
     """Await async runners; run sync runners off the event loop.
 
@@ -966,7 +983,7 @@ class ResidentWorkers:
 
 async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                         codex_path=None, codex_home=None,
-                        zcode_runner=None, codex_runner=None,
+                        zcode_runner=None, codex_runner=None, dsh_runner=None,
                         resident_factory=None, appserver_factory=None,
                         appserver_driver_factory=None,
                         appserver_concurrency=0,
@@ -1032,11 +1049,8 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
     resolution = resolve_worker_health(config, codex_path)
     entry = resolution["workers"].get(worker, {})
     remaining = sorted(
-        name for name in ("codex", "zcode")
+        name for name in ("codex", "zcode", "dsh")
         if name != worker and resolution["workers"].get(name, {}).get("enabled") is not False)
-    if worker == "dsh":
-        raise HubError("worker-absent",
-                       "worker 'dsh' is absent on this host; dispatch refused")
     if entry.get("enabled") is False:
         raise HubError(
             "worker-disabled",
@@ -1055,6 +1069,12 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         codex_runner = run_readonly
     if zcode_runner is None:
         zcode_runner = default_zcode_runner
+    if dsh_runner is None:
+        dsh_runner = default_dsh_runner
+    effective_dsh_path = resolution["workers"].get("dsh", {}).get("path")
+    if worker == "dsh" and effective_dsh_path is None:
+        raise HubError("worker-unavailable",
+                       "dsh CLI not found on this host; cannot dispatch")
     effective_codex_path = codex_path or resolution["workers"].get("codex", {}).get("path")
     if worker == "codex" and effective_codex_path is None \
             and codex_runner is run_readonly:
@@ -1273,6 +1293,47 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                 }
                 error_text = _field(receipt, "error")
                 status = "completed"
+        elif worker == "dsh":
+            # 2026-11-03: dsh headless channel — no approval broker exists,
+            # so the CONTRACT is the control (human-registered) and the hub
+            # adds the evidence the channel itself cannot: before/after
+            # workspace inventory compared against allowed_files, the
+            # heartbeat ledger with stall semantics, and the streamed event
+            # file. Success/failure comes from the dsh event stream (the
+            # process exit code stays 0 even on errors — live-verified).
+            common.ensure_directory(evidence_dir)
+            workspace = Path(contract["workspace"])
+            before = inventory(workspace)
+            stall_ms = contract.get("stall_timeout_ms")
+            stall_s = (stall_ms / 1000
+                       if isinstance(stall_ms, int) and not isinstance(stall_ms, bool)
+                       else None)
+            with common.workspace_lock(workspace, Path(config.state_dir)):
+                receipt = await _invoke(
+                    dsh_runner, effective_dsh_path, workspace,
+                    contract["prompt"], evidence_dir,
+                    wall_timeout_s=contract["max_timeout_ms"] / 1000,
+                    **({"stall_timeout_s": stall_s} if stall_s is not None else {}))
+            receipt = receipt if isinstance(receipt, dict) else {}
+            with contextlib.suppress(OSError, ValueError, TypeError):
+                common.write_json(evidence_dir / "dsh-receipt.json", receipt)
+            after = inventory(workspace)
+            changed = sorted(name for name in before.keys() | after.keys()
+                             if before.get(name) != after.get(name))
+            allowed = set(contract.get("allowed_files") or [])
+            outcome = str(_field(receipt, "outcome", "failed"))
+            dsh_session = _field(receipt, "session_id")
+            locator = ({"agent": "dsh", "session_id": dsh_session}
+                       if isinstance(dsh_session, str) and dsh_session else None)
+            result_payload = {
+                "final_message": _field(receipt, "final_message"),
+                "exit_code": _field(receipt, "exit_code"),
+                "changed_files": changed,
+                "unexpected_changes": sorted(set(changed) - allowed),
+                "progress": _field(receipt, "progress") or {},
+            }
+            error_text = _field(receipt, "error")
+            status = "completed"
         elif mode == "resident":
             from math import ceil
 

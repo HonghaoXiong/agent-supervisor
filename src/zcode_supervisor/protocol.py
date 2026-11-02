@@ -24,6 +24,7 @@ from .authority import (Authority, _edit_input_equivalent, _workflow_input_equiv
 from .common import (process_alive, read_regular, run_boundary_scan,
                      sha256_regular, workspace_lock, write_json)
 from . import profile
+from . import progress
 from . import ui_projection
 from .notify import send as send_notification
 from .worker_health import ExitProjection
@@ -828,7 +829,8 @@ def checked_locations(raw_workspace, output, config, packet_path=None):
     for location in (Path(config.state_dir).resolve(), Path(config.cache_dir).resolve()):
         if workspace.is_relative_to(location):
             raise ValueError('Workspace must not be inside controller state or cache')
-    for ext in ('.json', '.stderr.log', '.events.jsonl', '.before.json'):
+    for ext in ('.json', '.stderr.log', '.events.jsonl', '.before.json',
+                '.progress.jsonl'):
         path = output.with_suffix(ext)
         if path.exists() or path.is_symlink():
             raise ValueError('Use a new output basename')
@@ -937,6 +939,10 @@ def short_session(session_id):
     return text[:8] + '…' + text[-4:] if len(text) > 16 else text
 
 
+# One idle wait slice in the routed event loop: keeps the stall clock
+# observable even when the worker emits nothing (see execute's wait loop).
+_WAIT_SLICE_S = 1.0
+
 # Fixed, notification-safe outcome kinds; labels never embed raw error text.
 OUTCOME_LABELS = {
     'delivered': '交付检查通过',
@@ -960,9 +966,11 @@ def outcome_label(kind, problems=None):
 async def execute(args, config, ui_emitter=None):
     if args.resume and not re.fullmatch(r'sess_[A-Za-z0-9_-]+', args.resume):
         raise ValueError('Invalid resume session ID')
-    if (isinstance(args.timeout, bool) or not isinstance(args.timeout, (int, float))
-            or not math.isfinite(args.timeout) or args.timeout <= 0):
-        raise ValueError('Run timeout must be positive and finite')
+    # Stall-aware budget (2026-11-03): without --stall-timeout the historic
+    # absolute semantics are byte-identical; with it, the wall fuse defaults
+    # to the ceiling and heartbeats keep a progressing worker alive.
+    wall_timeout, stall_timeout = progress.resolve_run_budget(
+        args.timeout, getattr(args, 'stall_timeout', None))
     raw_packet = Path(args.packet)
     packet_info = raw_packet.lstat()
     if not stat.S_ISREG(packet_info.st_mode) or packet_info.st_nlink != 1:
@@ -1009,6 +1017,11 @@ async def execute(args, config, ui_emitter=None):
         with output.open('x') as stream:
             json.dump({'delivery_ok': False, 'state': 'starting'}, stream)
         write_json(output.with_suffix('.before.json'), before)
+        # Out-of-band heartbeat ledger: never enters any agent's context; the
+        # final result JSON gains only the bounded progress summary block.
+        ledger = progress.ProgressLedger(
+            output.with_suffix('.progress.jsonl'),
+            stall_timeout_s=stall_timeout, wall_timeout_s=wall_timeout)
         # Test doubles from parallel work may predate the orchestration and
         # P0.4 parameters; pass each only when the constructor accepts it.
         client_params = {}
@@ -1027,6 +1040,16 @@ async def execute(args, config, ui_emitter=None):
             # this session becomes part of the authorized turn set, and
             # subagent lifecycle events populate the child registry.
             authority.note_event(event)
+            # Heartbeat: one bounded line per received frame (coalesced when
+            # chatty); this is what keeps a progressing worker past the stall
+            # budget and what `czs progress` later reads.
+            payload = event.get('payload') if isinstance(event, dict) else None
+            payload = payload if isinstance(payload, dict) else {}
+            detail = str(event.get('type') or 'event')[:40]
+            token = payload.get('toolName') or payload.get('phase') or payload.get('kind')
+            if token:
+                detail = detail+':'+str(token)[:20]
+            ledger.note('event', detail)
             if (event.get('type') == 'turn.started'
                     and event.get('sessionId') == authority.session_id):
                 authority.note_turn(event.get('turnId'))
@@ -1052,7 +1075,6 @@ async def execute(args, config, ui_emitter=None):
         requested_model = packet.get('model')
         if requested_model is not None:
             result['requested_model'] = requested_model
-        deadline = time.monotonic()+args.timeout
         started = time.monotonic()
         # Test doubles build minimal duck-typed configs; missing means silent.
         notify_enabled = getattr(config, 'notify', False)
@@ -1060,7 +1082,9 @@ async def execute(args, config, ui_emitter=None):
         dispatched = False
         turn_succeeded = False
         def remaining():
-            return max(0.001, deadline-time.monotonic())
+            # Stall-aware: a fresh heartbeat moves the effective deadline, so
+            # each RPC's budget follows the run's real liveness window.
+            return max(0.001, ledger.effective_deadline()-time.monotonic())
         async def rpc(method, params):
             return await asyncio.wait_for(client.request(method, params), remaining())
         # N4c: the worker process discovers/reads skills at startup, so the
@@ -1137,7 +1161,7 @@ async def execute(args, config, ui_emitter=None):
                               enabled=notify_enabled)
             completed = None
             processed = 0
-            while time.monotonic() < deadline:
+            while ledger.expired() is None:
                 if client.failure:
                     raise ValueError(client.failure)
                 if router_sub is not None:
@@ -1173,10 +1197,20 @@ async def execute(args, config, ui_emitter=None):
                 if completed:
                     break
                 if router_sub is not None:
-                    await router_sub.wait_new(max(0.0, deadline - time.monotonic()))
+                    # Cap each idle wait so the stall clock is checked even
+                    # when no frames arrive (the deadline now MOVES with
+                    # heartbeats, so one long wait would miss a stall).
+                    await router_sub.wait_new(
+                        min(_WAIT_SLICE_S,
+                            max(0.0, ledger.effective_deadline()-time.monotonic())))
                 else:
                     await asyncio.sleep(0.02)
             if completed is None:
+                reason = ledger.expired() or 'wall'
+                if reason == 'stall':
+                    raise asyncio.TimeoutError(
+                        'Worker stalled: no progress heartbeat for '
+                        f'{stall_timeout}s')
                 raise asyncio.TimeoutError('Worker turn deadline exceeded')
             result['turn_id'] = authority.turn_id
             result['completion'] = completed['payload']
@@ -1204,9 +1238,10 @@ async def execute(args, config, ui_emitter=None):
                                                  f'{skill_binding["target"]}, now {final_target}')
                     except ValueError as error:
                         problems_orch.append(f'skill closure verification failed: {error}')
-                while time.monotonic() < deadline:
+                while ledger.expired() is None:
                     if client.failure:
                         raise ValueError(client.failure)
+                    ledger.note('poll', 'orchestration')
                     while processed < len(client.events):
                         event = client.events[processed]
                         processed += 1
@@ -1317,7 +1352,8 @@ async def execute(args, config, ui_emitter=None):
                         orchestration_result['goal_set'] = redact_transport(goal_set)
                         goal_gate = time.monotonic()+180
                         idle_streak = 0
-                        while time.monotonic() < min(deadline, goal_gate):
+                        while time.monotonic() < min(ledger.effective_deadline(), goal_gate):
+                            ledger.note('poll', 'goal')
                             gate_snapshot = await rpc('session/read', {'sessionId': sid,
                                 'deliveryKind': 'desktop-continuous', 'messageLimit': 1})
                             if (gate_snapshot.get('session') or {}).get('status') == 'idle':
@@ -1332,7 +1368,7 @@ async def execute(args, config, ui_emitter=None):
                     # Goal management is refused while a goal-driven prompt is
                     # running (-32010); retry to a bounded idle boundary.
                     goal_final = None
-                    goal_deadline = min(deadline, time.monotonic()+30)
+                    goal_deadline = min(ledger.effective_deadline(), time.monotonic()+30)
                     while goal_final is None and time.monotonic() < goal_deadline:
                         try:
                             goal_final = await rpc('session/goal', {'sessionId': sid,
@@ -1520,6 +1556,11 @@ async def execute(args, config, ui_emitter=None):
                 # finally-only scope discoveries stay scope errors; an in-try
                 # post-success audit verdict keeps its more specific category.
                 result['outcome'] = 'scope-error'
+            # Terminal heartbeat + bounded summary; the ledger's lines stay in
+            # the sidecar file and never inflate the result JSON.
+            ledger.finalize(result.get('outcome') or 'unknown')
+            result['progress'] = ledger.summary()
+            ledger.close()
             write_json(output,redact_transport(result))
             # P2.2: task-owned routed frames release only after the result
             # (with all its evidence) is finalized and persisted

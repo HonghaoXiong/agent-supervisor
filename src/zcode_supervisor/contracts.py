@@ -20,6 +20,11 @@ semantics (evidence ``out/tri-agent-p1-20261026``):
   sandbox, sandbox-contained operations execute without any approval — so
   ``allowed_files`` and ``commands`` must stay empty there;
 * zcode brokers ``allowed_files`` and exact ``commands`` in both modes;
+* dsh ``headless`` (2026-11-03) has NO approval callback at all — the
+  process runs with the launching user's permissions inside the contract
+  workspace, so ``commands`` must stay empty, ``model`` is profile-driven
+  (null), ``output_schema`` is unconsumed, and ``allowed_files`` is only an
+  acceptance comparison the hub checks against before/after inventory;
 * codex ``app-server`` + ``approvalPolicy="untrusted"`` sends per-command
   approval callbacks, and file approvals carry no per-file schema field
   (the bridge declines them whole), so writes travel through approved exact
@@ -45,6 +50,7 @@ from .common import read_regular, write_json
 
 __all__ = [
     "CODEX_MODES",
+    "DSH_MODES",
     "OPTIONAL",
     "REQUIRED",
     "SANDBOX_MODES",
@@ -73,11 +79,12 @@ REQUIRED = (
     "max_timeout_ms",
     "budget",
 )
-WORKERS = ("zcode", "codex")
-OPTIONAL = ("snapshots", "output_schema", "mode", "sandbox")
+WORKERS = ("zcode", "codex", "dsh")
+OPTIONAL = ("snapshots", "output_schema", "mode", "sandbox", "stall_timeout_ms")
 
 ZCODE_MODES = ("cold", "resident")
 CODEX_MODES = ("exec", "app-server")
+DSH_MODES = ("headless",)
 SANDBOX_MODES = ("read-only", "workspace-write")
 
 MAX_TIMEOUT_MS_CEILING = 3_600_000
@@ -198,15 +205,15 @@ def validate_contract(contract: dict) -> dict:
 
     # --- worker --------------------------------------------------------
     value = contract.get("worker")
-    if value == "dsh":
-        problems.append("worker 'dsh' is absent on this host")
-    elif value not in WORKERS:
-        problems.append(f"worker must be one of {WORKERS} (dsh is not installed on this host)")
+    if value not in WORKERS:
+        problems.append(f"worker must be one of {WORKERS}")
     worker = contract.get("worker")
 
     # --- mode (worker execution mode; default keeps old-contract meaning) ---
     if worker == "zcode":
         modes, default_mode = ZCODE_MODES, "cold"
+    elif worker == "dsh":
+        modes, default_mode = DSH_MODES, "headless"
     else:
         modes, default_mode = CODEX_MODES, "exec"
     value = contract.get("mode")
@@ -222,8 +229,8 @@ def validate_contract(contract: dict) -> dict:
     if "sandbox" in contract:
         if worker != "codex":
             problems.append(
-                "sandbox applies to codex workers only; zcode brokering is "
-                "governed by the czs packet itself")
+                "sandbox applies to codex workers only; zcode/dsh execution "
+                "is governed by the czs packet/contract itself")
         if not isinstance(value, str) or value not in SANDBOX_MODES:
             problems.append(f"sandbox must be one of {SANDBOX_MODES}")
     effective_sandbox = (value if isinstance(value, str) and value in SANDBOX_MODES
@@ -271,6 +278,11 @@ def validate_contract(contract: dict) -> dict:
                 problems.append(
                     f"allowed_files must be empty for worker {worker!r} "
                     "(no write path exists for this worker)")
+            # dsh note (no problem appended): headless writes freely inside
+            # its workspace with NO broker, so allowed_files is an acceptance
+            # comparison only — the hub records before/after inventory
+            # evidence and the reviewer must treat the workspace as a
+            # disposable copy (see docs/USAGE.md hub table).
 
     # --- commands ------------------------------------------------------
     value = contract.get("commands")
@@ -284,6 +296,10 @@ def validate_contract(contract: dict) -> dict:
                     _command_problems(command, f"commands[{position}]"))
             if worker == "codex" and effective_mode == "exec" and value:
                 problems.append(_CODEX_EXEC_NO_BROKER.format(field="commands"))
+            elif worker == "dsh" and value:
+                problems.append(
+                    "commands must be empty for worker 'dsh' (headless has no "
+                    "approval broker; the reviewed prompt is the whole contract)")
             elif worker not in WORKERS and value:
                 problems.append(
                     f"commands must be empty for worker {worker!r} "
@@ -309,6 +325,10 @@ def validate_contract(contract: dict) -> dict:
                         or not isinstance(value.get("model"), str)
                         or not value.get("model", "").strip()):
                     problems.append('codex model must be {"model": "<name>"} or null')
+        elif worker == "dsh":
+            if value is not None:
+                problems.append(
+                    "dsh model selection is profile-driven; model must be null")
         elif not isinstance(value, dict):
             problems.append("model must be an object for the chosen worker")
 
@@ -320,6 +340,15 @@ def validate_contract(contract: dict) -> dict:
         elif not 1 <= value <= MAX_TIMEOUT_MS_CEILING:
             problems.append(
                 f"max_timeout_ms must be within 1..{MAX_TIMEOUT_MS_CEILING}")
+
+    # --- optional: stall_timeout_ms (heartbeat-liveness budget) -----------
+    value = contract.get("stall_timeout_ms")
+    if "stall_timeout_ms" in contract:
+        if isinstance(value, bool) or not isinstance(value, int):
+            problems.append("stall_timeout_ms must be an integer")
+        elif not 1000 <= value <= MAX_TIMEOUT_MS_CEILING:
+            problems.append(
+                f"stall_timeout_ms must be within 1000..{MAX_TIMEOUT_MS_CEILING}")
 
     # --- budget (recorded, not enforced, in P0) -------------------------
     value = contract.get("budget")
@@ -352,7 +381,11 @@ def validate_contract(contract: dict) -> dict:
     # --- optional / codex-exec-required: output_schema -------------------
     value = contract.get("output_schema")
     if "output_schema" in contract:
-        if worker == "codex" and effective_mode == "app-server":
+        if worker == "dsh":
+            problems.append(
+                "output_schema is not consumed by dsh (the final message is "
+                "plain text); omit it")
+        elif worker == "codex" and effective_mode == "app-server":
             problems.append(
                 "output_schema is exec-only (codex exec recaptures the final "
                 "answer through --output-schema); app-server mode returns the "

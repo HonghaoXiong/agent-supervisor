@@ -22,11 +22,13 @@ the required host plugin commands and reports stable check codes and remedies,
 with authentication and unavailable guarantees kept unknown/unsupported.
 Use the detected absolute Node path in `init --node`, including when launched
 from Finder with a different PATH. `diagnostics.py --node-path` returns it locally
-without adding it to a shareable report. Plugin 0.1.4 retains core runtime
-0.1.0 and includes fixed-model packet support (`model` field with explicit
+without adding it to a shareable report. Plugin 0.1.4 retained core runtime
+0.1.0 and added fixed-model packet support (`model` field with explicit
 providerId/modelId, optional reasoningLevel) plus the tri-agent orchestration
 hub (contract-gated MCP control plane, resident workers, per-command
-approvals; see `docs/USAGE.md`).
+approvals; see `docs/USAGE.md`). Plugin 0.2.1 adds the stall-timeout progress
+ledger (`--stall-timeout`, `czs progress`, `czs codex-status`) and registers
+`dsh` as the third hub worker (headless mode).
 
 The generated example is at `<directory>/.czs/work/example/packet.json`:
 
@@ -53,13 +55,28 @@ Run from any cwd by passing `--config` before the subcommand. For a test command
 ```
 
 Check the exact command schema in `docs/USAGE.md` before executing a new packet.
-Do not treat examples as permission to run unrelated tests. Default timeout is
-300 seconds; keep the deadline and command bounds proportional to the task.
+Do not treat examples as permission to run unrelated tests.
+
+Time limits (2026-11-03 rule — do not regress to short absolute walls):
+
+* For CODE-WRITING tasks dispatch with `--stall-timeout` (600–900) and NO
+  `--timeout`: the run then terminates only after N seconds WITHOUT a
+  progress heartbeat, and the wall fuse rises to 86400. A worker that keeps
+  making progress is never cut off mid-implementation.
+* Bare `--timeout N` (default 300) keeps the legacy absolute semantics —
+  use it only for genuinely bounded probes, never for code writing.
+* Never assume a run is stuck from silence alone: peek first with
+  `czs progress <task-dir-or-run.json> --last 3` (one bounded line per
+  heartbeat, zero context cost, works from any side including a ZCode
+  session) and only then decide to resume or rework.
+* `czs codex-status` (any cwd, no config needed) shows live Codex sessions,
+  dsh workspaces and in-flight czs runs for cross-agent monitoring.
 
 Use `--out <task>/run-1.json`, then run-2, etc. The bridge retains matching
-`.events.jsonl` and before-state evidence. Never overwrite or remove failed
-attempts to make a later result appear clean. A registered, settled worker can
-be continued with `--resume <session_id>` and a newly reviewed packet/output.
+`.events.jsonl`, `.progress.jsonl` heartbeat and before-state evidence. Never
+overwrite or remove failed attempts to make a later result appear clean. A
+registered, settled worker can be continued with `--resume <session_id>` and
+a newly reviewed packet/output.
 
 Only merge accepted changes into a working repository under the user's existing
 authorization. Preserve other sessions' unstaged and staged hunks. No automatic

@@ -135,7 +135,32 @@ def parser():
     run.add_argument('--packet', type=Path, required=True)
     run.add_argument('--out', type=Path, required=True)
     run.add_argument('--resume', help='A completed worker session registered by this installation')
-    run.add_argument('--timeout', type=int, default=300)
+    run.add_argument('--timeout', type=int, default=None,
+                     help='Absolute wall fuse in seconds (default 300; with '
+                          '--stall-timeout the default rises to 86400)')
+    run.add_argument('--stall-timeout', type=int, default=None,
+                     help='Terminate only after N seconds without a progress '
+                          'heartbeat (recommended 600-900 for code writing); '
+                          'a progressing worker is never cut off')
+    progress_cmd = sub.add_parser(
+        'progress', help='Read a run\'s heartbeat ledger; no model calls')
+    progress_cmd.add_argument('target', type=Path,
+                              help='Task directory, run JSON or ledger file')
+    progress_cmd.add_argument('--last', type=int, default=5,
+                              help='How many heartbeat lines to print (default 5)')
+    codex_status = sub.add_parser(
+        'codex-status', help='One-glance view of live Codex sessions, dsh '
+                             'workspaces and in-flight czs runs; read-only')
+    codex_status.add_argument('--fresh', type=int, default=600,
+                              help='Activity window in seconds (default 600)')
+    codex_status.add_argument('--sessions', type=int, default=5,
+                              help='Maximum Codex sessions to report (default 5)')
+    codex_status.add_argument('--codex-home', type=Path, default=None,
+                              help='CODEX_HOME override (default ~/.codex)')
+    codex_status.add_argument('--dsh-home', type=Path, default=None,
+                              help='DSH home override (default ~/.dsh)')
+    codex_status.add_argument('--json', action='store_true',
+                              help='Machine-readable JSON instead of compact lines')
     habits = sub.add_parser('habits', help='Import or inspect user ZCode habits; no model calls')
     habits_sub = habits.add_subparsers(dest='habit_action', required=True)
     habits_import = habits_sub.add_parser(
@@ -210,6 +235,33 @@ def main(argv=None):
             print(json.dumps(create_project(args.directory, args.cli, args.provider_config, args.node),
                              ensure_ascii=False, indent=2))
             return 0
+        if args.action == 'progress':
+            from .progress import liveness, read_last
+            verdict = liveness(args.target)
+            if verdict.get('state') == 'unknown':
+                print(json.dumps({'ok': False, 'error': verdict.get('reason')},
+                                 ensure_ascii=False))
+                return 1
+            for record in read_last(verdict['ledger'], max(1, args.last)):
+                print(json.dumps(record, ensure_ascii=False))
+            summary = {k: v for k, v in verdict.items() if k != 'last'}
+            print(json.dumps(summary, ensure_ascii=False))
+            return 0
+        if args.action == 'codex-status':
+            from .codex_monitor import render_text, status as codex_status_view
+            try:
+                status_config = load_config(args.config)
+            except (ValueError, OSError):
+                status_config = None
+            document = codex_status_view(
+                status_config, fresh_s=max(1, args.fresh),
+                max_sessions=max(1, args.sessions), codex_home=args.codex_home,
+                dsh_home=args.dsh_home)
+            if args.json:
+                print(json.dumps(document, ensure_ascii=False, indent=2))
+            else:
+                print(render_text(document))
+            return 0
         config = load_config(args.config)
         if args.action == 'doctor':
             print(json.dumps(doctor(config), ensure_ascii=False, indent=2))
@@ -255,8 +307,9 @@ def main(argv=None):
         if args.action == 'probe':
             asyncio.run(probe(args, config))
             return 0
-        if not 1 <= args.timeout <= 86400:
-            raise ValueError('--timeout must be 1–86400 seconds')
+        # Budget resolution (incl. the 1–86400 range check) lives in
+        # protocol.execute via progress.resolve_run_budget, so the hub's
+        # in-process callers and the CLI share one validation path.
         return 0 if asyncio.run(execute(args, config)) else 1
     except (ValueError, OSError, KeyError, TypeError, asyncio.TimeoutError,
             subprocess.SubprocessError) as error:

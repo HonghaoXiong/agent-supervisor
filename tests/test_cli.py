@@ -379,12 +379,13 @@ class HubCliTests(unittest.TestCase):
         self.assertTrue(stored.is_file())
 
     def test_register_contract_rejects_a_bad_contract_as_json_error(self):
+        # dsh is a registered worker since 2026-11-03, so the rejection here
+        # is its own rule: model selection is profile-driven and must be null.
         code, payload = self._register(
             self.write_contract(worker='dsh', allowed_files=['REPORT.md']))
         self.assertEqual(code, 1)
         self.assertIs(payload['ok'], False)
-        self.assertIn('allowed_files must be empty', payload['error'])
-        self.assertIn("worker 'dsh'", payload['error'])
+        self.assertIn('dsh model selection is profile-driven', payload['error'])
         self.assertEqual(self._contracts_files(), [])  # nothing stored
 
     def test_hub_health_without_health_json_is_a_json_error(self):

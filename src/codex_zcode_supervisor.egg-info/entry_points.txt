@@ -1,0 +1,2 @@
+[console_scripts]
+czs = zcode_supervisor.cli:main

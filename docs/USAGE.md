@@ -132,7 +132,16 @@ czs probe \
 
 ```bash
 czs run --packet .czs/work/task-001/packet.json \
-  --out .czs/work/task-001/run.json --timeout 300
+  --out .czs/work/task-001/run.json --stall-timeout 600
+```
+
+**时限语义（2026-11-03 起）**：`--stall-timeout N` 把终止条件从“总时长”改为“N 秒无进展心跳”——监督者本来就在进程内消费 worker 的每个事件，每个事件向 `<out>.progress.jsonl` 追加一行紧凑心跳（白名单字段，不含提示词/代码正文；繁忙流按 2 秒窗口合并重复）。心跳不断就永不终止；带 stall 时 `--timeout` 缺省升为 86400 保险丝。写码任务一律用 stall 语义；裸 `--timeout N`（缺省 300，绝对墙钟）只用于有界探针。结果 JSON 增加有界 `progress` 块（心跳数/最近动作/停滞秒数）。
+
+任意一侧（含 ZCode 会话）可用两个只读命令窥探，不进任何 agent 的上下文：
+
+```bash
+czs progress <task目录或run.json> --last 3   # 最近心跳行 + 存活判定
+czs codex-status --fresh 600                 # 活跃 Codex 会话/dsh 工作区/在跑 czs 任务
 ```
 
 退出码为 0 且 `delivery_ok=true` 才表示交付检查通过。核对 `permission_decisions`、`commands`、`execution_problems`、`changed_files`，并单独审查实际文件差异和测试证据。Bash 结果必须包含 `exitCode=0`、`timedOut=false`、`status=completed`；缺少审批或终态证据会拒收。
@@ -144,14 +153,14 @@ czs run --packet .czs/work/task-001/packet.json \
 ```bash
 czs run --packet .czs/work/task-001/rework.json \
   --out .czs/work/task-001/rework-run.json \
-  --resume sess_<之前结果中的ID> --timeout 300
+  --resume sess_<之前结果中的ID> --stall-timeout 600
 ```
 
 只能续接此配置状态目录已登记、进程已退出、工作副本一致的会话。不要随意选择 GUI 会话或迁移原生会话数据库。超时或失败后先检查保留证据及已发生的副作用，再决定返工；不要把重试当作撤销。
 
 ## 三方编排 hub（czs-hub）
 
-hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode_supervisor.hub_server`），提供 health / list_workers / list_sessions / read_context / list_skills / delegate 六个工具。delegate 只执行人工经 `register_contract` 预先登记的合同（`state_dir/hub/contracts/`）；MCP 暴露不等于批准。每个 worker 有两种执行模式（合同可选 `mode` 字段，缺省取各 worker 的第一档，旧合同语义不变）：
+hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode_supervisor.hub_server`），提供 health / list_workers / list_sessions / read_context / list_skills / delegate 六个工具。delegate 只执行人工经 `register_contract` 预先登记的合同（`state_dir/hub/contracts/`）；MCP 暴露不等于批准。各 worker 的执行模式（合同可选 `mode` 字段，缺省取各 worker 的第一档，旧合同语义不变）：
 
 | worker | mode | 通道 | 写路径 |
 | --- | --- | --- | --- |
@@ -159,12 +168,14 @@ hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode
 | zcode | `resident` | 共享常驻进程上的隔离会话（`zcode_resident`） | 同 cold |
 | codex | `exec`（默认） | `codex exec -s read-only` 单发 + `--output-schema` | 禁止：`allowed_files` 与 `commands` 必须 `[]` |
 | codex | `app-server` | 常驻 app-server + 审批回调（`approvalPolicy=untrusted`） | 仅 `sandbox: "workspace-write"` 下经批准的精确命令 |
+| dsh | `headless`（默认，2026-11-03） | `dsh --profile headless --json` 单发，任务走 stdin，事件流即心跳 | 无审批层：`commands`/`model`/`output_schema` 必须空/null；`allowed_files` 仅作验收比对（hub 记录前后清点证据），workspace 必须是一次性副本 |
 
-写路径规则与理由（全部为真机验证事实，证据 `out/tri-agent-p1-20261026`）：
+写路径规则与理由（全部为真机验证事实，证据 `out/tri-agent-p1-20261026`；dsh 行为 2026-11-03 探针）：
 
 1. codex `exec` 模式没有审批回调：workspace-write 沙箱内操作不经审批自动执行——所以 exec 模式永远只读，写任务必须注册为 `app-server` 模式。
 2. codex `app-server` + `approvalPolicy=untrusted` 每条命令都发审批回调（批准→accept 执行、未批准→decline 拒绝）；但文件审批 `item/fileChange/requestApproval` 的 schema 无逐文件字段、桥只能整体 decline——Write 工具不可用，写只能经批准的精确命令，且（`allowed_files` 或 `commands` 非空的）写任务必须显式声明 `sandbox: "workspace-write"`（read-only 任务保持默认 `read-only`）。
 3. ZCode 冷启与常驻两模式都完整支持 `allowed_files` + 精确命令（czs 生产语义），无额外限制。
+4. dsh `headless` 的 `--json` 输出为 NDJSON 事件流（`session`/`status{phase}` 心跳、`turn_end{reason}`、`final{text}`），**进程退出码在错误时也是 0**（如 MISSING_CREDENTIAL）——成败只能从事件流判定，驱动已按此实现；合同可选 `stall_timeout_ms`（缺省 900 s，max 档思考单步可能静默数分钟）。凭据留在 dsh profile 自己的凭据仓，缺 key 以 `error` 结果原样透出。
 
 `output_schema` 是 exec 入口的 `--output-schema` 专用机制：codex+exec 必填（严格模式递归校验不变），codex+app-server 拒收（该模式返回 `final_message` 文本），zcode 不消费该字段。
 

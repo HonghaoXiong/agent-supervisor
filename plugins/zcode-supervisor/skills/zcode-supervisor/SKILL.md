@@ -55,8 +55,17 @@ unrelated repository by default. Record the baseline and relevant input hashes.
 Use a fresh `run-<N>.json` output name for every attempt, including failures.
 
 ```sh
-"<plugin-root>/scripts/python.sh" "<plugin-root>/scripts/czs.py" --config "<config>" run --packet "<packet.json>" --out "<task>/run-1.json" --timeout 300
+"<plugin-root>/scripts/python.sh" "<plugin-root>/scripts/czs.py" --config "<config>" run --packet "<packet.json>" --out "<task>/run-1.json" --stall-timeout 600
 ```
+
+Time-limit rule (2026-11-03): dispatch CODE-WRITING tasks with
+`--stall-timeout` (600–900) and no `--timeout` — the run then dies only after
+N seconds WITHOUT a progress heartbeat (the wall fuse rises to 86400), so a
+worker that keeps making progress is never cut off mid-implementation. Bare
+`--timeout N` (default 300, absolute) is for bounded probes only. Never
+declare a run stuck from silence alone: peek
+`czs progress <task-dir-or-run.json> --last 3` first (one bounded line per
+heartbeat, zero context cost), and monitor any side with `czs codex-status`.
 
 This sends real ZCode model requests and consumes that computer's quota. Existing
 user authorization for the task carries through; installing the plugin alone
