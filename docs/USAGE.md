@@ -160,7 +160,9 @@ czs run --packet .czs/work/task-001/rework.json \
 
 ## 三方编排 hub（czs-hub）
 
-hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode_supervisor.hub_server`），提供 health / list_workers / list_sessions / read_context / list_skills / delegate 六个工具。delegate 只执行人工经 `register_contract` 预先登记的合同（`state_dir/hub/contracts/`）；MCP 暴露不等于批准。各 worker 的执行模式（合同可选 `mode` 字段，缺省取各 worker 的第一档，旧合同语义不变）：
+hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode_supervisor.hub_server`），提供 health / list_workers / list_sessions / read_context / list_skills / task_status / delegate 七个工具。delegate 只执行人工经 `register_contract` 预先登记的合同（`state_dir/hub/contracts/`）；MCP 暴露不等于批准。各 worker 的执行模式（合同可选 `mode` 字段，缺省取各 worker 的第一档，旧合同语义不变；**新 zcode 合同建议显式 `"mode": "resident"`**——共享热进程 setup 94/68ms vs 冷启 604ms，且 hub 作为持久 MCP 连接时免每任务 python 冷启）：
+
+**技能可见（2026-11-03）**：`list_skills`（或 CLI `czs skills <worker>`）列出 zcode/codex/dsh 三方已安装技能的名字+frontmatter 描述行（同名多副本折叠为一条、按 root 优先序取第一；mtime 缓存；**仍不读 SKILL.md 正文**）。派发回执带 `worker_skills` 名单；惯例=派发前查技能、在 prompt 里点名要用的技能。**`task_status`** 返回最近任务与在跑任务的心跳判定（直接读 `.progress.jsonl`，状态查询永不排在运行中的工作后面）。
 
 | worker | mode | 通道 | 写路径 |
 | --- | --- | --- | --- |

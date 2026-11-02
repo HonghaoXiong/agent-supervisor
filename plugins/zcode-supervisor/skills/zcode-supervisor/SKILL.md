@@ -67,6 +67,20 @@ declare a run stuck from silence alone: peek
 `czs progress <task-dir-or-run.json> --last 3` first (one bounded line per
 heartbeat, zero context cost), and monitor any side with `czs codex-status`.
 
+Capability + latency conventions (2026-11-03):
+
+* **Know the worker's skills before dispatching**: `czs skills <zcode|codex|dsh>`
+  (or the hub `list_skills` tool) lists name + description; NAME the relevant
+  skills explicitly in the task prompt so the worker uses them instead of
+  improvising. Delegate receipts also carry a bounded `worker_skills` list.
+* **Prefer the warm topology for repeated work**: keep the hub connected as a
+  persistent MCP server (`czs hub serve`) and register zcode contracts with an
+  explicit `"mode": "resident"` — the shared warm process sets up in 94/68ms
+  versus 604ms cold. Old contracts without a mode keep their cold default.
+* **Status never queues**: the hub `task_status` tool (or `czs progress`)
+  reads running tasks' heartbeat ledgers directly — check it before assuming
+  a worker is stuck.
+
 This sends real ZCode model requests and consumes that computer's quota. Existing
 user authorization for the task carries through; installing the plugin alone
 does not authorize arbitrary work or an unbounded experiment.
@@ -96,8 +110,9 @@ The optional evidence MCP is read-only and does not execute ZCode tasks.
 
 The tri-agent orchestration hub (`czs-hub`, also in `docs/USAGE.md`) exposes a
 contract-gated MCP control plane: any installed agent can delegate read or
-write tasks to the other installed workers through human-registered
-contracts, with per-command approvals and conservative session readback.
+write tasks to the other installed workers (zcode / codex / dsh) through
+human-registered contracts, with per-command approvals and conservative
+session readback.
 
 Keep a minimal external handoff for long-running coordination. At phase changes
 or material context pressure, use the host's supported context maintenance or a

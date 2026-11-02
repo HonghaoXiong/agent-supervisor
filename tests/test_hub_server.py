@@ -27,7 +27,7 @@ from zcode_supervisor.codex_driver import CodexRunReceipt
 from zcode_supervisor.runtime import Config
 
 TOOL_NAMES = ["delegate", "health", "list_sessions", "list_skills",
-              "list_workers", "read_context"]
+              "list_workers", "read_context", "task_status"]
 
 
 class StreamingAdmissionTests(unittest.TestCase):
@@ -1489,18 +1489,20 @@ class ListSkillsTests(HubFixture):
         (nested / "SKILL.md").write_text("x", encoding="utf-8")
         roots.append((cache, "**/skills/*/SKILL.md"))
         listing = H.list_skills_impl("zcode", roots=roots)
-        # the same name under two different roots is listed once per root
+        # 2026-11-03: duplicates collapse to the FIRST root in order — one
+        # capability per name for the orchestrator.
         self.assertEqual([entry["name"] for entry in listing["skills"]],
-                         ["alpha", "alpha", "beta", "beta", "gamma"])
-        roots_seen = {entry["root"] for entry in listing["skills"]}
-        self.assertEqual(roots_seen, {str(roots[0][0]), str(roots[1][0]), str(cache)})
+                         ["alpha", "beta", "gamma"])
+        self.assertEqual(listing["duplicates_collapsed"], 2)
+        by_name = {entry["name"]: entry for entry in listing["skills"]}
+        self.assertEqual(by_name["alpha"]["root"], str(roots[0][0]))
         gamma = listing["skills"][-1]
         self.assertEqual(gamma["root"], str(cache))
         self.assertNotIn("secret body", json.dumps(listing))
 
     def test_invalid_worker_is_refused(self):
         with self.assertRaises(H.HubError):
-            H.list_skills_impl("dsh")
+            H.list_skills_impl("claude")
 
 
 class StdoutIsolationTests(HubFixture):

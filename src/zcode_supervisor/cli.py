@@ -161,6 +161,12 @@ def parser():
                               help='DSH home override (default ~/.dsh)')
     codex_status.add_argument('--json', action='store_true',
                               help='Machine-readable JSON instead of compact lines')
+    skills_cmd = sub.add_parser(
+        'skills', help="List one worker's installed skills (name + description); "
+                       'no model calls, no config needed')
+    skills_cmd.add_argument('worker', help='zcode | codex | dsh')
+    skills_cmd.add_argument('--json', action='store_true',
+                            help='Machine-readable JSON instead of compact lines')
     habits = sub.add_parser('habits', help='Import or inspect user ZCode habits; no model calls')
     habits_sub = habits.add_subparsers(dest='habit_action', required=True)
     habits_import = habits_sub.add_parser(
@@ -209,6 +215,20 @@ def _hub_action(args, config) -> int:
         except contracts.ContractError as error:
             print(json.dumps({'ok': False, 'error': str(error)}, ensure_ascii=False))
             return 1
+        # Latency hint (2026-11-03): a zcode contract without an explicit
+        # mode keeps its legacy cold default; recommending resident keeps
+        # the old-contract promise intact while steering new registrations
+        # to the warm shared process.
+        try:
+            raw = json.loads(Path(args.file).read_text())
+            if (isinstance(raw, dict) and raw.get('worker') == 'zcode'
+                    and 'mode' not in raw):
+                result['recommendation'] = (
+                    'no explicit mode: this contract stays on the cold default; '
+                    'new zcode contracts can declare "mode": "resident" for the '
+                    'shared warm process (94/68ms setup vs 604ms cold)')
+        except (OSError, ValueError):
+            pass
         print(json.dumps(result, ensure_ascii=False, indent=2))
         return 0
     if args.hub_action == 'health':
@@ -261,6 +281,25 @@ def main(argv=None):
                 print(json.dumps(document, ensure_ascii=False, indent=2))
             else:
                 print(render_text(document))
+            return 0
+        if args.action == 'skills':
+            from .hub_server import list_skills_impl
+            try:
+                listing = list_skills_impl(args.worker)
+            except ValueError as error:
+                print(json.dumps({'ok': False, 'error': str(error)[:300]},
+                                 ensure_ascii=False))
+                return 1
+            if args.json:
+                print(json.dumps(listing, ensure_ascii=False, indent=2))
+            else:
+                print(f"{listing['worker']}: {listing['count']} skills"
+                      + (f" ({listing['duplicates_collapsed']} duplicates collapsed)"
+                         if listing.get('duplicates_collapsed') else ''))
+                for entry in listing['skills']:
+                    desc = f" — {entry['description']}" if entry.get('description') else ''
+                    source = entry['root'].rstrip('/').rsplit('/', 1)[-1]
+                    print(f"  {entry['name']}{desc}  [{source}]")
             return 0
         config = load_config(args.config)
         if args.action == 'doctor':

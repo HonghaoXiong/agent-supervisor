@@ -95,6 +95,7 @@ __all__ = [
     "list_sessions_impl",
     "read_context_impl",
     "list_skills_impl",
+    "task_status_impl",
     "delegate_impl",
     "default_dsh_runner",
     "default_zcode_runner",
@@ -107,7 +108,8 @@ HEALTH_FILENAME = "health.json"
 SESSIONS_PAGE_DEFAULT = 20
 SESSIONS_PAGE_MAX = 50
 CONTEXT_MAX_ITEMS_MAX = 50
-SKILLS_NOTE = "names and source roots only; SKILL.md bodies are never read"
+SKILLS_NOTE = ("names, source roots and the frontmatter description line only; "
+               "SKILL.md bodies are never read")
 
 DEFAULT_SKILL_ROOTS: dict[str, tuple[tuple[Path, str], ...]] = {
     "codex": (
@@ -120,6 +122,12 @@ DEFAULT_SKILL_ROOTS: dict[str, tuple[tuple[Path, str], ...]] = {
               "bundled-skills/skills"), "*/SKILL.md"),
         (Path.home() / ".zcode" / "cli" / "plugins" / "cache",
          "**/skills/*/SKILL.md"),
+    ),
+    # dsh harness skills (2026-11-03): per-profile trees exist but the user
+    # level ~/.dsh/skills is the reviewed, named surface (the same roots the
+    # dsh AGENTS.md documents).
+    "dsh": (
+        (Path.home() / ".dsh" / "skills", "*/SKILL.md"),
     ),
 }
 
@@ -617,22 +625,149 @@ def read_context_impl(config, task_id, offset=0, max_items=30) -> dict:
 # Skills
 # --------------------------------------------------------------------------
 
+# Per-SKILL.md cache: the glob is cheap, frontmatter reads are not — entries
+# are re-read only when a file's mtime moved (2026-11-03 latency work).
+_skills_cache: dict[str, tuple[float, str, str | None]] = {}
+_FRONTMATTER_BYTES = 4096
+_DESCRIPTION_LIMIT = 160
+
+
+def _skill_description(path: Path) -> str | None:
+    """The frontmatter ``description`` line only; bodies are never read."""
+    try:
+        head = path.open("rb").read(_FRONTMATTER_BYTES).decode("utf-8",
+                                                               errors="replace")
+    except OSError:
+        return None
+    lines = head.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return None
+    for line in lines[1:]:
+        stripped = line.strip()
+        if stripped == "---":
+            break
+        if stripped.startswith("description:"):
+            value = stripped[len("description:"):].strip().strip('"').strip("'")
+            return value[:_DESCRIPTION_LIMIT] or None
+    return None
+
+
 def list_skills_impl(worker, roots=None) -> dict:
-    """Enumerate skill names per source root; SKILL.md bodies are never read."""
+    """Enumerate one worker's skills: name, source root, description line.
+
+    Duplicate names (the same skill installed at several roots, e.g. plugin
+    cache copies) collapse to the FIRST root in declaration order — the
+    orchestrator sees one capability per name. Frontmatter is read through a
+    bounded prefix only, mtime-cached; bodies are never read.
+    """
     if worker not in DEFAULT_SKILL_ROOTS:
-        raise HubError("invalid-argument", 'worker must be "codex" or "zcode"')
+        raise HubError("invalid-argument",
+                       'worker must be one of "codex", "zcode", "dsh"')
     scanned = list(roots) if roots is not None else DEFAULT_SKILL_ROOTS[worker]
     skills: list[dict] = []
+    seen: set[str] = set()
+    duplicates = 0
     for root, pattern in scanned:
         root = Path(root)
         if not root.is_dir():
             continue
         for marker in sorted(root.glob(pattern)):
-            if marker.name == "SKILL.md":
-                skills.append({"name": marker.parent.name, "root": str(root)})
-    skills.sort(key=lambda entry: (entry["name"], entry["root"]))
+            if marker.name != "SKILL.md":
+                continue
+            name = marker.parent.name
+            if name in seen:
+                duplicates += 1
+                continue
+            seen.add(name)
+            key = str(marker)
+            try:
+                mtime = marker.stat().st_mtime
+            except OSError:
+                continue
+            cached = _skills_cache.get(key)
+            if cached is None or cached[0] != mtime:
+                cached = (mtime, key, _skill_description(marker))
+                _skills_cache[key] = cached
+            skills.append({"name": name, "root": str(root),
+                           "description": cached[2]})
+    skills.sort(key=lambda entry: entry["name"])
     return {"hub_tool_version": HUB_TOOL_VERSION, "worker": worker,
-            "skills": skills, "count": len(skills), "note": SKILLS_NOTE}
+            "skills": skills, "count": len(skills),
+            "duplicates_collapsed": duplicates, "note": SKILLS_NOTE}
+
+
+def worker_skill_names(worker, limit=40) -> list[str]:
+    """Bounded name list for delegate receipts (cache-backed, never raises)."""
+    try:
+        listing = list_skills_impl(worker)
+    except Exception:  # noqa: BLE001 - advertisement must never fail a dispatch
+        return []
+    return [entry["name"] for entry in listing["skills"]][:max(1, limit)]
+
+
+# --------------------------------------------------------------------------
+# Task status (super-agent reserved-slot pattern: status reads never queue
+# behind running work — they read the heartbeat ledgers directly)
+# --------------------------------------------------------------------------
+
+def task_status_impl(config, task_id=None, limit=10) -> dict:
+    """Recent hub tasks with live heartbeat verdicts for running ones.
+
+    Terminal tasks report their recorded status/outcome; a task still marked
+    running is enriched with the :mod:`zcode_supervisor.progress` liveness
+    verdict from its heartbeat ledger (searching both the delegate evidence
+    dir and the zcode run dir under work_root).
+    """
+    from .progress import liveness
+
+    tasks_dir = _tasks_dir(config)
+    entries: list[dict] = []
+    if tasks_dir.is_dir():
+        records = sorted(tasks_dir.glob("*.json"),
+                         key=lambda path: path.stat().st_mtime if path.exists()
+                         else 0, reverse=True)
+        if task_id is not None:
+            records = [path for path in records if path.stem == task_id]
+        for path in records[:max(1, limit)]:
+            try:
+                record = json.loads(common.read_regular(path))
+            except (OSError, ValueError):
+                continue
+            entry = {
+                "task_id": record.get("task_id"),
+                "worker": record.get("worker"),
+                "mode": record.get("mode"),
+                "contract_id": record.get("contract_id"),
+                "status": record.get("status"),
+                "outcome": record.get("outcome"),
+                "updated": record.get("updated"),
+            }
+            if record.get("status") == "running":
+                for directory in _task_ledger_dirs(config, record):
+                    verdict = liveness(directory)
+                    if verdict.get("state") != "unknown":
+                        entry["heartbeat"] = {
+                            key: verdict.get(key)
+                            for key in ("state", "age_s", "last", "outcome")
+                            if verdict.get(key) is not None}
+                        break
+            entries.append(entry)
+    if task_id is not None and not entries:
+        raise HubError("unknown-task", f"no hub task record for {task_id!r}")
+    return {"hub_tool_version": HUB_TOOL_VERSION, "tasks": entries,
+            "count": len(entries)}
+
+
+def _task_ledger_dirs(config, record) -> list[Path]:
+    """Candidate directories holding a running task's progress ledger."""
+    candidates: list[Path] = []
+    evidence = record.get("evidence_dir")
+    if isinstance(evidence, str) and evidence:
+        candidates.append(Path(evidence))
+    task_id = record.get("task_id")
+    if isinstance(task_id, str) and task_id:
+        candidates.append(Path(config.work_root) / "hub-tasks" / task_id)
+    return candidates
 
 
 # --------------------------------------------------------------------------
@@ -1104,6 +1239,7 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
     record: dict = {
         "task_id": task_id,
         "worker": worker,
+        "mode": mode,
         "status": "running",
         "initiator": {"agent": initiator["agent"],
                       "session_id": initiator["session_id"]},
@@ -1442,6 +1578,9 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         "session_locator": locator,
         "evidence_dir": str(evidence_dir),
         "duration_s": round(time.monotonic() - started, 3),
+        # Capability advertisement (2026-11-03): the orchestrator learns what
+        # this worker can be asked to use, one bounded name list per receipt.
+        "worker_skills": worker_skill_names(worker),
         **result_payload,
     }
     if error_text:
@@ -1458,15 +1597,14 @@ def _tools() -> list[dict]:
         {
             "name": "health",
             "description": "Worker health view: human-approved health.json merged with "
-                           "live discovery (codex/zcode configured in P0, dsh absent), "
-                           "plus the degraded-routing non-equivalence note.",
+                           "live discovery (codex/zcode/dsh), plus the "
+                           "degraded-routing non-equivalence note.",
             "inputSchema": {"type": "object", "properties": {},
                             "additionalProperties": False},
         },
         {
             "name": "list_workers",
-            "description": "Installed workers with path/version/status; dsh is always "
-                           "reported absent on this host in P0.",
+            "description": "Installed workers (codex/zcode/dsh) with path/status.",
             "inputSchema": {"type": "object", "properties": {},
                             "additionalProperties": False},
         },
@@ -1494,21 +1632,35 @@ def _tools() -> list[dict]:
         },
         {
             "name": "list_skills",
-            "description": "Skill names per source root for one worker; SKILL.md bodies "
-                           "are never read.",
+            "description": "One worker's installed skills (name, source root, frontmatter "
+                           "description line; duplicates collapsed). Check before "
+                           "dispatching so prompts can name the skills to use.",
             "inputSchema": {"type": "object", "properties": {
-                "worker": {"type": "string", "enum": ["codex", "zcode"]},
+                "worker": {"type": "string", "enum": ["codex", "zcode", "dsh"]},
             }, "required": ["worker"], "additionalProperties": False},
+        },
+        {
+            "name": "task_status",
+            "description": "Recent hub tasks with live heartbeat verdicts for running "
+                           "ones (reads progress ledgers directly — status queries "
+                           "never queue behind running work).",
+            "inputSchema": {"type": "object", "properties": {
+                "task_id": {"type": "string"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 50},
+            }, "additionalProperties": False},
         },
         {
             "name": "delegate",
             "description": "Dispatch one human-registered contract to its worker. "
                            "zcode: mode cold (czs protocol executor) or resident "
-                           "(shared resident process); codex: mode exec "
-                           "(codex exec -s read-only, strict output_schema) or "
-                           "app-server (approval callbacks brokered through the "
-                           "contract Authority under the untrusted approval "
-                           "policy). MCP exposure is not approval: an "
+                           "(shared resident process, recommended for latency); "
+                           "codex: mode exec (codex exec -s read-only, strict "
+                           "output_schema) or app-server (approval callbacks "
+                           "brokered through the contract Authority under the "
+                           "untrusted approval policy); dsh: mode headless "
+                           "(NDJSON event stream as heartbeat; no approval "
+                           "layer — the registered contract is the control). "
+                           "MCP exposure is not approval: an "
                            "unregistered or incomplete contract is refused.",
             "inputSchema": {"type": "object", "properties": {
                 "contract_id": {"type": "string"},
@@ -1597,7 +1749,12 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
                     arguments.get("offset", 0),
                     arguments.get("max_items", 30))
             elif name == "list_skills":
-                value = list_skills_impl(arguments.get("worker"))
+                value = await _offload_read(list_skills_impl,
+                                            arguments.get("worker"))
+            elif name == "task_status":
+                value = await _offload_read(task_status_impl,
+                                            config, arguments.get("task_id"),
+                                            arguments.get("limit", 10))
             elif name == "delegate":
                 value = await delegate_impl(
                     config, evidence_root,
