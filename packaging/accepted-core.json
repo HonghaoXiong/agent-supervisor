@@ -100,8 +100,8 @@
       "sha256": "620d0630a7e33b41b0eb205ac2478f32522ba4cd1462d53335ab212fa9047100"
     },
     "src/zcode_supervisor/runtime.py": {
-      "blob": "0abb53b7b75050a045f62f3d3e3fa548c9e36b89",
-      "sha256": "5c87a9fd3725ccade0c0d8dffb0711bba17fe0b7b4f17d70cdec0ff94eba12ab"
+      "blob": "65bc7712b41f85e2f0be11c5ca7fcddb939e787f",
+      "sha256": "0ccfa06583eec9083ff64f359cbe9aa3025ac6bf1758c5548775c05ddd1f782b"
     },
     "src/zcode_supervisor/session_reader.py": {
       "blob": "68d0ae3ee7a80bcc3cf9cfe5afc643d05b35f6f1",
@@ -145,5 +145,5 @@
     }
   },
   "refreshed_at": "2026-11-03",
-  "refresh_reason": "v0.2.1 release: progress ledger + stall semantics, monitor commands, dsh hub worker; template docs and plugin manifests bumped"
+  "refresh_reason": "v0.2.1 release: progress ledger + stall semantics, monitor commands, dsh hub worker; template docs and plugin manifests bumped; runtime.py re-pinned to carry the 2026-10-31 CLI 0.17.1 bundle pin forward"
 }
