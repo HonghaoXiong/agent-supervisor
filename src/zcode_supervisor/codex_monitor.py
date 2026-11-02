@@ -46,6 +46,30 @@ _MESSAGE_TYPES = {"message", "agent_message"}
 _HARNESS_FRAME = re.compile(r"^\[\d+\] ")
 
 
+def _clip_text(value) -> str | None:
+    """Clip a display string; non-strings (agent-controlled shapes) drop."""
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.split())[:TEXT_LIMIT]
+
+
+_DISPLAY_CHARS = set("abcdefghijklmnopqrstuvwxyz"
+                     "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_./-")
+
+
+def _display_token(value, limit=64) -> str:
+    """Bounded identifier for DISPLAY columns (adds '/' to the token set).
+
+    Distinct from progress.safe_token on purpose: the ledger's fixed-charset
+    whitelist is evidence discipline, while these one-line view fields only
+    need agent-shaped garbage reduced and length bounded.
+    """
+    if not isinstance(value, str):
+        return "?"
+    kept = "".join(ch for ch in value[:limit * 4] if ch in _DISPLAY_CHARS)[:limit]
+    return kept or "?"
+
+
 def _default_codex_home(explicit=None) -> Path:
     return Path(explicit).expanduser() if explicit is not None \
         else Path.home() / ".codex"
@@ -90,30 +114,57 @@ def _clip(value) -> str:
     return " ".join(str(value).split())[:TEXT_LIMIT]
 
 
+def _ts(record) -> str:
+    """Bounded hh:mm:ss slice of a record timestamp; never trusts the type."""
+    value = record.get("timestamp")
+    if not isinstance(value, str):
+        return ""
+    return value[11:19] if len(value) >= 19 else value
+
+
+def _content_text(payload) -> str:
+    """Concatenate ONLY string text parts; agent-shaped garbage drops."""
+    parts = payload.get("content")
+    if not isinstance(parts, list):
+        return ""
+    return "\n".join(part.get("text") for part in parts
+                     if isinstance(part, dict)
+                     and isinstance(part.get("text"), str)
+                     and part.get("text"))
+
+
 def tail_summary(path, max_items=6):
     """Bounded tail digest of one rollout: meta + last message-ish records.
 
     Only ``response_item`` records of type ``message``/``agent_message``
     contribute text (clipped); every record type is counted. Raw payloads
-    (tokens, provider blobs, secrets) never leave this function.
+    (tokens, provider blobs, secrets) never leave this function. Malformed
+    shapes degrade to counts/omissions — one bad rollout never raises.
     """
     path = Path(path)
     meta_record = _first_line(path)
     meta = {}
     if isinstance(meta_record, dict) and meta_record.get("type") == "session_meta":
-        payload = meta_record.get("payload") if isinstance(meta_record.get("payload"), dict) else {}
-        meta = {"cwd": payload.get("cwd"),
-                "branch": (payload.get("git") or {}).get("branch"),
-                "cli_version": payload.get("cli_version")}
-    size = path.stat().st_size
+        payload = meta_record.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        git = payload.get("git")
+        git = git if isinstance(git, dict) else {}
+        meta = {"cwd": _clip_text(payload.get("cwd")),
+                "branch": _clip_text(git.get("branch")),
+                "cli_version": _clip_text(payload.get("cli_version"))}
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > _TAIL_BYTES:
+                handle.seek(max(0, size - _TAIL_BYTES))
+                handle.readline()  # drop the possibly-cut first line
+            raw = handle.read(_TAIL_BYTES).decode("utf-8", errors="replace")
+    except OSError as error:
+        return {"meta": meta, "error": f"unreadable tail: {error}",
+                "tail_type_counts": {}, "recent": []}
     counts: Counter = Counter()
     items = []
     last_ts = None
-    with path.open("rb") as handle:
-        if size > _TAIL_BYTES:
-            handle.seek(max(0, size - _TAIL_BYTES))
-            handle.readline()  # drop the possibly-cut first line
-        raw = handle.read().decode("utf-8", errors="replace")
     for line in raw.splitlines():
         try:
             record = json.loads(line)
@@ -123,37 +174,33 @@ def tail_summary(path, max_items=6):
         if not isinstance(record, dict):
             continue
         rtype = record.get("type")
-        ptype = (record.get("payload") or {}).get("type") \
-            if isinstance(record.get("payload"), dict) else None
-        key = f"{rtype}/{ptype}"
+        payload = record.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        ptype = payload.get("type")
+        key = f"{_display_token(rtype, 24)}/{_display_token(ptype, 24)}"
         counts[key] += 1
-        if record.get("timestamp"):
-            last_ts = record["timestamp"]
+        timestamp = record.get("timestamp")
+        if isinstance(timestamp, str):
+            last_ts = timestamp
         if rtype != "response_item" or ptype not in _MESSAGE_TYPES:
             continue
-        payload = record.get("payload") or {}
         if ptype == "message":
             role = payload.get("role")
             if role not in ("user", "assistant"):
                 continue
-            text = "\n".join(part.get("text", "") for part in payload.get("content", [])
-                             if isinstance(part, dict) and part.get("text"))
+            text = _content_text(payload)
             # Skip harness-injected frames (instructions/annotations and
             # multi-agent wire copies). Real user turns here are plain text.
             visible = text.lstrip()
             if role == "user" and (visible.startswith("#") or visible.startswith("<")
                                    or _HARNESS_FRAME.match(visible)):
                 continue
-            items.append({"ts": (record.get("timestamp") or "")[11:19],
-                          "kind": role, "text": _clip(text)})
+            items.append({"ts": _ts(record), "kind": role, "text": _clip(text)})
         else:
-            parts = payload.get("content") or []
-            text = "\n".join(part.get("text", "") for part in parts
-                             if isinstance(part, dict) and part.get("text"))
-            items.append({"ts": (record.get("timestamp") or "")[11:19],
-                          "kind": f"agent:{payload.get('author') or '?'}"
-                                  f"->{payload.get('recipient') or '?'}",
-                          "text": _clip(text)})
+            text = _content_text(payload)
+            kind = (f"agent:{_display_token(payload.get('author') or '?', 48)}"
+                    f"->{_display_token(payload.get('recipient') or '?', 48)}")
+            items.append({"ts": _ts(record), "kind": kind, "text": _clip(text)})
     return {"meta": meta, "last_timestamp": last_ts,
             "tail_type_counts": dict(counts.most_common(8)),
             "recent": items[-max(1, max_items):]}
@@ -213,11 +260,15 @@ def status(config=None, *, fresh_s=600, max_sessions=5, codex_home=None,
     now = time.time()
     rollouts = []
     for entry in fresh_rollouts(codex_home, fresh_s=fresh_s, limit=max_sessions):
-        rollouts.append({
+        record = {
             "file": entry["path"].name,
             "age_s": round(now - entry["mtime"], 1),
-            **tail_summary(entry["path"]),
-        })
+        }
+        try:
+            record.update(tail_summary(entry["path"]))
+        except Exception as error:  # noqa: BLE001 - one bad file never kills the view
+            record["error"] = f"summarize failed: {error}"[:200]
+        rollouts.append(record)
     return {
         "generated": time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(now)),
         "fresh_window_s": fresh_s,

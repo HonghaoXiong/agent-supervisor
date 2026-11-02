@@ -17,17 +17,28 @@ permissions inside the contract workspace. The control is the human-registered
 contract plus before/after inventory evidence recorded by the hub; this
 driver claims no brokering. Credentials stay in the dsh profile's own store;
 a missing key surfaces verbatim as an ``error`` outcome.
+
+Process-tree discipline (review P1-1): dsh runs as its OWN process-group
+leader; a timeout terminates the whole group, and a receipt is published as
+``delivered`` only when BOTH pump threads have finished — a descendant that
+inherits the pipes and keeps writing would otherwise mutate finalized
+evidence after the fact. If the streams cannot be settled, the private
+partials are quarantined (never renamed into final evidence names) and the
+run fails with ``error``.
 """
 
 from __future__ import annotations
 
 import json
+import math
+import os
+import signal
 import subprocess
 import threading
 import time
 from pathlib import Path
 
-from .progress import ProgressLedger
+from .progress import ProgressLedger, safe_token
 
 __all__ = ["DSH_MODES", "DshRunError", "run_headless"]
 
@@ -38,6 +49,8 @@ _LEDGER_NAME = "dsh.progress.jsonl"
 _RAW_STDOUT_PARTIAL = ".dsh-stdout.partial"
 _RAW_STDERR_PARTIAL = ".dsh-stderr.partial"
 _TERMINATE_GRACE_S = 5.0
+_MAX_LINE_BYTES = 1 << 20
+_OVERSIZE_NOTE = "[oversize line discarded]"
 #: Generous default: one max-thinking generation of a large file can stay
 #: silent for minutes; only real silence beyond this is a stall.
 DEFAULT_STALL_TIMEOUT_S = 900.0
@@ -47,13 +60,48 @@ class DshRunError(ValueError):
     """Invalid dispatch parameters (never a worker failure)."""
 
 
+def _iter_lines_bounded(stream, cap=_MAX_LINE_BYTES):
+    """Yield newline-terminated lines; a pathological line yields ``None``.
+
+    ``readline(cap)`` keeps streaming semantics (returns on newline), while
+    the cap bounds buffering when a worker emits megabytes without a break
+    (review P2-4): one ``None`` marks the discarded line, reading then
+    resumes at the next newline.
+    """
+    buffer = ""
+    while True:
+        chunk = stream.readline(cap - len(buffer) if buffer else cap)
+        if not chunk:
+            if buffer:
+                yield None
+            return
+        buffer += chunk
+        if buffer.endswith("\n"):
+            yield buffer[:-1]
+            buffer = ""
+        elif len(buffer) >= cap:
+            yield None
+            buffer = ""
+            while True:
+                chunk = stream.readline(cap)
+                if not chunk:
+                    return
+                if chunk.endswith("\n"):
+                    break
+
+
 def _pump_stdout(stream, raw_path: Path, state: dict, ledger: ProgressLedger,
                  pump_error: dict) -> None:
     """Stream stdout lines to the raw file; note one heartbeat per event."""
     try:
         with raw_path.open("a", encoding="utf-8") as sink:
-            for line in stream:
-                sink.write(line)
+            for line in _iter_lines_bounded(stream):
+                if line is None:
+                    sink.write(_OVERSIZE_NOTE + "\n")
+                    sink.flush()
+                    ledger.note("dsh", "oversize-line")
+                    continue
+                sink.write(line + "\n")
                 sink.flush()
                 stripped = line.strip()
                 if not stripped:
@@ -65,9 +113,9 @@ def _pump_stdout(stream, raw_path: Path, state: dict, ledger: ProgressLedger,
                     continue
                 if not isinstance(event, dict):
                     continue
-                etype = str(event.get("type") or "?")
-                phase = event.get("phase")
-                detail = f"{etype}:{phase}" if phase else etype
+                etype = safe_token(event.get("type") or "?", 16)
+                phase = safe_token(event.get("phase"), 12)
+                detail = f"{etype}:{phase}" if phase != "?" else etype
                 ledger.note("dsh", detail, turn=event.get("turn"))
                 if etype == "session" and not state.get("session_id"):
                     state["session_id"] = event.get("sessionId")
@@ -85,8 +133,8 @@ def _pump_stdout(stream, raw_path: Path, state: dict, ledger: ProgressLedger,
 def _pump_stderr(stream, raw_path: Path, pump_error: dict) -> None:
     try:
         with raw_path.open("a", encoding="utf-8") as sink:
-            for line in stream:
-                sink.write(line)
+            for line in _iter_lines_bounded(stream):
+                sink.write((line if line is not None else _OVERSIZE_NOTE) + "\n")
                 sink.flush()
     except Exception as error:  # noqa: BLE001
         pump_error["error"] = str(error)
@@ -100,6 +148,29 @@ def _write_stdin(stream, data: str) -> None:
         try:
             stream.close()
         except Exception:  # noqa: BLE001 - broken pipe just ends input
+            pass
+
+
+def _kill_group(process: subprocess.Popen, sig: int) -> None:
+    """Signal the child's whole process group.
+
+    ``start_new_session=True`` made the child its own session AND group
+    leader, so its pid IS the pgid — usable even after the leader itself was
+    reaped (``os.getpgid`` on a reaped pid fails, but the group with its
+    surviving members persists under the same id).
+    """
+    try:
+        os.killpg(process.pid, sig)
+        return
+    except (ProcessLookupError, PermissionError, OSError):
+        pass
+    if process.returncode is None:
+        try:
+            if sig == signal.SIGKILL:
+                process.kill()
+            else:
+                process.terminate()
+        except OSError:
             pass
 
 
@@ -121,8 +192,9 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
         raise DshRunError("task must be a non-empty prompt string")
     for label, value in (("wall_timeout_s", wall_timeout_s),
                          ("stall_timeout_s", stall_timeout_s)):
-        if not isinstance(value, (int, float)) or value <= 0:
-            raise DshRunError(f"{label} must be positive seconds")
+        if (isinstance(value, bool) or not isinstance(value, (int, float))
+                or not math.isfinite(value) or value <= 0):
+            raise DshRunError(f"{label} must be finite positive seconds")
     workspace = Path(workspace)
     evidence_dir = Path(evidence_dir)
     evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -150,7 +222,7 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
         process = subprocess.Popen(  # argv is fully driver-controlled
             argv, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, cwd=str(workspace),
-            env=environment)
+            env=environment, start_new_session=True)
     except OSError as error:
         ledger.finalize("launch-error")
         receipt = {"outcome": "launch-error",
@@ -183,40 +255,63 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
             if reason is None:
                 continue
             timed_out = reason
-            process.terminate()
+            _kill_group(process, signal.SIGTERM)
             try:
                 process.wait(timeout=_TERMINATE_GRACE_S)
             except subprocess.TimeoutExpired:
-                process.kill()
+                _kill_group(process, signal.SIGKILL)
                 process.wait()
             break
+    stdin_writer.join(timeout=1.0)
     stdout_pump.join(timeout=_TERMINATE_GRACE_S)
     stderr_pump.join(timeout=_TERMINATE_GRACE_S)
-    stdin_writer.join(timeout=1.0)
-    # Atomic finalize: rename the private partials onto their final names so
-    # a crash never leaves a half-written evidence file behind.
-    for partial, final in ((raw_stdout, events_file),
-                           (raw_stderr, stderr_file)):
-        if partial.exists():
-            partial.replace(final)
+    if stdout_pump.is_alive() or stderr_pump.is_alive():
+        # A descendant inherited the pipes and still holds them open: kill
+        # the whole group again, then give the pumps a final window. A
+        # receipt must never be published while evidence can still change.
+        _kill_group(process, signal.SIGKILL)
+        stdout_pump.join(timeout=_TERMINATE_GRACE_S)
+        stderr_pump.join(timeout=_TERMINATE_GRACE_S)
+    streams_settled = not stdout_pump.is_alive() and not stderr_pump.is_alive()
+    if streams_settled:
+        # Atomic finalize: rename the private partials onto their final names
+        # only once no writer can exist anymore.
+        for partial, final in ((raw_stdout, events_file),
+                               (raw_stderr, stderr_file)):
+            if partial.exists():
+                partial.replace(final)
+        evidence_note = None
+    else:
+        # Quarantine (review P1-1): keep the private partials under their
+        # dot-names — they are NOT the finalized evidence — and fail the run.
+        evidence_note = ("evidence streams still open (a descendant holds the "
+                         "dsh pipes); partial evidence retained unpublished")
 
     turn_end = state.get("turn_end_reason")
     final_text = state.get("final_text")
     exit_code = process.returncode
-    if timed_out == "stall":
+    if not streams_settled:
+        outcome = "error"
+        error_text = evidence_note
+    elif timed_out == "stall":
         outcome = "timeout-stall"
+        error_text = None
     elif timed_out == "wall":
         outcome = "timeout-wall"
+        error_text = None
     elif isinstance(turn_end, dict) and turn_end.get("kind") == "error":
         outcome = "error"
+        error_text = None
     elif exit_code != 0:
         outcome = "error"
+        error_text = None
     elif isinstance(final_text, str) and final_text.strip():
         outcome = "delivered"
+        error_text = None
     else:
         outcome = "error"
-    error_text = None
-    if outcome == "error":
+        error_text = None
+    if outcome == "error" and error_text is None:
         if isinstance(turn_end, dict):
             inner = turn_end.get("error")
             error_text = (inner.get("message") if isinstance(inner, dict)
@@ -232,8 +327,8 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
         "exit_code": exit_code,
         "timed_out": timed_out,
         "error": error_text,
-        "events_file": str(events_file),
-        "stderr_file": str(stderr_file),
+        "events_file": str(events_file if streams_settled else raw_stdout),
+        "stderr_file": str(stderr_file if streams_settled else raw_stderr),
         "duration_s": round(time.monotonic() - started, 3),
         "progress": ledger.summary(),
     }

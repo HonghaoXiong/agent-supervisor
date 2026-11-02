@@ -3,14 +3,18 @@
 The hub is the single dispatch point a decision-layer agent (any installed
 agent) drives over MCP. Shape:
 
-* **Two workers configured, each with two modes** — zcode (``cold`` via the
-  czs protocol executor, ``resident`` on one shared resident process) and
-  codex (``exec`` via ``codex exec -s read-only``, ``app-server`` with
-  approval callbacks brokered through the contract Authority); ``dsh`` is
-  always reported absent and is never dispatched;
+* **Three workers configured** — zcode (``cold`` via the czs protocol
+  executor, ``resident`` on one shared resident process), codex (``exec`` via
+  ``codex exec -s read-only``, ``app-server`` with approval callbacks
+  brokered through the contract Authority), and dsh (``headless`` via
+  ``dsh --profile headless --json`` — no approval layer, the registered
+  contract IS the control and the hub adds before/after inventory evidence,
+  2026-11-03);
 * **Write paths follow the contract layer's live-verified mode rules** (see
   :mod:`zcode_supervisor.contracts`): zcode brokers allowed_files/commands in
-  both modes, codex only in app-server mode under workspace-write;
+  both modes, codex only in app-server mode under workspace-write, dsh writes
+  freely inside its one-shot workspace (acceptance compares against
+  allowed_files, never a broker);
 * **Shared frozen workspaces** — the czs inventory-hash freeze still governs
   zcode runs, and codex runs take the same per-workspace advisory lock so
   writes to one workspace stay serialized across vendors;
@@ -1027,7 +1031,8 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         ) from error
 
     worker = contract["worker"]
-    mode = contract.get("mode") or ("cold" if worker == "zcode" else "exec")
+    mode = contract.get("mode") or {"zcode": "cold", "dsh": "headless"}.get(
+        worker, "exec")
     # P0.4 sideband UI projection (never part of the delegate result): the
     # default emitter is env-gated and ON by default (default flipped
     # 2026-10-24; rollback switch CZS_UI_EVENTS=0); the default initiator
@@ -1072,7 +1077,11 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
     if dsh_runner is None:
         dsh_runner = default_dsh_runner
     effective_dsh_path = resolution["workers"].get("dsh", {}).get("path")
-    if worker == "dsh" and effective_dsh_path is None:
+    if worker == "dsh" and effective_dsh_path is None \
+            and dsh_runner is default_dsh_runner:
+        # Mirrors the codex path: an INJECTED runner may drive its own
+        # transport (offline tests), only the production runner needs the
+        # host CLI.
         raise HubError("worker-unavailable",
                        "dsh CLI not found on this host; cannot dispatch")
     effective_codex_path = codex_path or resolution["workers"].get("codex", {}).get("path")
@@ -1303,21 +1312,25 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             # process exit code stays 0 even on errors — live-verified).
             common.ensure_directory(evidence_dir)
             workspace = Path(contract["workspace"])
-            before = inventory(workspace)
             stall_ms = contract.get("stall_timeout_ms")
             stall_s = (stall_ms / 1000
                        if isinstance(stall_ms, int) and not isinstance(stall_ms, bool)
                        else None)
+            # Review P1-2/P2-5: BOTH inventories stay inside the same
+            # workspace lock as the runner (attribution cannot race a second
+            # dispatched operation), and the hashing is offloaded off the
+            # event loop (it walks up to the workspace's full file budget).
             with common.workspace_lock(workspace, Path(config.state_dir)):
+                before = await _invoke(inventory, workspace)
                 receipt = await _invoke(
                     dsh_runner, effective_dsh_path, workspace,
                     contract["prompt"], evidence_dir,
                     wall_timeout_s=contract["max_timeout_ms"] / 1000,
                     **({"stall_timeout_s": stall_s} if stall_s is not None else {}))
+                after = await _invoke(inventory, workspace)
             receipt = receipt if isinstance(receipt, dict) else {}
             with contextlib.suppress(OSError, ValueError, TypeError):
                 common.write_json(evidence_dir / "dsh-receipt.json", receipt)
-            after = inventory(workspace)
             changed = sorted(name for name in before.keys() | after.keys()
                              if before.get(name) != after.get(name))
             allowed = set(contract.get("allowed_files") or [])

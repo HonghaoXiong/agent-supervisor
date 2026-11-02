@@ -1032,8 +1032,16 @@ async def execute(args, config, ui_emitter=None):
                 and 'exit_event_sink' in constructor:
             client_params['exit_event_sink'] = ui_projection.make_exit_sink(
                 ui_emitter, 'cold', 'zcode')
-        client = ProtocolClient(workspace, output, authority.decide, config,
-                                **client_params)
+        try:
+            client = ProtocolClient(workspace, output, authority.decide, config,
+                                    **client_params)
+        except Exception:
+            # Construction window between ledger creation and the main try:
+            # close/finalize the sidecar so no orphaned running ledger is
+            # left behind (review P2-1), then re-raise the real failure.
+            ledger.finalize('preflight-rejected')
+            ledger.close()
+            raise
         input_id = 'input_'+uuid.uuid4().hex
         def receive_event(event):
             # Native orchestration bookkeeping: every parent turn observed in
@@ -1042,13 +1050,15 @@ async def execute(args, config, ui_emitter=None):
             authority.note_event(event)
             # Heartbeat: one bounded line per received frame (coalesced when
             # chatty); this is what keeps a progressing worker past the stall
-            # budget and what `czs progress` later reads.
+            # budget and what `czs progress` later reads. Both tokens pass
+            # the fixed-charset whitelist so worker-controlled strings can
+            # never carry prompt/code text into the ledger (review P1-3).
             payload = event.get('payload') if isinstance(event, dict) else None
             payload = payload if isinstance(payload, dict) else {}
-            detail = str(event.get('type') or 'event')[:40]
+            detail = progress.safe_token(event.get('type') or 'event', 40)
             token = payload.get('toolName') or payload.get('phase') or payload.get('kind')
             if token:
-                detail = detail+':'+str(token)[:20]
+                detail = detail+':'+progress.safe_token(token, 20)
             ledger.note('event', detail)
             if (event.get('type') == 'turn.started'
                     and event.get('sessionId') == authority.session_id):
@@ -1107,6 +1117,14 @@ async def execute(args, config, ui_emitter=None):
                 result['skill_closure_refused'] = str(error)
                 result['delivery_ok'] = False
                 result['outcome'] = 'preflight-rejected'
+                # Same terminal heartbeat bookkeeping as the main finally:
+                # an early return must not leave an unfinalized ledger or a
+                # held routed subscription behind (review P2-1).
+                ledger.finalize('preflight-rejected')
+                result['progress'] = ledger.summary()
+                ledger.close()
+                if router_sub is not None:
+                    router_sub.release()
                 write_json(output, redact_transport(result))
                 print(json.dumps({'ok': False, 'error': str(error)[:300]}))
                 return False
@@ -1557,10 +1575,16 @@ async def execute(args, config, ui_emitter=None):
                 # post-success audit verdict keeps its more specific category.
                 result['outcome'] = 'scope-error'
             # Terminal heartbeat + bounded summary; the ledger's lines stay in
-            # the sidecar file and never inflate the result JSON.
-            ledger.finalize(result.get('outcome') or 'unknown')
-            result['progress'] = ledger.summary()
-            ledger.close()
+            # the sidecar file and never inflate the result JSON. Sidecar
+            # bookkeeping is isolated so it can never suppress the primary
+            # result write (review P2-1).
+            try:
+                ledger.finalize(result.get('outcome') or 'unknown')
+                result['progress'] = ledger.summary()
+            except Exception:  # noqa: BLE001 - evidence sidecar must not mask the run result
+                pass
+            finally:
+                ledger.close()
             write_json(output,redact_transport(result))
             # P2.2: task-owned routed frames release only after the result
             # (with all its evidence) is finalized and persisted

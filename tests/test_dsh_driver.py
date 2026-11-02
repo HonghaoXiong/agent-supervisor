@@ -126,3 +126,99 @@ class DshDriverRuns(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+# A descendant that exits on its own INSIDE the join grace: its output is
+# legitimately part of the evidence, and the receipt must publish only after
+# the streams settled — i.e. consistent with the finalized file.
+SLOW_DESCENDANT_SCRIPT = """#!/bin/sh
+cat > /dev/null
+( sleep 3; echo '{"type":"final","text":"late-final"}' ) &
+echo '{"type":"session","sessionId":"session-desc2","cwd":"/w"}'
+echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"success"}}'
+echo '{"type":"final","text":"early-final"}'
+exit 0
+"""
+
+# A descendant that NEVER exits: the group kill (child pid IS the pgid, even
+# once the leader was reaped) must settle the pipes so the published evidence
+# can never grow afterwards.
+HANGING_DESCENDANT_SCRIPT = """#!/bin/sh
+cat > /dev/null
+( sleep 60; echo '{"type":"final","text":"late-final"}' ) &
+echo '{"type":"session","sessionId":"session-desc3","cwd":"/w"}'
+echo '{"type":"status","phase":"turn_end","turn":1,"reason":{"kind":"success"}}'
+echo '{"type":"final","text":"early-final"}'
+exit 0
+"""
+
+
+class DshDriverQuarantine(unittest.TestCase):
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.workspace = self.root / "workspace"
+        self.evidence = self.root / "evidence"
+        self.workspace.mkdir()
+
+    def tearDown(self):
+        self.tmp.cleanup()
+
+    def _fake(self, name, body):
+        path = self.root / name
+        path.write_text(body)
+        path.chmod(path.stat().st_mode | stat.S_IEXEC)
+        return path
+
+    def _run(self, executable, **kwargs):
+        return dsh_driver.run_headless(
+            executable, self.workspace, "task", self.evidence, **kwargs)
+
+    def test_slow_descendant_publishes_consistent_immutable_evidence(self):
+        import time as _time
+        receipt = self._run(self._fake("dsh-slow", SLOW_DESCENDANT_SCRIPT),
+                            wall_timeout_s=60, stall_timeout_s=30)
+        events_file = Path(receipt["events_file"])
+        first = events_file.read_text()
+        # receipt agrees with the evidence: the LAST final wins in both
+        self.assertIn("early-final", first)
+        self.assertIn("late-final", first)
+        self.assertEqual(receipt["final_message"], "late-final")
+        _time.sleep(4)
+        self.assertEqual(events_file.read_text(), first)
+
+    def test_hanging_descendant_killed_evidence_immutable(self):
+        import time as _time
+        receipt = self._run(self._fake("dsh-hang", HANGING_DESCENDANT_SCRIPT),
+                            wall_timeout_s=60, stall_timeout_s=30)
+        events_file = Path(receipt["events_file"])
+        first = events_file.read_text()
+        self.assertIn("early-final", first)
+        _time.sleep(4)
+        self.assertEqual(events_file.read_text(), first)
+        self.assertNotIn("late-final", events_file.read_text())
+
+    def test_non_finite_timeouts_rejected(self):
+        executable = self._fake("dsh-ok", SUCCESS_SCRIPT)
+        for bad in (float("nan"), float("inf"), True, 0, -1):
+            with self.assertRaises(dsh_driver.DshRunError):
+                dsh_driver.run_headless(
+                    executable, self.workspace, "task", self.evidence,
+                    wall_timeout_s=bad)
+
+    def test_oversize_line_marked_and_survives(self):
+        script = "#!/bin/sh\ncat > /dev/null\n"
+        script += "python3 - <<'PY2'\n"
+        script += 'print("{\\"type\\":\\"session\\",\\"sessionId\\":\\"s-big\\"}")\n'
+        script += 'print("x" * 2000000)\n'
+        script += 'print("{\\"type\\":\\"final\\",\\"text\\":\\"done\\"}")\n'
+        script += "PY2\n"
+        executable = self._fake("dsh-big", script)
+        receipt = self._run(executable, wall_timeout_s=60)
+        self.assertEqual(receipt["outcome"], "delivered")
+        self.assertEqual(receipt["session_id"], "s-big")
+        ledger_lines = (self.evidence / "dsh.progress.jsonl").read_text()
+        self.assertIn("oversize-line", ledger_lines)
+
+if __name__ == "__main__":
+    unittest.main()

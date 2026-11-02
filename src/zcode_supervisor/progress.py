@@ -26,6 +26,7 @@ does not append, bounding the file to distinct activity.
 from __future__ import annotations
 
 import json
+import math
 import time
 from pathlib import Path
 
@@ -37,6 +38,7 @@ __all__ = [
     "read_last",
     "liveness",
     "locate_ledger",
+    "safe_token",
 ]
 
 COALESCE_WINDOW_S = 2.0
@@ -63,9 +65,25 @@ def resolve_run_budget(timeout_arg, stall_arg):
     else:
         wall = float(timeout_arg)
     for label, value in (("--timeout", wall), ("--stall-timeout", stall)):
-        if value is not None and not 1 <= value <= 86400:
+        if value is not None and (not math.isfinite(value)
+                                  or not 1 <= value <= 86400):
             raise ValueError(f"{label} must be 1–86400 seconds")
     return wall, stall
+
+
+# Fixed character allowlist for ledger tokens: worker-controlled strings are
+# reduced to this set so no prompt/code/model text can ride into the ledger
+# through an event type, tool name or phase (review P1-3).
+_TOKEN_CHARS = set("abcdefghijklmnopqrstuvwxyz"
+                   "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_.-")
+
+
+def safe_token(value, limit=24) -> str:
+    """Whitelist-reduce any value to a short fixed-charset token."""
+    if not isinstance(value, str):
+        return "?"
+    kept = "".join(ch for ch in value[:limit * 4] if ch in _TOKEN_CHARS)[:limit]
+    return kept or "?"
 
 
 class ProgressLedger:
@@ -212,14 +230,22 @@ def locate_ledger(target):
 
 
 def read_last(path, count=5):
-    """Parse the last ``count`` ledger lines with one bounded tail read."""
+    """Parse the last ``count`` ledger lines with one bounded tail read.
+
+    The single ``read`` is capped at ``_TAIL_BYTES`` so an actively growing
+    ledger cannot blow the promised bound (review P2-3); stat/open races
+    surface as an empty result, never an exception.
+    """
     path = Path(path)
-    size = path.stat().st_size
-    with path.open("rb") as handle:
-        if size > _TAIL_BYTES:
-            handle.seek(size - _TAIL_BYTES)
-            handle.readline()  # drop the possibly-cut first line
-        raw = handle.read().decode("utf-8", errors="replace")
+    try:
+        size = path.stat().st_size
+        with path.open("rb") as handle:
+            if size > _TAIL_BYTES:
+                handle.seek(size - _TAIL_BYTES)
+                handle.readline()  # drop the possibly-cut first line
+            raw = handle.read(_TAIL_BYTES).decode("utf-8", errors="replace")
+    except OSError:
+        return []
     records = []
     for line in raw.splitlines():
         try:
@@ -237,13 +263,17 @@ def liveness(target, *, now=None, finished_fallback=None):
     ``finished`` needs either the terminal ``final`` ledger line or a sibling
     result JSON whose outcome field is present. Age is measured from the last
     heartbeat to the file's mtime (readers have no clock shared with the
-    writer, so mtime is the honest observable).
+    writer, so mtime is the honest observable). A ledger that disappears or
+    turns unreadable mid-read reports ``unknown``, never raises.
     """
     path = locate_ledger(target)
     if path is None or not path.is_file():
         return {"state": "unknown", "reason": "no progress ledger found"}
-    records = read_last(path, 1)
-    mtime = path.stat().st_mtime
+    try:
+        records = read_last(path, 1)
+        mtime = path.stat().st_mtime
+    except OSError as error:
+        return {"state": "unknown", "reason": f"ledger unreadable: {error}"}
     reference = time.time() if now is None else now
     age_s = max(0.0, round(reference - mtime, 3))
     last = records[0] if records else None
@@ -255,27 +285,27 @@ def liveness(target, *, now=None, finished_fallback=None):
         state = "finished" if result is not None else "running"
     verdict = {"state": state, "ledger": str(path), "age_s": age_s,
                "last": last}
-    if state == "finished":
-        verdict["outcome"] = (last.get("detail") if last
-                              and last.get("kind") == _FINAL_KIND
-                              else _sibling_outcome(path))
+    if state == "finished" and not (last and last.get("kind") == _FINAL_KIND):
+        verdict["outcome"] = _sibling_outcome(path)
+    elif state == "finished":
+        verdict["outcome"] = last.get("detail")
     return verdict
 
 
 def _sibling_outcome(ledger_path):
     """Terminal outcome from the run/result JSON next to the ledger, if any."""
     stem = ledger_path.name[:-len(LEDGER_SUFFIX)]
-    for suffix in (".json",):
-        candidate = ledger_path.parent / (stem + suffix)
-        if not candidate.is_file():
-            continue
-        try:
-            value = json.loads(candidate.read_text(encoding="utf-8",
-                                                   errors="replace"))
-        except ValueError:
-            continue
-        if isinstance(value, dict) and isinstance(value.get("outcome"), str):
-            return value["outcome"]
-        if isinstance(value, dict) and value.get("delivery_ok") is True:
-            return "delivered"
+    candidate = ledger_path.parent / (stem + ".json")
+    if not candidate.is_file():
+        return None
+    try:
+        # Bounded read: a huge final message must not blow the peek budget.
+        raw = candidate.open("rb").read(256 * 1024)
+        value = json.loads(raw.decode("utf-8", errors="replace"))
+    except (OSError, ValueError):
+        return None
+    if isinstance(value, dict) and isinstance(value.get("outcome"), str):
+        return value["outcome"]
+    if isinstance(value, dict) and value.get("delivery_ok") is True:
+        return "delivered"
     return None
