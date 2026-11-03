@@ -4,8 +4,8 @@
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "f107d36a383e8cb3403e30cb8cceadeed93d7d67",
-      "sha256": "ff97b12405030ab72dbfe8cc5ba595a0a691a61270f8bbae33bd598083e9fc39"
+      "blob": "eb4cbef534c7f304f313915a3b207432d0ef74d7",
+      "sha256": "ecfdfa2481a22a024323c560e444a815124134b8d0735d0e08741a5872e88192"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -40,8 +40,8 @@
       "sha256": "06379f7cc49aef82c60d3732e9aa36b8d0b9e630f62c62ff2ff2deed04709cae"
     },
     "src/zcode_supervisor/contracts.py": {
-      "blob": "26a109ec4cbf71698b91df7a51a56bd24c76c6c0",
-      "sha256": "f9ad024cd8b317b92e67c6e3f9430359b3c523148431e6a637a3b0f9f7dcb995"
+      "blob": "f632a1802031e6f7a857154c1d6365209ce5a202",
+      "sha256": "72cc1160e81777500d19d3c9395855d24560ff9389e6353d8f52f0e8f885471f"
     },
     "src/zcode_supervisor/deadline.py": {
       "blob": "af08b7b93f2b6b83cd8c4d75836e47bf80c314f7",
@@ -64,8 +64,8 @@
       "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
     },
     "src/zcode_supervisor/hub_server.py": {
-      "blob": "af7817facf72008d0c24f86088df32a53d4e5a3f",
-      "sha256": "c074ab7526fc48d2390c95540e6455e593f80c998ec80ad83b4ba4622ec4bbb7"
+      "blob": "1c904908235c76f85ad815a127ba5151f8915179",
+      "sha256": "4deebb8ff4833787573ab586c2fa839909272fdc6e58a694985761ce13b73b71"
     },
     "src/zcode_supervisor/mcp_readonly.py": {
       "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
@@ -149,5 +149,5 @@
     }
   },
   "refreshed_at": "2026-11-03",
-  "refresh_reason": "v0.2.6: L1 binary IPC transport (UDS+MessagePack, all five channels telemetry push, 206x status read speedup, 35us RTT)"
+  "refresh_reason": "v0.2.7: dispatch overhead 0.115ms (260x target) — skills directory-cache (27ms to 0.02ms, 2527x), contract mtime-cache, L1 UDS telemetry retained"
 }
