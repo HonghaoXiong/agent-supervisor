@@ -20,8 +20,8 @@
       "sha256": "d55ca4152cda233dc4f746427a77ad1916ae06f829434a1bf29a3bf5dadb2bf6"
     },
     "src/zcode_supervisor/cli.py": {
-      "blob": "837926cbdae28c1b0661633d5355521530f37095",
-      "sha256": "29e3b27fed9ecbb1bbda62071e1078b4d916720aa5f4180a96b2a0032bf2f5c5"
+      "blob": "ee7754f7a92d722a5db7742a7bea55b8cf132c4f",
+      "sha256": "6f72580123f1c496049b1d4c74c094477191bde7ea9b0e710054b9c7022064ce"
     },
     "src/zcode_supervisor/codex_appserver.py": {
       "blob": "4fcfe669338347af7dd243be76b0bcc99ebe6f1e",
