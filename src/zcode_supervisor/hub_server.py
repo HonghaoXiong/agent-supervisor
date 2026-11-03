@@ -891,6 +891,11 @@ async def default_zcode_runner(config, task_id: str, contract: dict,
     }
     if isinstance(contract.get("model"), dict):
         packet["model"] = contract["model"]
+    # P-B G4: the reviewer-named skills become the packet's orchestration
+    # allowlist — the advertised capability becomes loadable on the worker.
+    if contract.get("skills"):
+        packet["orchestration"] = {"skills": {"allowed":
+                                              list(contract["skills"])}}
     packet_path = task_dir / "packet.json"
     common.write_json(packet_path, packet)
     out_path = task_dir / "run.json"
@@ -999,6 +1004,14 @@ async def _start_appserver_client(client, budget):
         await _invoke(client.start, initialize_timeout=budget.wait_s(cap=120))
     else:
         await _invoke(client.start)
+
+
+def exec_params_all(runner) -> set:
+    """Signature parameter names of an (injectable) runner; empty on error."""
+    try:
+        return set(inspect.signature(runner).parameters)
+    except (TypeError, ValueError):
+        return set()
 
 
 def _field(source, name: str, default=None):
@@ -1280,11 +1293,6 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
     # --- attach resolution (P2): which session does this follow-up continue?
     resume_session = None
     if action == "attach":
-        if worker == "codex":
-            raise HubError(
-                "unsupported",
-                "codex attach is not implemented in this batch (exec is "
-                "single-shot; app-server thread continuation is future work)")
         if not isinstance(attach_to, str) or not attach_to.strip():
             raise HubError(
                 "invalid-argument",
@@ -1309,8 +1317,10 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             if isinstance(prior_record.get("session_locator"), dict) else {}
         prior_result = prior_record.get("result")
         prior_result = prior_result if isinstance(prior_result, dict) else {}
-        prior_session = prior_locator.get("session_id") \
-            or prior_result.get("session_id")
+        # P-C G6: codex records carry thread_id; zcode/dsh carry session_id.
+        prior_session = (prior_locator.get("session_id")
+                         or prior_locator.get("thread_id")
+                         or prior_result.get("session_id"))
         if not isinstance(prior_session, str) or not prior_session.strip():
             raise HubError(
                 "invalid-state",
@@ -1418,10 +1428,31 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         record["progress_ledger"] = str(evidence_dir / "dsh.progress.jsonl")
     else:
         record["progress_ledger"] = str(evidence_dir / "codex.progress.jsonl")
+    if contract.get("skills"):
+        record["skills"] = list(contract["skills"])
     if action == "attach":
         record["attached_to"] = attach_to
         record["resumed_session"] = resume_session
     _write_task_record(_task_record_path(config, task_id), record)
+    # P-B G4 (pre-try: refusals must surface as HubError, not runner-error).
+    # Named skills must exist on THIS zcode worker before dispatch — the
+    # receipt advertised them, the packet is about to enable them; and the
+    # resident path rejects orchestration packets outright.
+    if worker == "zcode" and contract.get("skills"):
+        if mode == "resident":
+            raise HubError(
+                "unsupported",
+                "skills require the cold path: resident packets reject "
+                "orchestration; register the follow-up without a mode "
+                "(cold default) to use skills")
+        available = set(worker_skill_names(worker))
+        unknown = [name for name in contract["skills"]
+                   if name not in available]
+        if unknown:
+            raise HubError(
+                "invalid-argument",
+                f"skills not installed on this zcode worker: {unknown}; "
+                "see czs skills zcode / list_skills")
     # P0.4 sideband: the running record is readable — project task.accepted
     # and only then the hub-stream announcement referencing it (failures are
     # recorded inside the emitter and never reach the delegate result).
@@ -1494,7 +1525,10 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             model = contract.get("model")
             model_name = model.get("model") if isinstance(model, dict) else None
             common.ensure_directory(evidence_dir)
-            if mode == "app-server":
+            # P-C G6: attach on codex always routes through the exec
+            # resume path (read-only follow-up) regardless of the
+            # follow-up contract's own mode.
+            if mode == "app-server" and action != "attach":
                 # P0.1 review spec-I5: ONE CallBudget for the whole delegate —
                 # the lazy app-server start (first delegate only) and this
                 # delegate's run_task share the same primary window; the
@@ -1607,12 +1641,32 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                     if exec_ledger_ok:
                         exec_kwargs["progress_ledger"] = Path(
                             record["progress_ledger"])
-                    receipt = await _invoke(
-                        codex_runner, effective_codex_path,
-                        Path(contract["workspace"]), contract["prompt"],
-                        contract["output_schema"], evidence_dir,
-                        timeout_s=contract["max_timeout_ms"] / 1000,
-                        model=model_name, **exec_kwargs)
+                    # P-C G6: attach continues the prior thread via
+                    # ``exec resume`` (schema recapture unavailable there —
+                    # the final message is validated instance-side only);
+                    # stop handle registered for the dispatch's lifetime.
+                    if action == "attach":
+                        if "resume_thread" not in exec_params_all(codex_runner):
+                            raise HubError("unsupported",
+                                           "the injected codex runner accepts "
+                                           "no resume_thread; cannot attach")
+                        exec_kwargs["resume_thread"] = resume_session
+                    codex_stop = threading.Event()
+                    if "stop_event" in exec_params_all(codex_runner):
+                        exec_kwargs["stop_event"] = codex_stop
+                    with _running_tasks_lock:
+                        _running_tasks[task_id] = {"stop": codex_stop,
+                                                   "worker": worker}
+                    try:
+                        receipt = await _invoke(
+                            codex_runner, effective_codex_path,
+                            Path(contract["workspace"]), contract["prompt"],
+                            contract["output_schema"], evidence_dir,
+                            timeout_s=contract["max_timeout_ms"] / 1000,
+                            model=model_name, **exec_kwargs)
+                    finally:
+                        with _running_tasks_lock:
+                            _running_tasks.pop(task_id, None)
                 outcome = str(_field(receipt, "outcome", "failed"))
                 thread_id = _field(receipt, "thread_id")
                 locator = None
@@ -1781,6 +1835,7 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                 "delivery_ok": bool(run.get("delivery_ok")),
                 "changed_files": run.get("changed_files") or [],
                 "problems": run.get("execution_problems") or [],
+                "skills_enabled": contract.get("skills") or [],
             }
             status = "completed"
     except Exception as error:  # noqa: BLE001 - a runner crash is a task outcome

@@ -164,6 +164,13 @@ hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode
 
 **技能可见（2026-11-03）**：`list_skills`（或 CLI `czs skills <worker>`）列出 zcode/codex/dsh 三方已安装技能的名字+frontmatter 描述行（同名多副本折叠为一条、按 root 优先序取第一；mtime 缓存；**仍不读 SKILL.md 正文**）。派发回执带 `worker_skills` 名单；惯例=派发前查技能、在 prompt 里点名要用的技能。**`task_status`** 返回最近任务与在跑任务的心跳判定（直接读 `.progress.jsonl`，状态查询永不排在运行中的工作后面）。
 
+**P-B/P-C（2026-11-03 第二轮架构闭环）**：
+- 合同可选 `skills`（**zcode 专属**，≤8 个已安装技能名）：派发前校验本机可用性，cold 包自动注入 orchestration 白名单——回执广告的技能变成 worker 真正可加载的能力；resident 路径不支持（诚实拒绝）。codex/dsh 自带 harness 技能，prompt 点名即可，字段拒绝。
+- `action=attach` 现支持 **codex**（`exec resume` 续既有 thread；该子命令无 `--output-schema`，结构化回执降级为实例侧校验的最终消息文本）；`action=stop` 支持 codex exec（在飞进程终止梯度）。
+- `czs pin-candidate`：对已装 ZCode bundle 产**静态钉候选**（bundle/patched 哈希、fragment 计数、版本串）——只省去哈希算术，入册仍需活体仪式（doctor/probe/有界任务/篡改拒绝）+ 人审。
+- config 可选 `events_cap_bytes`：`run.events.jsonl` 原始帧日志超限后写一条 `events_truncated` 标记并停写（审计读内存/路由事件切片，交付证据不受影响；缺省不限）。
+- hub extra 增 `jsonschema>=4,<5`（可选）：装了则合同 schema 注册时做 Draft 2020-12 合法性检查、codex 最终消息做全量实例校验；未装保持手写权威，行为对合格负载一致。
+
 **delegate 三态（2026-11-03 P2，super-agent 续发/停止语义）**：`action=start`（缺省，历史行为不变）；`action=attach` + `attach_to=<先前任务id>`——把一份**新的后续合同**发到先前任务的 worker 会话上续跑（dsh 走 `--session-id`、zcode 走 resume：cold 需会话已在 state 目录登记退出、resident 校验 workspace；要求同 worker，zcode 另要求同 workspace，不匹配即拒；codex 本批未实现、诚实拒绝）；`action=stop` + `attach_to=<运行中任务id>`——向在飞 dsh 派发发停止信号（登记表仅存在于派发生命期，回执 `stopped`；zcode/codex 任务按 stall/wall 边界自然结束，本批不提供强停）。attach 即 super-agent 的"重试/追问复用同一 session+目录"模式。
 
 | worker | mode | 通道 | 写路径 |

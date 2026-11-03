@@ -167,6 +167,12 @@ def parser():
     skills_cmd.add_argument('worker', help='zcode | codex | dsh')
     skills_cmd.add_argument('--json', action='store_true',
                             help='Machine-readable JSON instead of compact lines')
+    pin_cmd = sub.add_parser(
+        'pin-candidate', help='STATIC pin candidate for the installed ZCode '
+        'bundle (hash arithmetic only; adding the pin stays a human review '
+        'with live evidence); no model calls')
+    pin_cmd.add_argument('--json', action='store_true',
+                         help='Machine-readable JSON instead of the review note')
     habits = sub.add_parser('habits', help='Import or inspect user ZCode habits; no model calls')
     habits_sub = habits.add_subparsers(dest='habit_action', required=True)
     habits_import = habits_sub.add_parser(
@@ -281,6 +287,16 @@ def main(argv=None):
                 print(json.dumps(document, ensure_ascii=False, indent=2))
             else:
                 print(render_text(document))
+            return 0
+        if args.action == 'pin-candidate':
+            from .runtime import pin_candidate
+            candidate = pin_candidate(config)
+            if args.json:
+                print(json.dumps(candidate, ensure_ascii=False, indent=2))
+            else:
+                print(json.dumps(candidate, ensure_ascii=False, indent=2))
+            if not candidate.get('fragment_ok'):
+                return 1
             return 0
         if args.action == 'skills':
             from .hub_server import list_skills_impl

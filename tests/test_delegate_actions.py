@@ -154,7 +154,8 @@ class DelegateActions(unittest.TestCase):
         self.assertEqual(calls["resume"], "sess_1")
         self.assertEqual(result["outcome"], "delivered")
 
-    def test_attach_codex_is_unsupported(self):
+    def test_attach_codex_continues_prior_thread(self):
+        import asyncio
         contract = {
             "contract_id": "cx-follow", "worker": "codex",
             "workspace": str(self.workspace),
@@ -165,10 +166,29 @@ class DelegateActions(unittest.TestCase):
                               "required": ["a"], "additionalProperties": False},
         }
         _register(self.config, contract)
-        with self.assertRaises(H.HubError) as caught:
-            self._delegate(contract_id="cx-follow", action="attach",
-                           attach_to="t9")
-        self.assertIn("codex attach is not implemented", str(caught.exception))
+        prior = _prior_task(self.config, "t9", "codex", "thread-77",
+                            "cx-first", self.workspace)
+        prior["session_locator"] = {"agent": "codex", "thread_id": "thread-77"}
+        (self.config.state_dir / "hub" / "tasks" / "t9.json").write_text(
+            json.dumps(prior))
+        calls = {}
+
+        def fake_codex_runner(codex_path, workspace, task, schema, evidence,
+                              timeout_s=300, model=None, progress_ledger=None,
+                              resume_thread=None, stop_event=None, **kw):
+            calls["resume_thread"] = resume_thread
+            return {"outcome": "delivered", "thread_id": "thread-77",
+                    "final_message": "ok", "structured": {"a": "b"},
+                    "exit_code": 0, "progress": {"final": "delivered"}}
+
+        result = asyncio.run(H.delegate_impl(
+            self.config, self.evidence, "cx-follow", self.initiator,
+            action="attach", attach_to="t9", codex_runner=fake_codex_runner))
+        self.assertEqual(calls["resume_thread"], "thread-77")
+        self.assertEqual(result["outcome"], "delivered")
+        record = json.loads((self.config.state_dir / "hub" / "tasks"
+                             / (result["task_id"] + ".json")).read_text())
+        self.assertEqual(record["resumed_session"], "thread-77")
 
     def test_stop_unknown_task_is_rejected(self):
         with self.assertRaises(H.HubError) as caught:

@@ -80,7 +80,8 @@ REQUIRED = (
     "budget",
 )
 WORKERS = ("zcode", "codex", "dsh")
-OPTIONAL = ("snapshots", "output_schema", "mode", "sandbox", "stall_timeout_ms")
+OPTIONAL = ("snapshots", "output_schema", "mode", "sandbox", "stall_timeout_ms",
+               "skills")
 
 ZCODE_MODES = ("cold", "resident")
 CODEX_MODES = ("exec", "app-server")
@@ -167,13 +168,29 @@ def _schema_object_node_problems(node, label: str) -> list[str]:
 
 
 def _output_schema_problems(schema, label: str) -> list[str]:
-    """Strict-mode checks: the top level itself must be an object schema."""
+    """Strict-mode checks: the top level itself must be an object schema.
+
+    P-C (2026-11-03): with the optional ``jsonschema`` hub extra the schema
+    is additionally checked as a valid Draft 2020-12 schema (catches
+    malformed keyword shapes the hand-rolled walker cannot see). The
+    hand-rolled strict-object rules stay in force either way — they encode
+    the contract's own policy, not just schema validity.
+    """
     if not isinstance(schema, dict):
         return [f"{label} must be a JSON Schema object"]
     problems: list[str] = []
     if schema.get("type") != "object":
         problems.append(f"{label} must declare \"type\": \"object\" at the top level")
     problems.extend(_schema_object_node_problems(schema, label))
+    try:
+        import jsonschema  # optional hub extra
+        try:
+            jsonschema.Draft202012Validator.check_schema(schema)
+        except jsonschema.SchemaError as error:
+            problems.append(f"{label} is not a valid JSON Schema: "
+                            f"{error.message[:200]}")
+    except ImportError:
+        pass
     return problems
 
 
@@ -349,6 +366,31 @@ def validate_contract(contract: dict) -> dict:
         elif not 1000 <= value <= MAX_TIMEOUT_MS_CEILING:
             problems.append(
                 f"stall_timeout_ms must be within 1000..{MAX_TIMEOUT_MS_CEILING}")
+
+    # --- optional: skills (P-B G4, 2026-11-03) ---------------------------
+    # The reviewer names the worker skills the task may use; the hub injects
+    # them into the zcode packet's orchestration allowlist at dispatch and
+    # refuses names the worker does not have. This closes the loop between
+    # what delegate receipts advertise (worker_skills) and what a dispatched
+    # worker can actually load.
+    value = contract.get("skills")
+    if "skills" in contract:
+        if worker != "zcode":
+            problems.append(
+                "skills is zcode-only: codex and dsh workers load their own "
+                "harness skills; name them in the prompt instead")
+        if not isinstance(value, list) or not value:
+            problems.append("skills must be a non-empty list of skill names")
+        else:
+            if len(value) > 8:
+                problems.append("skills supports at most 8 names")
+            if len(set(value)) != len(value):
+                problems.append("skills entries must be unique")
+            for name in value:
+                if not isinstance(name, str) or not name.strip()                         or name != name.strip() or len(name) > 160:
+                    problems.append(
+                        "skills entries must be trimmed non-empty strings "
+                        "(<=160 chars)")
 
     # --- budget (recorded, not enforced, in P0) -------------------------
     value = contract.get("budget")

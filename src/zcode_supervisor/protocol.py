@@ -517,6 +517,15 @@ class ProtocolClient:
             command = self.config.command()
             self.stderr = self.output.with_suffix('.stderr.log').open('x')
             self.wire = self.output.with_suffix('.events.jsonl').open('x')
+            # P-B G5 (2026-11-03): optional evidence cap for the raw wire log
+            # (audits read the in-memory/router event slices — delivery
+            # evidence stays complete even when raw frames truncate).
+            # Strict int check: duck-typed test configs (Mock) must not
+            # smuggle a truthy non-int through getattr's default.
+            raw_cap = getattr(self.config, 'events_cap_bytes', None)
+            self._events_cap_bytes = (raw_cap if isinstance(raw_cap, int)
+                                      and not isinstance(raw_cap, bool) else 0)
+            self._events_capped = False
             self.process = await asyncio.create_subprocess_exec(
                 *command, 'app-server', '--stdio', '--cwd', str(self.workspace),
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE,
@@ -592,10 +601,24 @@ class ProtocolClient:
             await self.send({'id':frame['id'], 'error':{
                 'code':-32601, 'message':f'Unsupported host request: {method}'}})
             return
-        self.wire.write(json.dumps({'host_response_to':frame['id'], 'method':method,
-                                    'result':response}, ensure_ascii=False)+'\n')
-        self.wire.flush()
+        self._wire_write({'host_response_to':frame['id'], 'method':method,
+                          'result':response})
         await self.send({'id':frame['id'], 'result':response})
+
+    def _wire_write(self, payload) -> None:
+        """G5: capped raw-frame append; first overflow writes ONE marker."""
+        if getattr(self, '_events_capped', False):
+            return
+        line = json.dumps(payload, ensure_ascii=False)
+        cap = getattr(self, '_events_cap_bytes', 0)
+        if cap and (self.wire.tell() + len(line) + 1) > cap:
+            self._events_capped = True
+            self.wire.write(json.dumps({'events_truncated': True,
+                                        'cap_bytes': cap}) + '\n')
+            self.wire.flush()
+            return
+        self.wire.write(line + '\n')
+        self.wire.flush()
 
     def fail(self, error):
         # P0.2 (round-2 minor 3): the FIRST terminal failure is the
@@ -639,9 +662,8 @@ class ProtocolClient:
                     known = frame['method'] in ('interaction/requestPermission',
                         'session/requestRuntimePreferences', 'subagents/readRuntimeConfig',
                         'session/event', 'state.updated')
-                    self.wire.write(json.dumps(redact_transport(frame) if known else {
-                        'method':frame['method'], 'id':frame.get('id')}, ensure_ascii=False)+'\n')
-                    self.wire.flush()
+                    self._wire_write(redact_transport(frame) if known else {
+                        'method':frame['method'], 'id':frame.get('id')})
                     if 'id' in frame:
                         task = asyncio.create_task(self.reverse(frame))
                         self.tasks.append(task)
@@ -712,12 +734,10 @@ class ProtocolClient:
             raise ValueError('Unmatched protocol response')
         if kind is None:
             raise ValueError('Response has no result or error')
-        self.wire.write(json.dumps({'late_response_to': rid,
-                                    'tombstone_reason': entry['reason'],
-                                    'late_kind': kind,
-                                    'duplicate': entry['late_count'] > 1},
-                                   ensure_ascii=False)+'\n')
-        self.wire.flush()
+        self._wire_write({'late_response_to': rid,
+                          'tombstone_reason': entry['reason'],
+                          'late_kind': kind,
+                          'duplicate': entry['late_count'] > 1})
 
     async def close(self):
         self.closing = True
@@ -1579,6 +1599,8 @@ async def execute(args, config, ui_emitter=None):
             # bookkeeping is isolated so it can never suppress the primary
             # result write (review P2-1).
             try:
+                if getattr(client, '_events_capped', False):
+                    result['events_truncated'] = True
                 ledger.finalize(result.get('outcome') or 'unknown')
                 result['progress'] = ledger.summary()
             except Exception:  # noqa: BLE001 - evidence sidecar must not mask the run result

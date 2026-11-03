@@ -185,12 +185,36 @@ def build_argv(
     schema_file,
     last_message_file,
     model=None,
+    resume=None,
 ) -> list[str]:
     """Assemble the exact ``codex exec`` argument vector.
 
     Flag order is fixed; ``--ephemeral`` is never emitted and its accidental
     presence is a hard driver error.
+
+    P-C G6 (2026-11-03): ``resume`` continues an existing thread via the
+    ``exec resume`` subcommand. Only flags verified in that subcommand's own
+    help are emitted there — notably NO ``--output-schema`` (absent from
+    resume) and no sandbox dial; the final message is still recaptured via
+    ``-o`` and validated instance-side by :func:`_load_structured`.
     """
+    if resume is not None:
+        if not isinstance(resume, str) or not resume.strip():
+            raise CodexExecError("resume must be a non-empty thread id string")
+        argv = [
+            str(codex_path),
+            "exec",
+            "resume",
+            resume,
+            "-o",
+            str(last_message_file),
+        ]
+        if model is not None:
+            argv.extend(["-m", str(model)])
+        argv.append("-")  # prompt on stdin
+        if "--ephemeral" in argv:
+            raise CodexExecError("internal error: --ephemeral must never be passed")
+        return argv
     argv = [
         str(codex_path),
         "exec",
@@ -547,6 +571,8 @@ def run_readonly(
     exit_event_sink: callable | None = None,
     metrics_sink: dict | None = None,
     progress_ledger: Path | None = None,
+    resume_thread: str | None = None,
+    stop_event=None,
 ) -> CodexRunReceipt:
     """Run one read-only ``codex exec`` dispatch and persist its evidence.
 
@@ -588,10 +614,12 @@ def run_readonly(
     _progress_ledger = (ProgressLedger(Path(progress_ledger))
                         if progress_ledger is not None else None)
 
-    argv = build_argv(codex_path, workspace, schema_file, last_message_file, model=model)
+    argv = build_argv(codex_path, workspace, schema_file, last_message_file,
+                      model=model, resume=resume_thread)
     started = time.monotonic()
 
     timed_out = False
+    stopped = False
     # P2.3 streaming evidence: the placeholder keeps the finalized name
     # observable from launch — and, repair1 D3, TRUNCATES any stale
     # content when an evidence directory is reused, exactly like the old
@@ -635,8 +663,27 @@ def run_readonly(
     stdin_writer.start()
 
     try:
-        process.wait(timeout=timeout_s)
-    except subprocess.TimeoutExpired:
+        # P-C G6: poll in slices so a stop_event (hub action=stop) can
+        # terminate the whole run mid-flight, same gradient as timeouts.
+        while True:
+            try:
+                process.wait(timeout=0.5)
+                break
+            except subprocess.TimeoutExpired:
+                if stop_event is not None and stop_event.is_set():
+                    stopped = True
+                    break
+                if time.monotonic() - started >= timeout_s:
+                    timed_out = True
+                    break
+        if stopped or timed_out:
+            process.terminate()
+            try:
+                process.wait(timeout=_TERMINATE_GRACE_S)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                process.wait()
+    except subprocess.TimeoutExpired:  # defensive: gradient miss
         timed_out = True
         process.terminate()
         try:
@@ -707,7 +754,10 @@ def run_readonly(
                        if raw_stderr_path.exists() else 0)
     error: str | None = None
     structured: dict | None = None
-    if timed_out:
+    if stopped:
+        outcome = "stopped"
+        error = None
+    elif timed_out:
         outcome = "timeout"
         error = f"codex exec timed out after {timeout_s}s (exit {exit_code})"
     elif exit_code != 0:
@@ -817,7 +867,14 @@ def run_readonly(
 
 
 def _load_structured(last_message_file: Path, output_schema: dict) -> tuple[dict | None, str | None]:
-    """Load and validate the -o file; returns (structured, error)."""
+    """Load and validate the -o file; returns (structured, error).
+
+    P-C (2026-11-03): with the optional ``jsonschema`` hub extra installed,
+    the payload is validated against the FULL schema (Draft 2020-12). Without
+    it the historic required-keys check stays the authority — behavior for
+    conforming payloads is identical, the library only catches richer
+    violations codex itself should never emit (it enforces --output-schema).
+    """
     if not last_message_file.exists():
         return None, f"codex wrote no last-message file: {last_message_file}"
     try:
@@ -826,13 +883,22 @@ def _load_structured(last_message_file: Path, output_schema: dict) -> tuple[dict
         return None, f"last-message file is not valid JSON: {exc}"
     if not isinstance(payload, dict):
         return None, "last-message file did not contain a JSON object"
-    required = output_schema.get("required")
-    if isinstance(required, list) and required:
-        missing = [key for key in required if key not in payload]
-        if missing:
-            return None, "last-message JSON is missing required keys: " + ", ".join(
-                str(key) for key in missing
-            )
+    try:
+        import jsonschema  # optional hub extra
+    except ImportError:
+        required = output_schema.get("required")
+        if isinstance(required, list) and required:
+            missing = [key for key in required if key not in payload]
+            if missing:
+                return None, "last-message JSON is missing required keys: " + ", ".join(
+                    str(key) for key in missing
+                )
+        return payload, None
+    errors = sorted(jsonschema.Draft202012Validator(
+        output_schema).iter_errors(payload), key=str)
+    if errors:
+        return None, ("last-message JSON failed schema: "
+                      + "; ".join(error.message[:200] for error in errors[:3]))
     return payload, None
 
 

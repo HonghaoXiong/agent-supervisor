@@ -152,6 +152,7 @@ class Config:
     node: str = "node"
     compatibility: str = COMPATIBILITY
     notify: bool = False
+    events_cap_bytes: int | None = None
     profile: Path | None = None
     config_dir: Path | None = None
 
@@ -202,7 +203,11 @@ def load_config(path: Path | str) -> Config:
     except (json.JSONDecodeError, UnicodeDecodeError) as error:
         raise ValueError("Configuration must be valid UTF-8 JSON") from error
     required = {"schema_version", "work_root", "state_dir", "cache_dir", "cli_path", "node", "compatibility"}
-    allowed = required | {"provider_config", "notify", "profile"}
+    allowed = required | {"provider_config", "notify", "profile",
+                          # P-B G5 (2026-11-03): cap for run.events.jsonl
+                          # evidence streams; absent keeps the legacy
+                          # unbounded behavior, 0 is an explicit no-cap.
+                          "events_cap_bytes"}
     if not isinstance(value, dict):
         raise ValueError("Configuration must be a JSON object")
     unknown, missing = set(value) - allowed, required - set(value)
@@ -214,6 +219,11 @@ def load_config(path: Path | str) -> Config:
     notify = value.get("notify", sys.platform == "darwin")
     if type(notify) is not bool:
         raise ValueError("notify must be a boolean when present")
+    events_cap = value.get("events_cap_bytes")
+    if events_cap is not None and (isinstance(events_cap, bool)
+                                   or not isinstance(events_cap, int)
+                                   or events_cap < 0):
+        raise ValueError("events_cap_bytes must be a non-negative integer or absent")
     profile = value.get("profile")
     return Config(
         work_root=_path(value["work_root"], path.parent, "work_root"),
@@ -222,6 +232,7 @@ def load_config(path: Path | str) -> Config:
         cli_path=_path(value["cli_path"], path.parent, "cli_path"),
         provider_config=None if provider is None else _path(provider, path.parent, "provider_config"),
         node=value["node"], compatibility=value["compatibility"], notify=notify,
+        events_cap_bytes=events_cap,
         profile=None if profile is None else _path(profile, path.parent, "profile"),
         config_dir=path.parent,
     )
@@ -516,6 +527,40 @@ def prepare_bundled_skills(config: Config, source: Path | None = None) -> Path:
     # this reference; the link itself never redefines approval.
     _write_closure_approval(config, target)
     return link
+
+
+def pin_candidate(config: Config) -> dict:
+    """P-B G7 (2026-11-03): STATIC pin candidate for the installed bundle.
+
+    Computes the registry entry the compatibility review would need (bundle
+    sha256, fragment occurrence count, patched sha256, CLI version string)
+    and returns it as a ready-to-review dict. It NEVER writes the registry:
+    adding a pin stays a human decision backed by the live ritual (doctor,
+    probe, bounded delegation, tamper rejection) — this only removes the
+    hash arithmetic, not the gate.
+    """
+    original = read_regular(config.cli_path)
+    count = original.count(FRAGMENT)
+    result = {
+        "bundle_sha256": _sha256(original),
+        "fragment_occurrences": count,
+        "fragment_ok": count == 1,
+        "cli_version": None,
+    }
+    if count == 1:
+        result["patched_sha256"] = _sha256(original.replace(FRAGMENT, b"", 1))
+    try:
+        import subprocess as _sp
+        version = _sp.run([config.node, str(config.cli_path), "--version"],
+                          capture_output=True, text=True, timeout=30).stdout.strip()
+        result["cli_version"] = version or None
+    except Exception:  # noqa: BLE001 - informational only
+        pass
+    result["note"] = ("STATIC CANDIDATE ONLY — run the live ritual (doctor, "
+                      "probe, one bounded delegation, attach/resume, tamper "
+                      "rejection) and write the provenance before adding "
+                      "this entry to REVIEWED_BUNDLES")
+    return result
 
 
 def prepare_cli(config: Config) -> Path:
