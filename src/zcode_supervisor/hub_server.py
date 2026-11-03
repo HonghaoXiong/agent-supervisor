@@ -73,6 +73,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 from . import __version__, common, contracts
+from . import transport
 from .authority import Authority, inventory
 from .codex_driver import locate_rollout, run_readonly
 from . import dsh_driver
@@ -465,6 +466,114 @@ _read_semaphore_state: tuple[object, asyncio.Semaphore] | None = None
 _read_executor_lock = threading.Lock()
 
 
+# --------------------------------------------------------------------------
+# L1 telemetry: UDS push channel for worker progress/status (2026-11-03)
+# --------------------------------------------------------------------------
+
+class TelemetryHub:
+    """In-memory task status cache fed by UDS pushes from worker drivers.
+
+    Workers push progress/results on a Unix Domain Socket; the hub's
+    ``task_status`` reads this cache (O(1)) instead of polling files.
+    Falls back to the file-based ledger when no push has arrived (worker
+    not yet integrated, or hub restarted after the push was sent).
+    """
+
+    def __init__(self, state_dir):
+        import hashlib
+        self._socket_dir = Path(state_dir) / "telemetry"
+        self._socket_dir.mkdir(parents=True, exist_ok=True)
+        self._socket_path = self._socket_dir / "hub.sock"
+        self._statuses: dict[str, dict] = {}  # task_id → latest push
+        self._lock = threading.Lock()
+        self._server = None
+        self._started = False
+
+    @property
+    def socket_path(self) -> str:
+        return str(self._socket_path)
+
+    async def start(self):
+        """Bind and listen; safe to call multiple times."""
+        if self._started:
+            return
+        self._started = True
+        path = self._socket_path
+        if path.exists():
+            path.unlink()
+        self._server = await asyncio.start_unix_server(
+            self._handle_client, path=str(path))
+        import os as _os
+        _os.chmod(str(path), 0o600)
+
+    async def _handle_client(self, reader, writer):
+        """Receive pushes; each message updates the in-memory cache."""
+        try:
+            while True:
+                header = await reader.readexactly(5)
+                msg_type, length = transport._HEADER_STREAM.unpack(header)
+                if length > transport._MAX_PAYLOAD:
+                    break
+                payload = await reader.readexactly(length)
+                env = transport.decode_envelope(bytes([msg_type]) + payload)
+                task_id = env.payload.get("task_id")
+                if isinstance(task_id, str) and task_id:
+                    with self._lock:
+                        self._statuses[task_id] = {
+                            "msg_type": env.msg_type,
+                            "type_name": env.type_name,
+                            "payload": env.payload,
+                            "received_at": time.time(),
+                        }
+        except (asyncio.IncompleteReadError, ConnectionResetError):
+            pass  # client disconnected
+        except Exception:
+            pass  # never crash the server on a malformed push
+        finally:
+            writer.close()
+
+    def get_status(self, task_id: str) -> dict | None:
+        """Latest push for a task; None if no UDS update received."""
+        with self._lock:
+            entry = self._statuses.get(task_id)
+            if entry is None:
+                return None
+            return {
+                "state": entry["payload"].get("state"),
+                "outcome": entry["payload"].get("outcome"),
+                "last_detail": entry["payload"].get("detail"),
+                "received_at": entry["received_at"],
+                "age_s": round(time.time() - entry["received_at"], 3),
+                "source": "uds-push",
+            }
+
+    def stats(self) -> dict:
+        with self._lock:
+            return {"tracked_tasks": len(self._statuses),
+                    "socket": str(self._socket_path)}
+
+    async def stop(self):
+        if self._server is not None:
+            self._server.close()
+            self._server = None
+        self._socket_path.unlink(missing_ok=True)
+        self._started = False
+
+
+# Module-level singleton (lazily started by the first delegate/task_status)
+_telemetry: TelemetryHub | None = None
+_telemetry_lock = threading.Lock()
+
+
+def get_telemetry(config) -> TelemetryHub:
+    """The process-wide telemetry hub; created from the config's state dir."""
+    global _telemetry
+    with _telemetry_lock:
+        if _telemetry is None:
+            _telemetry = TelemetryHub(config.state_dir)
+        return _telemetry
+
+
 def read_executor_pool() -> concurrent.futures.ThreadPoolExecutor:
     """The process-wide bounded executor for hub read paths (lazy).
 
@@ -798,6 +907,7 @@ def task_status_impl(config, task_id=None, limit=10) -> dict:
     from .progress import liveness
 
     _recover_stale_tasks(config)
+    telemetry = get_telemetry(config)
     tasks_dir = _tasks_dir(config)
     entries: list[dict] = []
     if tasks_dir.is_dir():
@@ -823,23 +933,29 @@ def task_status_impl(config, task_id=None, limit=10) -> dict:
             if record.get("note"):
                 entry["note"] = record["note"]
             if record.get("status") == "running":
-                ledger_path = record.get("progress_ledger")
-                if isinstance(ledger_path, str) and ledger_path:
-                    verdict = liveness(ledger_path)
-                    if verdict.get("state") != "unknown":
-                        entry["heartbeat"] = {
-                            key: verdict.get(key)
-                            for key in ("state", "age_s", "last", "outcome")
-                            if verdict.get(key) is not None}
-                if "heartbeat" not in entry:
-                    for directory in _task_ledger_dirs(config, record):
-                        verdict = liveness(directory)
+                # L1 priority: UDS push (sub-ms) → explicit ledger → dir scan
+                uds_status = telemetry.get_status(
+                    record.get("task_id") or "")
+                if uds_status is not None:
+                    entry["heartbeat"] = uds_status
+                else:
+                    ledger_path = record.get("progress_ledger")
+                    if isinstance(ledger_path, str) and ledger_path:
+                        verdict = liveness(ledger_path)
                         if verdict.get("state") != "unknown":
                             entry["heartbeat"] = {
                                 key: verdict.get(key)
                                 for key in ("state", "age_s", "last", "outcome")
                                 if verdict.get(key) is not None}
-                            break
+                    if "heartbeat" not in entry:
+                        for directory in _task_ledger_dirs(config, record):
+                            verdict = liveness(directory)
+                            if verdict.get("state") != "unknown":
+                                entry["heartbeat"] = {
+                                    key: verdict.get(key)
+                                    for key in ("state", "age_s", "last", "outcome")
+                                    if verdict.get(key) is not None}
+                                break
             entries.append(entry)
     if task_id is not None and not entries:
         raise HubError("unknown-task", f"no hub task record for {task_id!r}")
@@ -939,13 +1055,14 @@ async def default_zcode_runner(config, task_id: str, contract: dict,
 
 def default_dsh_runner(dsh_path, workspace, task, evidence_dir, *,
                        wall_timeout_s, stall_timeout_s=None, session_id=None,
-                       stop_event=None):
+                       stop_event=None, telemetry_socket=None, task_id=None):
     """Sync thin wrapper so _invoke can offload the blocking dsh dispatch.
 
     ``stall_timeout_s`` forwards only when provided: the contract's optional
     ``stall_timeout_ms`` overrides the driver's generous default, and absent
     contracts keep that default instead of zeroing it. ``session_id`` (P2
     attach) and ``stop_event`` (P2 stop) forward to the driver verbatim.
+    L1: ``telemetry_socket``/``task_id`` enable the UDS push channel.
     """
     kwargs = {"wall_timeout_s": wall_timeout_s}
     if stall_timeout_s is not None:
@@ -954,6 +1071,10 @@ def default_dsh_runner(dsh_path, workspace, task, evidence_dir, *,
         kwargs["session_id"] = session_id
     if stop_event is not None:
         kwargs["stop_event"] = stop_event
+    if telemetry_socket is not None:
+        kwargs["telemetry_socket"] = telemetry_socket
+    if task_id is not None:
+        kwargs["task_id"] = task_id
     return dsh_driver.run_headless(dsh_path, workspace, task, evidence_dir,
                                    **kwargs)
 
@@ -1717,6 +1838,12 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                 dsh_extra["session_id"] = resume_session
             if "stop_event" in dsh_params:
                 dsh_extra["stop_event"] = stop_event
+            # L1 telemetry: UDS push channel for sub-ms task_status reads
+            telemetry = get_telemetry(config)
+            if "telemetry_socket" in dsh_params:
+                dsh_extra["telemetry_socket"] = telemetry.socket_path
+            if "task_id" in dsh_params:
+                dsh_extra["task_id"] = task_id
             with _running_tasks_lock:
                 _running_tasks[task_id] = {"stop": stop_event, "worker": worker}
             with common.workspace_lock(workspace, Path(config.state_dir)):
@@ -2085,6 +2212,10 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
 async def serve(config, evidence_root: Path, **injectables) -> None:
     """Run the stdio server for one process lifetime."""
     from mcp.server.stdio import stdio_server
+
+    # L1 telemetry: start the UDS push channel for worker progress updates
+    telemetry = get_telemetry(config)
+    await telemetry.start()
 
     server = build_server(config, Path(evidence_root), **injectables)
     workers = getattr(server, "czs_workers", None)

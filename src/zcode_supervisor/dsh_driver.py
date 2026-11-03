@@ -33,12 +33,16 @@ import json
 import math
 import os
 import signal
+import socket
+import struct
 import subprocess
 import threading
 import time
 from pathlib import Path
 
 from .progress import ProgressLedger, safe_token
+from .transport import MSG_PROGRESS as _MSG_PROGRESS
+from .transport import MSG_RESULT as _MSG_RESULT
 
 __all__ = ["DSH_MODES", "DshRunError", "run_headless"]
 
@@ -58,6 +62,60 @@ DEFAULT_STALL_TIMEOUT_S = 900.0
 
 class DshRunError(ValueError):
     """Invalid dispatch parameters (never a worker failure)."""
+
+
+# L1 telemetry: lightweight sync UDS push (no asyncio — runs in pump threads).
+# Frame format matches transport.py: [type:1B][len:4B][payload:msgpack/json].
+_TELEM_HEADER = struct.Struct("<BI")
+
+
+class _TelemetryPusher:
+    """Sync UDS client for pushing progress updates to the hub's telemetry.
+
+    Fire-and-forget: if the socket is unreachable or the send fails, the
+    push is silently dropped (the file-based ledger remains the evidence
+    authority; UDS is a latency optimization for status reads only).
+    """
+
+    def __init__(self, socket_path: str | None):
+        self._path = socket_path
+        self._sock: socket.socket | None = None
+
+    def _ensure_connected(self) -> bool:
+        if self._sock is not None:
+            return True
+        if not self._path:
+            return False
+        try:
+            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+            sock.settimeout(0.5)
+            sock.connect(self._path)
+            self._sock = sock
+            return True
+        except (OSError, socket.timeout):
+            self._sock = None
+            return False
+
+    def push(self, msg_type: int, payload: dict) -> None:
+        if not self._ensure_connected():
+            return
+        try:
+            from . import transport as _t
+            frame = _t.encode_envelope(_t.MessageEnvelope(msg_type, payload))
+            # Stream framing: [type:1B][len:4B][payload]
+            header = _TELEM_HEADER.pack(msg_type, len(frame) - 1)
+            self._sock.sendall(header + frame[1:])
+        except (OSError, Exception):
+            # Drop silently; file ledger is the evidence authority
+            self._close()
+
+    def _close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
 
 
 def _iter_lines_bounded(stream, cap=_MAX_LINE_BYTES):
@@ -91,7 +149,7 @@ def _iter_lines_bounded(stream, cap=_MAX_LINE_BYTES):
 
 
 def _pump_stdout(stream, raw_path: Path, state: dict, ledger: ProgressLedger,
-                 pump_error: dict) -> None:
+                 pump_error: dict, pusher=None, telemetry_id=None) -> None:
     """Stream stdout lines to the raw file; note one heartbeat per event."""
     try:
         with raw_path.open("a", encoding="utf-8") as sink:
@@ -117,6 +175,10 @@ def _pump_stdout(stream, raw_path: Path, state: dict, ledger: ProgressLedger,
                 phase = safe_token(event.get("phase"), 12)
                 detail = f"{etype}:{phase}" if phase != "?" else etype
                 ledger.note("dsh", detail, turn=event.get("turn"))
+                if pusher is not None:
+                    pusher.push(_MSG_PROGRESS,
+                                {"task_id": telemetry_id or "",
+                                 "state": "running", "detail": detail})
                 if etype == "session" and not state.get("session_id"):
                     state["session_id"] = event.get("sessionId")
                 elif etype == "status" and phase == "turn_end":
@@ -176,7 +238,8 @@ def _kill_group(process: subprocess.Popen, sig: int) -> None:
 
 def run_headless(dsh_path, workspace, task, evidence_dir, *,
                  wall_timeout_s=3600.0, stall_timeout_s=DEFAULT_STALL_TIMEOUT_S,
-                 env=None, session_id=None, stop_event=None) -> dict:
+                 env=None, session_id=None, stop_event=None,
+                 telemetry_socket=None, task_id=None) -> dict:
     """Run one dsh headless dispatch and persist its evidence; returns a receipt.
 
     The receipt (never an exception for worker outcomes) carries ``outcome``
@@ -214,6 +277,12 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
             stale.unlink()
     events_file.write_text("")
     stderr_file.write_text("")
+    # L1 telemetry: UDS push channel (fire-and-forget, never blocks evidence)
+    pusher = _TelemetryPusher(telemetry_socket)
+    telemetry_id = task_id or evidence_dir.name
+    def _push(msg_type, **fields):
+        pusher.push(msg_type, {"task_id": telemetry_id, **fields})
+
     ledger = ProgressLedger(
         evidence_dir / _LEDGER_NAME,
         stall_timeout_s=float(stall_timeout_s),
@@ -246,6 +315,7 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
     stdout_pump = threading.Thread(
         target=_pump_stdout,
         args=(process.stdout, raw_stdout, state, ledger, stdout_error),
+        kwargs={"pusher": pusher, "telemetry_id": telemetry_id},
         daemon=True)
     stderr_pump = threading.Thread(
         target=_pump_stderr, args=(process.stderr, raw_stderr, stderr_error),
@@ -345,6 +415,14 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
         else:
             error_text = f"exit {exit_code} with empty final message"
     ledger.finalize(outcome)
+    # L1 telemetry: terminal push so task_status sees completion instantly
+    pusher.push(_MSG_RESULT, {
+        "task_id": telemetry_id,
+        "state": "finished", "outcome": outcome,
+        "detail": (state.get("final_text") or error_text or "")[:200],
+        "session_id": state.get("session_id"),
+        "duration_s": round(time.monotonic() - started, 3)})
+    pusher._close()
     receipt = {
         "outcome": outcome,
         "session_id": state.get("session_id"),
