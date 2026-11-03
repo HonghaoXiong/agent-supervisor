@@ -80,6 +80,11 @@ Capability + latency conventions (2026-11-03):
 * **Status never queues**: the hub `task_status` tool (or `czs progress`)
   reads running tasks' heartbeat ledgers directly — check it before assuming
   a worker is stuck.
+* **Follow-ups attach, they don't restart**: to continue a prior task's
+  worker conversation (rework, next step), register the follow-up contract
+  and call `delegate` with `action=attach` and `attach_to=<prior task id>`
+  — same session, same workspace (zcode/dsh). `action=stop` +
+  `attach_to=<running task id>` signals an in-flight dsh dispatch to stop.
 
 This sends real ZCode model requests and consumes that computer's quota. Existing
 user authorization for the task carries through; installing the plugin alone

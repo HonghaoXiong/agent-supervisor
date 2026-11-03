@@ -120,7 +120,7 @@ def build(repo: Path, output: Path) -> Path:
         write(release, ".agents/plugins/marketplace.json",
               (json.dumps(marketplace, ensure_ascii=False, indent=2) + "\n").encode())
         manifest = {"schema_version": 1, "name": PLUGIN, "version": version,
-                    "core_version": "0.2.2",
+                    "core_version": "0.2.3",
                     "accepted_core": pins, "runtime_dependencies": ["Python>=3.11", "Node.js", "supported signed-in ZCode", "Codex plugin CLI"],
                     "model_requests_during_install": 0,
                     "scope": "Baseline CLI delegation and discoverable skill; fixed-model packet field included (verified selection plus provider receipts); no live strict budget or Codex cost claims.",

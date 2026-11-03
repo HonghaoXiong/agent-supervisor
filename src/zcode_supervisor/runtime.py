@@ -43,6 +43,22 @@ CACHE_LAYOUT = 3
 # carried from the single-pin releases, NOT a claim that every pinned CLI is
 # 0.16.9 — fingerprints remain the authority.
 REVIEWED_BUNDLES = {
+    "d9afd58d694f98a5279bf548cdc7646413c125762e86730605a6071f9e0346d6": {
+        "patched_sha256": "7932cde2ac1af0d1431d01225993786036d7ca4a6ef3a8219878b5cab926956c",
+        "upstream_commit": None,
+        "reviewed": "2026-11-03",
+        "provenance": (
+            "Desktop auto-update replaced the installed bundle in place (CLI "
+            "version string stays 0.17.1, bytes differ from the 2026-10-31 "
+            "9afd565a pin). Single allowlist-conversion fragment verified "
+            "statically (occurs exactly once; patched digest matches). "
+            "Accepted 2026-11-03 after live doctor + protocol probe + one "
+            "bounded real delegation (Write allow path, REPORT.md) + an "
+            "attach/resume follow-up on the same session + cache tamper "
+            "rejection. Evidence: scratch config czs-live-val-20261103."
+        ),
+        "cli_version": "0.17.1",
+    },
     "9afd565a104d660259e6bdeeaa5cb8abc74a908559e21aa3c5f6a06f2a9da6c6": {
         "patched_sha256": "90795d1864cb2430e5357bc091f967a6554c76b7933e4157317c150852729e47",
         "upstream_commit": None,

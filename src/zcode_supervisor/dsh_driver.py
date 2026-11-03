@@ -176,13 +176,19 @@ def _kill_group(process: subprocess.Popen, sig: int) -> None:
 
 def run_headless(dsh_path, workspace, task, evidence_dir, *,
                  wall_timeout_s=3600.0, stall_timeout_s=DEFAULT_STALL_TIMEOUT_S,
-                 env=None) -> dict:
+                 env=None, session_id=None, stop_event=None) -> dict:
     """Run one dsh headless dispatch and persist its evidence; returns a receipt.
 
     The receipt (never an exception for worker outcomes) carries ``outcome``
-    in {"delivered", "error", "timeout-stall", "timeout-wall", "launch-error"},
-    the dsh ``session_id``, the final message text, the ``turn_end`` reason,
-    exit code, duration and the heartbeat ledger summary.
+    in {"delivered", "error", "timeout-stall", "timeout-wall", "launch-error",
+    "stopped"}, the dsh ``session_id``, the final message text, the
+    ``turn_end`` reason, exit code, duration and the heartbeat ledger summary.
+
+    ``session_id`` (2026-11-03 P2 attach): pass a previous receipt's session
+    to continue THAT conversation (``dsh --session-id``) instead of booting a
+    fresh one — the super-agent retry-reuse pattern. ``stop_event`` (P2
+    stop): a :class:`threading.Event` checked by the watchdog; when set, the
+    whole process group is terminated and the run settles as ``stopped``.
     """
     for label, value in (("workspace", workspace), ("task", task),
                          ("evidence_dir", evidence_dir)):
@@ -216,7 +222,13 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
     state: dict = {}
     stdout_error: dict = {}
     stderr_error: dict = {}
-    argv = [str(dsh_path), "--profile", "headless", "--json", "-"]
+    argv = [str(dsh_path), "--profile", "headless", "--json"]
+    if session_id is not None:
+        if not isinstance(session_id, str) or not session_id.strip() \
+                or session_id.strip() != session_id:
+            raise DshRunError("session_id must be a trimmed non-empty string")
+        argv += ["--session-id", session_id]
+    argv.append("-")
     environment = dict(env) if env else None
     try:
         process = subprocess.Popen(  # argv is fully driver-controlled
@@ -246,11 +258,22 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
     ledger.note("dsh", "launched", pid=process.pid)
 
     timed_out = None
+    stopped = False
     while True:
         try:
             process.wait(timeout=0.5)
             break
         except subprocess.TimeoutExpired:
+            if stop_event is not None and stop_event.is_set():
+                stopped = True
+                timed_out = None
+                _kill_group(process, signal.SIGTERM)
+                try:
+                    process.wait(timeout=_TERMINATE_GRACE_S)
+                except subprocess.TimeoutExpired:
+                    _kill_group(process, signal.SIGKILL)
+                    process.wait()
+                break
             reason = ledger.expired()
             if reason is None:
                 continue
@@ -293,6 +316,9 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
     if not streams_settled:
         outcome = "error"
         error_text = evidence_note
+    elif stopped:
+        outcome = "stopped"
+        error_text = None
     elif timed_out == "stall":
         outcome = "timeout-stall"
         error_text = None

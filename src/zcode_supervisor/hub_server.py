@@ -371,6 +371,32 @@ def _append_index(config, entry: dict) -> None:
         os.fsync(stream.fileno())
 
 
+# P2 (2026-11-03): running-task registry backing delegate action="stop". Only
+# workers whose driver takes a stop handle register here (dsh in this batch);
+# entries exist exactly for the dispatch's lifetime.
+_running_tasks: dict[str, dict] = {}
+_running_tasks_lock = threading.Lock()
+
+
+def _stop_task(config, task_id) -> dict:
+    """Signal one running dispatch to stop; never waits for it to die."""
+    if not isinstance(task_id, str) or not task_id.strip():
+        raise HubError("invalid-argument",
+                       "stop requires the target task id in 'attach_to'")
+    with _running_tasks_lock:
+        entry = _running_tasks.get(task_id)
+    if entry is None:
+        raise HubError(
+            "unknown-task",
+            f"task {task_id} is not a stoppable in-flight dispatch "
+            "(only dsh workers register a stop handle in this batch; zcode "
+            "and codex tasks run to their stall/wall bounds)")
+    entry["stop"].set()
+    return {"hub_tool_version": HUB_TOOL_VERSION, "task_id": task_id,
+            "worker": entry.get("worker"), "stop_requested": True,
+            "note": "stop signalled; poll task_status for the stopped outcome"}
+
+
 # P2.4: synchronous index/SQLite/disk reads ride a DEDICATED bounded
 # executor (2 workers) behind a UI/read request semaphore (4) — the MCP
 # event loop never blocks on them, and concurrent reads are capped.
@@ -775,14 +801,17 @@ def _task_ledger_dirs(config, record) -> list[Path]:
 # --------------------------------------------------------------------------
 
 async def default_zcode_runner(config, task_id: str, contract: dict,
-                               timeout_s=None, ui_emitter=None) -> dict:
+                               timeout_s=None, ui_emitter=None,
+                               resume=None) -> dict:
     """Translate the contract into a czs packet and run protocol.execute.
 
     The packet is written under ``work_root/hub-tasks/<task_id>/`` (outside the
     frozen workspace), the run evidence lands next to it, and the summary
     fields are read back from run.json. P0.4 round 2: ``ui_emitter`` (the hub
     passes it only on the production runner) links the cold Authority's
-    approval projection and the child's awaited-exit projection.
+    approval projection and the child's awaited-exit projection. P2
+    (2026-11-03): ``resume`` continues a registered worker session (czs run
+    --resume) — the attach path for cold zcode tasks.
     """
     from math import ceil
 
@@ -814,7 +843,7 @@ async def default_zcode_runner(config, task_id: str, contract: dict,
         execute_params = {}
     await protocol.execute(
         SimpleNamespace(packet=str(packet_path), out=str(out_path),
-                        resume=None, timeout=timeout, quiet=True),
+                        resume=resume, timeout=timeout, quiet=True),
         config,
         **({"ui_emitter": ui_emitter} if "ui_emitter" in execute_params else {}))
     run: dict = {}
@@ -841,16 +870,22 @@ async def default_zcode_runner(config, task_id: str, contract: dict,
 
 
 def default_dsh_runner(dsh_path, workspace, task, evidence_dir, *,
-                       wall_timeout_s, stall_timeout_s=None):
+                       wall_timeout_s, stall_timeout_s=None, session_id=None,
+                       stop_event=None):
     """Sync thin wrapper so _invoke can offload the blocking dsh dispatch.
 
     ``stall_timeout_s`` forwards only when provided: the contract's optional
     ``stall_timeout_ms`` overrides the driver's generous default, and absent
-    contracts keep that default instead of zeroing it.
+    contracts keep that default instead of zeroing it. ``session_id`` (P2
+    attach) and ``stop_event`` (P2 stop) forward to the driver verbatim.
     """
     kwargs = {"wall_timeout_s": wall_timeout_s}
     if stall_timeout_s is not None:
         kwargs["stall_timeout_s"] = stall_timeout_s
+    if session_id is not None:
+        kwargs["session_id"] = session_id
+    if stop_event is not None:
+        kwargs["stop_event"] = stop_event
     return dsh_driver.run_headless(dsh_path, workspace, task, evidence_dir,
                                    **kwargs)
 
@@ -1121,6 +1156,7 @@ class ResidentWorkers:
 
 
 async def delegate_impl(config, evidence_root, contract_id, initiator, *,
+                        action="start", attach_to=None,
                         codex_path=None, codex_home=None,
                         zcode_runner=None, codex_runner=None, dsh_runner=None,
                         resident_factory=None, appserver_factory=None,
@@ -1152,6 +1188,16 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         raise HubError(
             "invalid-argument",
             'initiator must be {"agent": "<non-empty>", "session_id": "<non-empty>"}')
+    # P2 actions (2026-11-03, super-agent attach/stop semantics): start keeps
+    # the historic behavior; attach continues a prior task's worker session
+    # under a NEW human-registered follow-up contract; stop signals an
+    # in-flight dispatch. stop carries no contract at all.
+    action = action or "start"
+    if action not in ("start", "attach", "stop"):
+        raise HubError("invalid-argument",
+                       'action must be "start", "attach" or "stop"')
+    if action == "stop":
+        return _stop_task(config, attach_to)
     if not isinstance(contract_id, str) or not contract_id.strip():
         raise HubError("invalid-argument", "contract_id must be a non-empty string")
 
@@ -1168,6 +1214,54 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
     worker = contract["worker"]
     mode = contract.get("mode") or {"zcode": "cold", "dsh": "headless"}.get(
         worker, "exec")
+    # --- attach resolution (P2): which session does this follow-up continue?
+    resume_session = None
+    if action == "attach":
+        if worker == "codex":
+            raise HubError(
+                "unsupported",
+                "codex attach is not implemented in this batch (exec is "
+                "single-shot; app-server thread continuation is future work)")
+        if not isinstance(attach_to, str) or not attach_to.strip():
+            raise HubError(
+                "invalid-argument",
+                "attach requires 'attach_to': the prior hub task id whose "
+                "worker session continues")
+        prior_path = _task_record_path(config, attach_to)
+        if not prior_path.is_file():
+            raise HubError("unknown-task",
+                           f"no hub task record for {attach_to!r}")
+        try:
+            prior_record = json.loads(common.read_regular(prior_path))
+        except (OSError, ValueError) as error:
+            raise HubError("unknown-task",
+                           f"prior task record unreadable: {error}") from error
+        prior_worker = prior_record.get("worker")
+        if prior_worker != worker:
+            raise HubError(
+                "invalid-argument",
+                f"attach worker mismatch: task {attach_to} ran on "
+                f"{prior_worker!r}, the follow-up contract is {worker!r}")
+        prior_locator = prior_record.get("session_locator") \
+            if isinstance(prior_record.get("session_locator"), dict) else {}
+        prior_result = prior_record.get("result")
+        prior_result = prior_result if isinstance(prior_result, dict) else {}
+        prior_session = prior_locator.get("session_id") \
+            or prior_result.get("session_id")
+        if not isinstance(prior_session, str) or not prior_session.strip():
+            raise HubError(
+                "invalid-state",
+                f"task {attach_to} recorded no session identity to attach to")
+        if worker == "zcode":
+            prior_contract = contracts.load_contract(
+                Path(config.state_dir), prior_record.get("contract_id"))
+            if (Path(prior_contract["workspace"]).resolve()
+                    != Path(contract["workspace"]).resolve()):
+                raise HubError(
+                    "invalid-argument",
+                    "attach workspace mismatch: the follow-up contract must "
+                    "target the same workspace as the original task")
+        resume_session = prior_session
     # P0.4 sideband UI projection (never part of the delegate result): the
     # default emitter is env-gated and ON by default (default flipped
     # 2026-10-24; rollback switch CZS_UI_EVENTS=0); the default initiator
@@ -1240,6 +1334,7 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         "task_id": task_id,
         "worker": worker,
         "mode": mode,
+        "action": action,
         "status": "running",
         "initiator": {"agent": initiator["agent"],
                       "session_id": initiator["session_id"]},
@@ -1247,6 +1342,9 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         "contract_sha256": digest,
         "created": _now(),
     }
+    if action == "attach":
+        record["attached_to"] = attach_to
+        record["resumed_session"] = resume_session
     _write_task_record(_task_record_path(config, task_id), record)
     # P0.4 sideband: the running record is readable — project task.accepted
     # and only then the hub-stream announcement referencing it (failures are
@@ -1456,13 +1554,36 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             # workspace lock as the runner (attribution cannot race a second
             # dispatched operation), and the hashing is offloaded off the
             # event loop (it walks up to the workspace's full file budget).
+            # P2: the stop handle registers for the dispatch lifetime;
+            # session_id continues a prior conversation when attaching.
+            stop_event = threading.Event()
+            try:
+                dsh_params = inspect.signature(dsh_runner).parameters
+            except (TypeError, ValueError):
+                dsh_params = {}
+            dsh_extra = {}
+            if resume_session is not None:
+                if "session_id" not in dsh_params:
+                    raise HubError("unsupported",
+                                   "the injected dsh runner accepts no "
+                                   "session_id; cannot attach through it")
+                dsh_extra["session_id"] = resume_session
+            if "stop_event" in dsh_params:
+                dsh_extra["stop_event"] = stop_event
+            with _running_tasks_lock:
+                _running_tasks[task_id] = {"stop": stop_event, "worker": worker}
             with common.workspace_lock(workspace, Path(config.state_dir)):
                 before = await _invoke(inventory, workspace)
-                receipt = await _invoke(
-                    dsh_runner, effective_dsh_path, workspace,
-                    contract["prompt"], evidence_dir,
-                    wall_timeout_s=contract["max_timeout_ms"] / 1000,
-                    **({"stall_timeout_s": stall_s} if stall_s is not None else {}))
+                try:
+                    receipt = await _invoke(
+                        dsh_runner, effective_dsh_path, workspace,
+                        contract["prompt"], evidence_dir,
+                        wall_timeout_s=contract["max_timeout_ms"] / 1000,
+                        **({"stall_timeout_s": stall_s} if stall_s is not None else {}),
+                        **dsh_extra)
+                finally:
+                    with _running_tasks_lock:
+                        _running_tasks.pop(task_id, None)
                 after = await _invoke(inventory, workspace)
             receipt = receipt if isinstance(receipt, dict) else {}
             with contextlib.suppress(OSError, ValueError, TypeError):
@@ -1496,8 +1617,21 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             generation = await workers.resident_generation()
             used = ("resident", generation)
             resident = generation["instance"]
+            resume_kwargs = {}
+            if resume_session is not None:
+                try:
+                    resume_params = inspect.signature(
+                        resident.run_packet).parameters
+                except (TypeError, ValueError):
+                    resume_params = {}
+                if "resume" not in resume_params:
+                    raise HubError("unsupported",
+                                   "the resident instance accepts no resume; "
+                                   "cannot attach through it")
+                resume_kwargs["resume"] = resume_session
             run = await _invoke(resident.run_packet, packet_dir / "packet.json",
-                                task_dir / "run.json", timeout_s=timeout_s)
+                                task_dir / "run.json", timeout_s=timeout_s,
+                                **resume_kwargs)
             run = run if isinstance(run, dict) else {}
             outcome = (run.get("outcome")
                        if isinstance(run.get("outcome"), str) and run.get("outcome")
@@ -1524,6 +1658,16 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                 # production cold path only: injected test runners keep
                 # their exact pre-P0.4 call shape
                 cold_kwargs["ui_emitter"] = emitter
+            if resume_session is not None:
+                try:
+                    cold_params = inspect.signature(zcode_runner).parameters
+                except (TypeError, ValueError):
+                    cold_params = {}
+                if "resume" not in cold_params:
+                    raise HubError("unsupported",
+                                   "the injected zcode runner accepts no "
+                                   "resume; cannot attach through it")
+                cold_kwargs["resume"] = resume_session
             run = await _invoke(zcode_runner, config, task_id, contract,
                                 timeout_s, **cold_kwargs)
             run = run if isinstance(run, dict) else {}
@@ -1652,24 +1796,31 @@ def _tools() -> list[dict]:
         {
             "name": "delegate",
             "description": "Dispatch one human-registered contract to its worker. "
-                           "zcode: mode cold (czs protocol executor) or resident "
-                           "(shared resident process, recommended for latency); "
-                           "codex: mode exec (codex exec -s read-only, strict "
-                           "output_schema) or app-server (approval callbacks "
-                           "brokered through the contract Authority under the "
-                           "untrusted approval policy); dsh: mode headless "
-                           "(NDJSON event stream as heartbeat; no approval "
-                           "layer — the registered contract is the control). "
-                           "MCP exposure is not approval: an "
-                           "unregistered or incomplete contract is refused.",
+                           "action=start (default): run the contract. "
+                           "action=attach: continue a PRIOR task's worker "
+                           "session under this follow-up contract (dsh --"
+                           "session-id / zcode resume; attach_to names the "
+                           "prior task; same worker and workspace required). "
+                           "action=stop: signal an in-flight dsh dispatch to "
+                           "stop (attach_to names the running task; no "
+                           "contract needed). zcode: mode cold or resident "
+                           "(resident recommended for latency); codex: exec "
+                           "or app-server; dsh: headless. MCP exposure is not "
+                           "approval: an unregistered or incomplete contract "
+                           "is refused.",
             "inputSchema": {"type": "object", "properties": {
                 "contract_id": {"type": "string"},
+                "action": {"type": "string",
+                           "enum": ["start", "attach", "stop"]},
+                "attach_to": {"type": "string",
+                              "description": "prior task id (attach) or running "
+                                             "task id (stop)"},
                 "initiator": {"type": "object", "properties": {
                     "agent": {"type": "string"},
                     "session_id": {"type": "string"},
                 }, "required": ["agent", "session_id"],
                    "additionalProperties": False},
-            }, "required": ["contract_id", "initiator"],
+            }, "required": ["initiator"],
                "additionalProperties": False},
         },
     ]
@@ -1759,6 +1910,8 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
                 value = await delegate_impl(
                     config, evidence_root,
                     arguments.get("contract_id"), arguments.get("initiator"),
+                    action=arguments.get("action", "start"),
+                    attach_to=arguments.get("attach_to"),
                     codex_path=codex_path, codex_home=codex_home,
                     zcode_runner=zcode_runner, codex_runner=codex_runner,
                     workers=workers)

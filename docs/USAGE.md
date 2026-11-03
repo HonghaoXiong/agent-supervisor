@@ -164,6 +164,8 @@ hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode
 
 **技能可见（2026-11-03）**：`list_skills`（或 CLI `czs skills <worker>`）列出 zcode/codex/dsh 三方已安装技能的名字+frontmatter 描述行（同名多副本折叠为一条、按 root 优先序取第一；mtime 缓存；**仍不读 SKILL.md 正文**）。派发回执带 `worker_skills` 名单；惯例=派发前查技能、在 prompt 里点名要用的技能。**`task_status`** 返回最近任务与在跑任务的心跳判定（直接读 `.progress.jsonl`，状态查询永不排在运行中的工作后面）。
 
+**delegate 三态（2026-11-03 P2，super-agent 续发/停止语义）**：`action=start`（缺省，历史行为不变）；`action=attach` + `attach_to=<先前任务id>`——把一份**新的后续合同**发到先前任务的 worker 会话上续跑（dsh 走 `--session-id`、zcode 走 resume：cold 需会话已在 state 目录登记退出、resident 校验 workspace；要求同 worker，zcode 另要求同 workspace，不匹配即拒；codex 本批未实现、诚实拒绝）；`action=stop` + `attach_to=<运行中任务id>`——向在飞 dsh 派发发停止信号（登记表仅存在于派发生命期，回执 `stopped`；zcode/codex 任务按 stall/wall 边界自然结束，本批不提供强停）。attach 即 super-agent 的"重试/追问复用同一 session+目录"模式。
+
 | worker | mode | 通道 | 写路径 |
 | --- | --- | --- | --- |
 | zcode | `cold`（默认） | 每任务一个 app-server 进程（czs protocol executor） | `allowed_files` + 精确命令，完整审批 |
