@@ -1853,6 +1853,7 @@ async def run_fake_baseline(server_path, out_dir, *, steady_rounds=3,
             scratch, tasks=2, runs_per_task=60, messages=40, trials=3)),
         (FAKE_UI_JOURNAL, lambda: bench_fake_ui_journal(scratch)),
         ('ledger-and-json', lambda: bench_ledger_and_json(scratch)),
+        ('uds-telemetry', lambda: bench_uds_telemetry(scratch)),
     ]
     for name, runner in runners:
         try:
@@ -2034,6 +2035,76 @@ def main(argv=None):
     entries = list(result['sections'].values())
     return 1 if entries and all(entry.get('status') == 'error'
                                 for entry in entries) else 0
+
+
+async def bench_uds_telemetry(scratch_dir):
+    """L1: UDS telemetry vs file-based status read latency."""
+    import time as _time
+    import json as _json
+    from . import transport as _t
+
+    with _bench_workspace(scratch_dir, 'uds-telemetry') as scratch:
+        results = {'status': 'ok', 'model_requests': 0}
+
+        # 1) UDS round-trip (transport self-test)
+        server = _t.UdsTransport()
+        await server.listen()
+        import asyncio as _a
+        await _a.sleep(0.05)
+        client = _t.UdsTransport(socket_path=server.path)
+        await client.connect()
+        await _a.sleep(0.05)
+
+        samples = []
+        for i in range(500):
+            env = _t.MessageEnvelope(
+                _t.MSG_PROGRESS,
+                {'task_id': f'bench-{i}', 'state': 'running',
+                 'detail': f'step {i}'})
+            start = _time.perf_counter_ns()
+            await client.send(env)
+            await server.recv(timeout=5)
+            samples.append(_time.perf_counter_ns() - start)
+        samples.sort()
+        results['uds_rtt_p50_us'] = round(samples[250] / 1000, 1)
+        results['uds_rtt_p99_us'] = round(samples[495] / 1000, 1)
+        results['transport'] = client.stats()
+
+        await client.close()
+        await server.close()
+
+        # 2) File read vs memory read (task_status paths)
+        ledger_file = scratch / 'run.progress.jsonl'
+        lines = []
+        for i in range(100):
+            lines.append(_json.dumps(
+                {'t': i * 0.1, 'kind': 'event', 'detail': f'step {i}'}))
+        ledger_file.write_text('\n'.join(lines) + '\n')
+
+        file_samples = []
+        for _ in range(100):
+            start = _time.perf_counter_ns()
+            content = ledger_file.read_text()
+            parts = content.strip().split('\n')
+            last = _json.loads(parts[-1]) if parts else {}
+            file_samples.append(_time.perf_counter_ns() - start)
+
+        cache = {'task_id': 'bench', 'state': 'running',
+                 'detail': 'step 99', 'received_at': _time.time()}
+        mem_samples = []
+        for _ in range(100):
+            start = _time.perf_counter_ns()
+            entry = dict(cache)
+            mem_samples.append(_time.perf_counter_ns() - start)
+
+        file_samples.sort()
+        mem_samples.sort()
+        results['file_read_p50_us'] = round(file_samples[50] / 1000, 1)
+        results['memory_read_p50_us'] = round(mem_samples[50] / 1000, 1)
+        results['status_speedup'] = round(
+            file_samples[50] / max(mem_samples[50], 1), 1)
+
+        return results
 
 
 if __name__ == '__main__':  # pragma: no cover
