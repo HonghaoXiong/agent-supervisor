@@ -31,6 +31,7 @@ from pathlib import Path
 from . import protocol
 from . import progress
 from . import runtime
+from .transport import MSG_PROGRESS, MSG_RESULT, SyncPusher
 from . import ui_projection
 from .protocol import RouterOverflow, event_router_mode
 from .authority import (Authority, check_model_snapshot, execution_evidence,
@@ -208,7 +209,8 @@ class ResidentZCode:
         return {'setup_ms': list(self._setup_latencies_ms)}
 
     async def run_packet(self, packet_path: Path, out: Path, *, timeout_s: int,
-                         resume: str | None = None) -> dict:
+                         resume: str | None = None,
+                         telemetry_socket: str | None = None) -> dict:
         # ---- preflight: nothing written yet; caller errors raise (as in execute) ----
         if resume and not re.fullmatch(r'sess_[A-Za-z0-9_-]+', resume):
             raise ValueError('Invalid resume session ID')
@@ -245,11 +247,12 @@ class ResidentZCode:
         # Same workspace serializes (shared frozen inputs); different workspaces
         # may run concurrently on their own sessions.
         async with self._lock_for(str(workspace)):
-            return await self._run_locked(packet, packet_path, workspace, output,
-                                          timeout_s, resume, budget)
+            return await self._run_locked(packet, packet_path, workspace,
+                                          output, timeout_s, resume, budget,
+                                          telemetry_socket)
 
-    async def _run_locked(self, packet, packet_path, workspace, output, timeout_s,
-                          resume, budget):
+    async def _run_locked(self, packet, packet_path, workspace, output,
+                          timeout_s, resume, budget, telemetry_socket=None):
         client = self.client
         registry = self.registry
         output.parent.mkdir(parents=True, exist_ok=True)
@@ -259,12 +262,19 @@ class ResidentZCode:
         # their reviewed absolute CallBudget semantics — this adds evidence,
         # not new termination paths.
         ledger = progress.ProgressLedger(output.with_suffix('.progress.jsonl'))
+        _pusher = SyncPusher(telemetry_socket)
+        _telemetry_id = Path(output).stem
+        _started_at = time.monotonic()
         def heartbeat(event, payload):
             detail = progress.safe_token(event.get('type') or 'event', 40)
             token = payload.get('toolName') or payload.get('phase') or payload.get('kind')
             if token:
                 detail = detail + ':' + progress.safe_token(token, 20)
             ledger.note('event', detail)
+            if _pusher.available:
+                _pusher.push(MSG_PROGRESS,
+                             {"task_id": _telemetry_id,
+                              "state": "running", "detail": detail})
         before = await run_boundary_scan(inventory, workspace)
         task_id = Path(output).stem
         # P0.4: the stream id of every UI projection below is the run's task
@@ -645,6 +655,14 @@ class ResidentZCode:
                 pass
             finally:
                 ledger.close()
+            if _pusher.available:
+                _pusher.push(MSG_RESULT, {
+                    "task_id": _telemetry_id,
+                    "state": "finished",
+                    "outcome": result.get('outcome') or 'unknown',
+                    "session_id": result.get('session_id'),
+                    "duration_s": round(time.monotonic() - _started_at, 3)})
+                _pusher.close()
             write_json(output, protocol.redact_transport(result))
             # P2.2: the task-owned frames release ONLY here — after the
             # result (and every evidence inside it) is finalized and

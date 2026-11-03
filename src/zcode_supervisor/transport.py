@@ -37,6 +37,7 @@ __all__ = [
     "TransportError",
     "MessageEnvelope",
     "UdsTransport",
+    "SyncPusher",
     "encode_envelope",
     "decode_envelope",
     "have_msgpack",
@@ -297,6 +298,62 @@ async def _bench(rounds: int = 1000) -> dict:
             "p50_us": round(p50 / 1000, 1),
             "p99_us": round(p99 / 1000, 1),
             "mean_us": round(sum(samples) / len(samples) / 1000, 1)}
+
+
+class SyncPusher:
+    """Lightweight sync UDS client for pushing telemetry to the hub.
+
+    Fire-and-forget: if the socket is unreachable or the send fails, the
+    push is silently dropped (file-based evidence remains the authority).
+    Designed for use in driver pump threads (no asyncio dependency).
+    """
+
+    def __init__(self, socket_path: str | None):
+        import socket as _socket
+        self._socket_mod = _socket
+        self._path = socket_path
+        self._sock = None
+
+    @property
+    def available(self) -> bool:
+        return bool(self._path)
+
+    def _ensure_connected(self) -> bool:
+        if self._sock is not None:
+            return True
+        if not self._path:
+            return False
+        try:
+            sock = self._socket_mod.socket(
+                self._socket_mod.AF_UNIX, self._socket_mod.SOCK_STREAM)
+            sock.settimeout(0.5)
+            sock.connect(self._path)
+            self._sock = sock
+            return True
+        except (OSError, self._socket_mod.timeout):
+            self._sock = None
+            return False
+
+    def push(self, msg_type: int, payload: dict) -> None:
+        if not self._ensure_connected():
+            return
+        try:
+            frame = encode_envelope(MessageEnvelope(msg_type, payload))
+            header = _HEADER_STREAM.pack(msg_type, len(frame) - 1)
+            self._sock.sendall(header + frame[1:])
+        except (OSError, Exception):
+            self._close()
+
+    def close(self):
+        self._close()
+
+    def _close(self):
+        if self._sock is not None:
+            try:
+                self._sock.close()
+            except OSError:
+                pass
+            self._sock = None
 
 
 if __name__ == "__main__":

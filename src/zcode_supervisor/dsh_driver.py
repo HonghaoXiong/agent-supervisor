@@ -43,6 +43,7 @@ from pathlib import Path
 from .progress import ProgressLedger, safe_token
 from .transport import MSG_PROGRESS as _MSG_PROGRESS
 from .transport import MSG_RESULT as _MSG_RESULT
+from .transport import SyncPusher
 
 __all__ = ["DSH_MODES", "DshRunError", "run_headless"]
 
@@ -62,60 +63,6 @@ DEFAULT_STALL_TIMEOUT_S = 900.0
 
 class DshRunError(ValueError):
     """Invalid dispatch parameters (never a worker failure)."""
-
-
-# L1 telemetry: lightweight sync UDS push (no asyncio — runs in pump threads).
-# Frame format matches transport.py: [type:1B][len:4B][payload:msgpack/json].
-_TELEM_HEADER = struct.Struct("<BI")
-
-
-class _TelemetryPusher:
-    """Sync UDS client for pushing progress updates to the hub's telemetry.
-
-    Fire-and-forget: if the socket is unreachable or the send fails, the
-    push is silently dropped (the file-based ledger remains the evidence
-    authority; UDS is a latency optimization for status reads only).
-    """
-
-    def __init__(self, socket_path: str | None):
-        self._path = socket_path
-        self._sock: socket.socket | None = None
-
-    def _ensure_connected(self) -> bool:
-        if self._sock is not None:
-            return True
-        if not self._path:
-            return False
-        try:
-            sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            sock.settimeout(0.5)
-            sock.connect(self._path)
-            self._sock = sock
-            return True
-        except (OSError, socket.timeout):
-            self._sock = None
-            return False
-
-    def push(self, msg_type: int, payload: dict) -> None:
-        if not self._ensure_connected():
-            return
-        try:
-            from . import transport as _t
-            frame = _t.encode_envelope(_t.MessageEnvelope(msg_type, payload))
-            # Stream framing: [type:1B][len:4B][payload]
-            header = _TELEM_HEADER.pack(msg_type, len(frame) - 1)
-            self._sock.sendall(header + frame[1:])
-        except (OSError, Exception):
-            # Drop silently; file ledger is the evidence authority
-            self._close()
-
-    def _close(self):
-        if self._sock is not None:
-            try:
-                self._sock.close()
-            except OSError:
-                pass
-            self._sock = None
 
 
 def _iter_lines_bounded(stream, cap=_MAX_LINE_BYTES):
@@ -278,7 +225,7 @@ def run_headless(dsh_path, workspace, task, evidence_dir, *,
     events_file.write_text("")
     stderr_file.write_text("")
     # L1 telemetry: UDS push channel (fire-and-forget, never blocks evidence)
-    pusher = _TelemetryPusher(telemetry_socket)
+    pusher = SyncPusher(telemetry_socket)
     telemetry_id = task_id or evidence_dir.name
     def _push(msg_type, **fields):
         pusher.push(msg_type, {"task_id": telemetry_id, **fields})

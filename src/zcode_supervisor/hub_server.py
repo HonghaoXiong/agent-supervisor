@@ -1762,6 +1762,11 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                     if exec_ledger_ok:
                         exec_kwargs["progress_ledger"] = Path(
                             record["progress_ledger"])
+                    # L1 telemetry
+                    if "telemetry_socket" in exec_params_all(codex_runner):
+                        exec_kwargs["telemetry_socket"] = telemetry.socket_path
+                    if "task_id" in exec_params_all(codex_runner):
+                        exec_kwargs["task_id"] = task_id
                     # P-C G6: attach continues the prior thread via
                     # ``exec resume`` (schema recapture unavailable there —
                     # the final message is validated instance-side only);
@@ -1903,6 +1908,14 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                                    "the resident instance accepts no resume; "
                                    "cannot attach through it")
                 resume_kwargs["resume"] = resume_session
+            # L1 telemetry
+            try:
+                resident_params = inspect.signature(
+                    resident.run_packet).parameters
+            except (TypeError, ValueError):
+                resident_params = set()
+            if "telemetry_socket" in resident_params:
+                resume_kwargs["telemetry_socket"] = telemetry.socket_path
             run = await _invoke(resident.run_packet, packet_dir / "packet.json",
                                 task_dir / "run.json", timeout_s=timeout_s,
                                 **resume_kwargs)

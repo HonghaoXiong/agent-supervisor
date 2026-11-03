@@ -43,6 +43,7 @@ from pathlib import Path
 
 from .progress import ProgressLedger, safe_token
 from .splitlines_stream import eof_segments, scan_new
+from .transport import SyncPusher
 from .worker_health import ExitProjection
 
 SANDBOX_MODE = "read-only"
@@ -273,7 +274,8 @@ _STDERR_WINDOW_CAP = 16 * 1024 * 1024
 
 
 def _pump_stdout_streaming(stream, raw_path, accumulator,
-                           first_partial, pump_error, ledger=None) -> None:
+                           first_partial, pump_error, ledger=None,
+                           pusher=None, telemetry_id=None) -> None:
     """P2.3 stdout pump: iterate the pipe line by line, append each line
     to the private partial raw-NDJSON file (flushed per line so an
     in-flight observer sees exactly the complete segments the child has
@@ -316,6 +318,10 @@ def _pump_stdout_streaming(stream, raw_path, accumulator,
                 raw.flush()
                 if ledger is not None:
                     ledger.note("codex", safe_token(line[:60], 40))
+                if pusher is not None and pusher.available:
+                    pusher.push(2, {"task_id": telemetry_id,
+                                    "state": "running",
+                                    "detail": safe_token(line[:60], 40)})
                 if pump_error["error"] is None:
                     try:
                         accumulator.feed(line)
@@ -573,6 +579,8 @@ def run_readonly(
     progress_ledger: Path | None = None,
     resume_thread: str | None = None,
     stop_event=None,
+    telemetry_socket: str | None = None,
+    task_id: str | None = None,
 ) -> CodexRunReceipt:
     """Run one read-only ``codex exec`` dispatch and persist its evidence.
 
@@ -613,6 +621,9 @@ def run_readonly(
     # the task's evidence path; standalone callers keep the old behavior).
     _progress_ledger = (ProgressLedger(Path(progress_ledger))
                         if progress_ledger is not None else None)
+    # L1 telemetry: UDS push for sub-ms task_status reads
+    _pusher = SyncPusher(telemetry_socket)
+    _telemetry_id = task_id or str(evidence_dir.name)
 
     argv = build_argv(codex_path, workspace, schema_file, last_message_file,
                       model=model, resume=resume_thread)
@@ -647,7 +658,12 @@ def run_readonly(
         target=_pump_stdout_streaming,
         args=(process.stdout, raw_stdout_path, accumulator, first_partial,
               stdout_pump_error),
-        kwargs=({} if progress_ledger is None else {"ledger": _progress_ledger}),
+        kwargs={
+            **({} if progress_ledger is None
+               else {"ledger": _progress_ledger}),
+            **({"pusher": _pusher, "telemetry_id": _telemetry_id}
+               if telemetry_socket else {}),
+        },
         daemon=True,
     )
     stderr_pump = threading.Thread(
@@ -863,6 +879,13 @@ def run_readonly(
         with contextlib.suppress(Exception):
             _progress_ledger.finalize(receipt.outcome)
             _progress_ledger.close()
+    if telemetry_socket:
+        _pusher.push(3, {"task_id": _telemetry_id,
+                         "state": "finished",
+                         "outcome": receipt.outcome,
+                         "thread_id": receipt.thread_id,
+                         "duration_s": round(time.monotonic() - started, 3)})
+        _pusher.close()
     return receipt
 
 

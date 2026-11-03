@@ -166,5 +166,53 @@ class DshTelemetryPush(unittest.TestCase):
         self.assertEqual(receipt["outcome"], "delivered")
 
 
+
+
+class CodexTelemetryPush(unittest.TestCase):
+    def test_exec_pushes_telemetry(self):
+        import sys
+        sys.path.insert(0, str(Path(__file__).parent))
+        try:
+            from test_codex_driver import FAKE_CODEX_SOURCE
+        except ImportError:
+            self.skipTest("harness unavailable")
+        finally:
+            if str(Path(__file__).parent) in sys.path:
+                sys.path.remove(str(Path(__file__).parent))
+
+        async def scenario():
+            from zcode_supervisor import codex_driver
+            hub = H.TelemetryHub(self.root)
+            await hub.start()
+            workspace = self.root / "ws"
+            evidence = self.root / "ev"
+            workspace.mkdir()
+            codex = self.root / "fake-codex"
+            codex.write_text(FAKE_CODEX_SOURCE)
+            codex.chmod(0o755)
+            schema = {"type": "object",
+                      "properties": {"summary": {"type": "string"},
+                                     "files": {"type": "array"}},
+                      "required": ["summary", "files"]}
+            receipt = codex_driver.run_readonly(
+                codex, workspace, "task", schema, evidence,
+                timeout_s=30,
+                env={"FAKE_CODEX_MODE": "delivered",
+                     "CODEX_HOME": str(self.root / "home")},
+                telemetry_socket=hub.socket_path,
+                task_id="codex-tel")
+            await asyncio.sleep(0.1)
+            status = hub.get_status("codex-tel")
+            await hub.stop()
+            return receipt, status
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self.root = Path(tmp)
+            receipt, status = asyncio.run(scenario())
+        self.assertEqual(receipt.outcome, "delivered")
+        self.assertIsNotNone(status)
+        self.assertEqual(status["state"], "finished")
+
+
 if __name__ == "__main__":
     unittest.main()
