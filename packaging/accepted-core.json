@@ -4,8 +4,8 @@
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "e5d2267c7222b911081fd06e59134ff7a9826cef",
-      "sha256": "b224a268083b23fb8080430c8154189bd12602cc94098be1258e9af32ab9a344"
+      "blob": "dff7268361c0e5972e246e88ab402d068a06382f",
+      "sha256": "7ddd2bba50f813fe62436a00f6cdfc30ab2180548696f5697f787d9efb8ccb9d"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -20,16 +20,16 @@
       "sha256": "d55ca4152cda233dc4f746427a77ad1916ae06f829434a1bf29a3bf5dadb2bf6"
     },
     "src/zcode_supervisor/cli.py": {
-      "blob": "2353612d9e877eab2d3fdb865963086c316db5b2",
-      "sha256": "83359b56a88d584c865acb2170480966d737943ab86dcb6730d3d388487c7b1c"
+      "blob": "837926cbdae28c1b0661633d5355521530f37095",
+      "sha256": "29e3b27fed9ecbb1bbda62071e1078b4d916720aa5f4180a96b2a0032bf2f5c5"
     },
     "src/zcode_supervisor/codex_appserver.py": {
       "blob": "4fcfe669338347af7dd243be76b0bcc99ebe6f1e",
       "sha256": "9e8e5b896ee039a3a03b196cdf4317533c8c7cf047804a21e794fdd93f545942"
     },
     "src/zcode_supervisor/codex_driver.py": {
-      "blob": "2e74dc61a55b1eda490574a4a24ee06b8a8c9b9d",
-      "sha256": "71eff5242503b7f1faefeb2cdaea933ad9d1ab591e15f5404be2e67cc9af0be2"
+      "blob": "c8cb58028edd284d918ca5e0de6883180e2f2187",
+      "sha256": "b056de083618492addde094f194d8393f24c9cb671899a6029120a91d189e33c"
     },
     "src/zcode_supervisor/codex_monitor.py": {
       "blob": "c0ecda31ef8ad33ac061f490d7ae38e7bbbfa5b4",
@@ -40,8 +40,8 @@
       "sha256": "06379f7cc49aef82c60d3732e9aa36b8d0b9e630f62c62ff2ff2deed04709cae"
     },
     "src/zcode_supervisor/contracts.py": {
-      "blob": "cae8e63136236a5c5009999904bc425f899763b8",
-      "sha256": "5431b26bda5dc7b419a31fece2e85a410bdec313464028e9fe7f021788d56fcf"
+      "blob": "26a109ec4cbf71698b91df7a51a56bd24c76c6c0",
+      "sha256": "f9ad024cd8b317b92e67c6e3f9430359b3c523148431e6a637a3b0f9f7dcb995"
     },
     "src/zcode_supervisor/deadline.py": {
       "blob": "af08b7b93f2b6b83cd8c4d75836e47bf80c314f7",
@@ -64,8 +64,8 @@
       "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
     },
     "src/zcode_supervisor/hub_server.py": {
-      "blob": "c23a6ac7a1079be0ea2f551ba4ba4d8e1cd264d4",
-      "sha256": "c8c77fd897ddbe0fc40aceac927615d9d7527f8515835bf4c654d403a8338154"
+      "blob": "170e4f13ae1117cc5725626567572f411a8d57ab",
+      "sha256": "9e8298ca0a72e5f29d1e3ed710b7bec6691109c4cb274d140299b473304fd5bc"
     },
     "src/zcode_supervisor/mcp_readonly.py": {
       "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
@@ -96,12 +96,12 @@
       "sha256": "62d163e010554c1b55888505791047e0f2c8744b9ee95b1f051307d578a30477"
     },
     "src/zcode_supervisor/protocol.py": {
-      "blob": "65059be356f61511414f2bcbf855552142bfe8d3",
-      "sha256": "165cec510b8f2266a877d03d70fa8c90dab6fb4abfd3dd1740c0f7f659d614bc"
+      "blob": "fc9b13a3fd0fae0384a3122d5fcf5617619fa256",
+      "sha256": "5315a011aaed9ab45e534d50ccd3594e6f06b4ca509e96ed601d082a4d06a02e"
     },
     "src/zcode_supervisor/runtime.py": {
-      "blob": "16d32f6e03a5872bf1d22a386e557e6e9d692241",
-      "sha256": "82790256259b2d0c4e81fc373c75e03eb05564593c0342ad34a0a19154c4f0b9"
+      "blob": "a204ea97edbfbedd2029c6e549994d55e9dcf29a",
+      "sha256": "10d1d8fd8ded4ee12f39d1de847cc5bcdf319c51e60de54a7a563ca11c21ae50"
     },
     "src/zcode_supervisor/session_reader.py": {
       "blob": "68d0ae3ee7a80bcc3cf9cfe5afc643d05b35f6f1",
@@ -145,5 +145,5 @@
     }
   },
   "refreshed_at": "2026-11-03",
-  "refresh_reason": "v0.2.4 release: P-A architecture closure (all five worker channels write heartbeat ledgers, explicit ledger paths in task records, hub-restart recovery marking, bench ledger/skills/json section); graphified audit evidence docs/diagrams/zsc-code-graph"
+  "refresh_reason": "v0.2.5 release: P-B/P-C closure (skills field, events cap, pin-candidate, codex attach/stop, optional jsonschema hub extra)"
 }
