@@ -288,16 +288,6 @@ def main(argv=None):
             else:
                 print(render_text(document))
             return 0
-        if args.action == 'pin-candidate':
-            from .runtime import pin_candidate
-            candidate = pin_candidate(config)
-            if args.json:
-                print(json.dumps(candidate, ensure_ascii=False, indent=2))
-            else:
-                print(json.dumps(candidate, ensure_ascii=False, indent=2))
-            if not candidate.get('fragment_ok'):
-                return 1
-            return 0
         if args.action == 'skills':
             from .hub_server import list_skills_impl
             try:
@@ -318,6 +308,11 @@ def main(argv=None):
                     print(f"  {entry['name']}{desc}  [{source}]")
             return 0
         config = load_config(args.config)
+        if args.action == 'pin-candidate':
+            from .runtime import pin_candidate
+            candidate = pin_candidate(config)
+            print(json.dumps(candidate, ensure_ascii=False, indent=2))
+            return 0 if candidate.get('fragment_ok') else 1
         if args.action == 'doctor':
             print(json.dumps(doctor(config), ensure_ascii=False, indent=2))
             return 0
