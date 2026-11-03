@@ -41,6 +41,7 @@ import time
 from collections import Counter
 from pathlib import Path
 
+from .progress import ProgressLedger, safe_token
 from .splitlines_stream import eof_segments, scan_new
 from .worker_health import ExitProjection
 
@@ -248,13 +249,17 @@ _STDERR_WINDOW_CAP = 16 * 1024 * 1024
 
 
 def _pump_stdout_streaming(stream, raw_path, accumulator,
-                           first_partial, pump_error) -> None:
+                           first_partial, pump_error, ledger=None) -> None:
     """P2.3 stdout pump: iterate the pipe line by line, append each line
     to the private partial raw-NDJSON file (flushed per line so an
     in-flight observer sees exactly the complete segments the child has
     flushed) and feed the incremental parser. Memory: one line at a
     time; receipt metadata growth is itemised separately, not bounded
     here.
+
+    P-A G1b (2026-11-03): with a ``ledger`` each flushed line is also one
+    heartbeat — a whitelist-reduced prefix token, NO second parse (the
+    incremental parser already owns line semantics).
 
     repair1 F2: a parse exception (e.g. RecursionError on a deep-JSON
     bomb) is RECORDED and the loop keeps reading/writing — the evidence
@@ -285,6 +290,8 @@ def _pump_stdout_streaming(stream, raw_path, accumulator,
             for line in stream:
                 raw.write(line)
                 raw.flush()
+                if ledger is not None:
+                    ledger.note("codex", safe_token(line[:60], 40))
                 if pump_error["error"] is None:
                     try:
                         accumulator.feed(line)
@@ -539,6 +546,7 @@ def run_readonly(
     strict_schema: bool = True,
     exit_event_sink: callable | None = None,
     metrics_sink: dict | None = None,
+    progress_ledger: Path | None = None,
 ) -> CodexRunReceipt:
     """Run one read-only ``codex exec`` dispatch and persist its evidence.
 
@@ -575,6 +583,10 @@ def run_readonly(
     last_message_file = evidence_dir / LAST_MESSAGE_FILENAME
     events_file = evidence_dir / EVENTS_FILENAME
     schema_file.write_text(json.dumps(effective_schema) + "\n", encoding="utf-8")
+    # P-A G1b: optional heartbeat ledger beside the evidence (the hub passes
+    # the task's evidence path; standalone callers keep the old behavior).
+    _progress_ledger = (ProgressLedger(Path(progress_ledger))
+                        if progress_ledger is not None else None)
 
     argv = build_argv(codex_path, workspace, schema_file, last_message_file, model=model)
     started = time.monotonic()
@@ -607,6 +619,7 @@ def run_readonly(
         target=_pump_stdout_streaming,
         args=(process.stdout, raw_stdout_path, accumulator, first_partial,
               stdout_pump_error),
+        kwargs=({} if progress_ledger is None else {"ledger": _progress_ledger}),
         daemon=True,
     )
     stderr_pump = threading.Thread(
@@ -795,6 +808,11 @@ def run_readonly(
         json.dumps(_receipt_payload(receipt), indent=2, sort_keys=True) + "\n",
         encoding="utf-8",
     )
+    if _progress_ledger is not None:
+        # Sidecar finalization only — never able to suppress the receipt.
+        with contextlib.suppress(Exception):
+            _progress_ledger.finalize(receipt.outcome)
+            _progress_ledger.close()
     return receipt
 
 

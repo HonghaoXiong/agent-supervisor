@@ -30,7 +30,7 @@ import signal
 import time
 from pathlib import Path
 
-from . import __version__, codex_driver, ui_projection
+from . import __version__, codex_driver, progress, ui_projection
 
 # WP-C: codex_driver supplies the shared receipt metadata entry caps
 from .authority import worker_response
@@ -1253,7 +1253,7 @@ class CodexAppServerDriver:
 
     async def run_task(self, authority, workspace: Path, prompt: str, *, model=None,
                        sandbox='read-only', approval_policy='on-request',
-                       timeout_s=600, budget=None) -> dict:
+                       timeout_s=600, budget=None, progress_ledger=None) -> dict:
         # P0.1 (review spec-I3/I5): the budget originates at the CALL START,
         # before any setup — and a caller that already owns one (CLI run with
         # its initialize, hub delegate with the lazy app-server start) passes
@@ -1266,6 +1266,10 @@ class CodexAppServerDriver:
         started = time.monotonic()
         workspace = Path(workspace)
         evidence_dir = self.client.evidence_dir
+        # P-A G1c (2026-11-03): per-task heartbeat ledger beside the task
+        # evidence; None keeps injected doubles' call shapes unchanged.
+        ledger = (progress.ProgressLedger(Path(progress_ledger))
+                  if progress_ledger is not None else None)
         receipt = {'outcome': 'failed', 'thread_id': None, 'turn_id': None,
                    'final_message': None, 'command_items': [], 'approvals': [],
                    'notification_counts': {}, 'duration_s': 0.0,
@@ -1313,6 +1317,8 @@ class CodexAppServerDriver:
         def on_notification(method, params):
             if not isinstance(method, str) or not isinstance(params, dict):
                 return
+            if ledger is not None:
+                ledger.note('codex', progress.safe_token(method, 40))
             if method.startswith('turn/'):
                 # A notification may announce a turn the turn/start response
                 # did not carry (or a later turn): bind it before deciding.
@@ -1688,6 +1694,11 @@ class CodexAppServerDriver:
                 json.dumps(redact(receipt), indent=2, sort_keys=True,
                            ensure_ascii=False) + '\n',
                 encoding='utf-8')
+            if ledger is not None:
+                # Sidecar finalization only, never able to suppress the receipt.
+                with contextlib.suppress(Exception):
+                    ledger.finalize(receipt.get('outcome') or 'unknown')
+                    ledger.close()
             return receipt
         finally:
             self._merge_unattributed()

@@ -29,6 +29,7 @@ import uuid
 from pathlib import Path
 
 from . import protocol
+from . import progress
 from . import runtime
 from . import ui_projection
 from .protocol import RouterOverflow, event_router_mode
@@ -252,6 +253,18 @@ class ResidentZCode:
         client = self.client
         registry = self.registry
         output.parent.mkdir(parents=True, exist_ok=True)
+        # P-A G1a (2026-11-03): the resident channel writes the SAME heartbeat
+        # ledger as the cold executor (checked_locations already reserved the
+        # name). Monitoring closure for the recommended mode; timeouts keep
+        # their reviewed absolute CallBudget semantics — this adds evidence,
+        # not new termination paths.
+        ledger = progress.ProgressLedger(output.with_suffix('.progress.jsonl'))
+        def heartbeat(event, payload):
+            detail = progress.safe_token(event.get('type') or 'event', 40)
+            token = payload.get('toolName') or payload.get('phase') or payload.get('kind')
+            if token:
+                detail = detail + ':' + progress.safe_token(token, 20)
+            ledger.note('event', detail)
         before = await run_boundary_scan(inventory, workspace)
         task_id = Path(output).stem
         # P0.4: the stream id of every UI projection below is the run's task
@@ -408,6 +421,7 @@ class ResidentZCode:
                             + str(sid))
                     for _seq, event in router_sub.drain():
                         payload = event.get('payload', {})
+                        heartbeat(event, payload)
                         seq = event.get('seq')
                         if isinstance(seq, int) and seq > last_seq:
                             last_seq = seq
@@ -469,6 +483,7 @@ class ResidentZCode:
                                 or event.get('seq', -1) <= result['start_event_seq']):
                             continue
                         payload = event.get('payload', {})
+                        heartbeat(event, payload)
                         seq = event.get('seq')
                         if isinstance(seq, int) and seq > last_seq:
                             last_seq = seq
@@ -621,6 +636,15 @@ class ResidentZCode:
                     result['outcome'] = 'protocol-error'
             if result.get('scope_error') and result.get('outcome') != 'postflight-rejected':
                 result['outcome'] = 'scope-error'
+            # Terminal heartbeat + bounded summary, isolated so the sidecar
+            # can never suppress the primary result write (same as execute).
+            try:
+                ledger.finalize(result.get('outcome') or 'unknown')
+                result['progress'] = ledger.summary()
+            except Exception:  # noqa: BLE001
+                pass
+            finally:
+                ledger.close()
             write_json(output, protocol.redact_transport(result))
             # P2.2: the task-owned frames release ONLY here — after the
             # result (and every evidence inside it) is finalized and

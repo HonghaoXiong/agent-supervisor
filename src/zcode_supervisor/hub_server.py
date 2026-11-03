@@ -397,6 +397,56 @@ def _stop_task(config, task_id) -> dict:
             "note": "stop signalled; poll task_status for the stopped outcome"}
 
 
+# P-A G3 (2026-11-03): hub restart recovery. A record still "running" whose
+# task is NOT in the in-flight registry predates this process — the dispatch
+# died with the previous hub. Marked interrupted once per process (the
+# super-agent recovery-note pattern: evidence retained, human decides).
+_PROCESS_STARTED = time.time()
+_recovery_done = False
+_recovery_lock = threading.Lock()
+
+
+def _recover_stale_tasks(config) -> int:
+    """Mark pre-restart 'running' tasks interrupted (idempotent per process)."""
+    global _recovery_done
+    with _recovery_lock:
+        if _recovery_done:
+            return 0
+        _recovery_done = True
+    recovered = 0
+    tasks_dir = _tasks_dir(config)
+    if not tasks_dir.is_dir():
+        return 0
+    for path in tasks_dir.glob("*.json"):
+        try:
+            if path.stat().st_mtime >= _PROCESS_STARTED:
+                continue  # touched by THIS process: genuinely live
+            record = json.loads(common.read_regular(path))
+        except (OSError, ValueError):
+            continue
+        if record.get("status") != "running":
+            continue
+        with _running_tasks_lock:
+            live = record.get("task_id") in _running_tasks
+        if live:
+            continue
+        record["status"] = "interrupted"
+        record["outcome"] = "hub-restart"
+        record["note"] = ("hub process restarted while this task was in flight; "
+                          "evidence retained — attach to the recorded session "
+                          "to continue manually")
+        record["updated"] = _now()
+        with contextlib.suppress(OSError, ValueError):
+            _write_task_record(path, record)
+            _append_index(config, {
+                "ts": _now(), "task_id": record.get("task_id"),
+                "worker": record.get("worker"), "status": "interrupted",
+                "outcome": "hub-restart",
+                "contract_id": record.get("contract_id")})
+        recovered += 1
+    return recovered
+
+
 # P2.4: synchronous index/SQLite/disk reads ride a DEDICATED bounded
 # executor (2 workers) behind a UI/read request semaphore (4) — the MCP
 # event loop never blocks on them, and concurrent reads are capped.
@@ -741,11 +791,13 @@ def task_status_impl(config, task_id=None, limit=10) -> dict:
 
     Terminal tasks report their recorded status/outcome; a task still marked
     running is enriched with the :mod:`zcode_supervisor.progress` liveness
-    verdict from its heartbeat ledger (searching both the delegate evidence
-    dir and the zcode run dir under work_root).
+    verdict from its heartbeat ledger. P-A G2 (2026-11-03): the record's
+    explicit ``progress_ledger`` path is authoritative; the legacy
+    two-directory scan remains only as a fallback for old records.
     """
     from .progress import liveness
 
+    _recover_stale_tasks(config)
     tasks_dir = _tasks_dir(config)
     entries: list[dict] = []
     if tasks_dir.is_dir():
@@ -768,15 +820,26 @@ def task_status_impl(config, task_id=None, limit=10) -> dict:
                 "outcome": record.get("outcome"),
                 "updated": record.get("updated"),
             }
+            if record.get("note"):
+                entry["note"] = record["note"]
             if record.get("status") == "running":
-                for directory in _task_ledger_dirs(config, record):
-                    verdict = liveness(directory)
+                ledger_path = record.get("progress_ledger")
+                if isinstance(ledger_path, str) and ledger_path:
+                    verdict = liveness(ledger_path)
                     if verdict.get("state") != "unknown":
                         entry["heartbeat"] = {
                             key: verdict.get(key)
                             for key in ("state", "age_s", "last", "outcome")
                             if verdict.get(key) is not None}
-                        break
+                if "heartbeat" not in entry:
+                    for directory in _task_ledger_dirs(config, record):
+                        verdict = liveness(directory)
+                        if verdict.get("state") != "unknown":
+                            entry["heartbeat"] = {
+                                key: verdict.get(key)
+                                for key in ("state", "age_s", "last", "outcome")
+                                if verdict.get(key) is not None}
+                            break
             entries.append(entry)
     if task_id is not None and not entries:
         raise HubError("unknown-task", f"no hub task record for {task_id!r}")
@@ -785,7 +848,7 @@ def task_status_impl(config, task_id=None, limit=10) -> dict:
 
 
 def _task_ledger_dirs(config, record) -> list[Path]:
-    """Candidate directories holding a running task's progress ledger."""
+    """Legacy fallback directories for records without a recorded ledger path."""
     candidates: list[Path] = []
     evidence = record.get("evidence_dir")
     if isinstance(evidence, str) and evidence:
@@ -1280,6 +1343,8 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             appserver_driver_factory=appserver_driver_factory,
             appserver_concurrency=appserver_concurrency,
             ui_emitter=emitter)
+    # P-A G3: one-shot recovery of pre-restart running records.
+    _recover_stale_tasks(config)
     resolution = resolve_worker_health(config, codex_path)
     entry = resolution["workers"].get(worker, {})
     remaining = sorted(
@@ -1342,6 +1407,17 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         "contract_sha256": digest,
         "created": _now(),
     }
+    # P-A G2 (2026-11-03): the ledger path is DETERMINISTIC per worker/mode —
+    # record it so task_status reads the authoritative location instead of
+    # scanning candidate directories. All five channels now write a ledger.
+    if worker == "zcode":
+        record["progress_ledger"] = str(
+            Path(config.work_root) / "hub-tasks" / task_id
+            / "run.progress.jsonl")
+    elif worker == "dsh":
+        record["progress_ledger"] = str(evidence_dir / "dsh.progress.jsonl")
+    else:
+        record["progress_ledger"] = str(evidence_dir / "codex.progress.jsonl")
     if action == "attach":
         record["attached_to"] = attach_to
         record["resumed_session"] = resume_session
@@ -1469,6 +1545,14 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                     # start used (injected doubles without the parameter keep
                     # their own timeout handling)
                     run_kwargs["budget"] = delegate_budget
+                # P-A G1c: heartbeat ledger path (duck-typed for doubles).
+                try:
+                    accepts_ledger = "progress_ledger" in inspect.signature(
+                        driver.run_task).parameters
+                except (TypeError, ValueError):
+                    accepts_ledger = False
+                if accepts_ledger:
+                    run_kwargs["progress_ledger"] = record["progress_ledger"]
                 async with workers.appserver_gate():
                     with common.workspace_lock(Path(contract["workspace"]),
                                                Path(config.state_dir)):
@@ -1514,6 +1598,15 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                                 emitter, "cold", "codex")
                 with common.workspace_lock(Path(contract["workspace"]),
                                            Path(config.state_dir)):
+                    # P-A G1b: heartbeat ledger path (duck-typed for doubles).
+                    try:
+                        exec_ledger_ok = "progress_ledger" in inspect.signature(
+                            codex_runner).parameters
+                    except (TypeError, ValueError):
+                        exec_ledger_ok = False
+                    if exec_ledger_ok:
+                        exec_kwargs["progress_ledger"] = Path(
+                            record["progress_ledger"])
                     receipt = await _invoke(
                         codex_runner, effective_codex_path,
                         Path(contract["workspace"]), contract["prompt"],

@@ -144,6 +144,75 @@ def _section_result(samples, notes):
     return entry
 
 
+async def bench_ledger_and_json(scratch_dir):
+    """P-A G8 (2026-11-03): heartbeat-ledger write overhead, skills cache hit
+    cost, and an optional orjson-vs-stdlib JSON A/B. Zero model requests; the
+    orjson leg degrades to a 'not installed' note instead of failing.
+    """
+    import time as _time
+
+    from . import progress as _progress
+
+    with _bench_workspace(scratch_dir, 'ledger-json') as scratch:
+        # 1) ledger note throughput: 5,000 notes through one ProgressLedger
+        ledger_path = scratch / 'bench.progress.jsonl'
+        ledger = _progress.ProgressLedger(ledger_path)
+        started = _time.perf_counter()
+        for index in range(5000):
+            ledger.note('event', f'tool:Edit#{index % 97}')
+        ledger_seconds = _time.perf_counter() - started
+        ledger.finalize('delivered')
+        ledger_bytes = ledger_path.stat().st_size
+        ledger.close()
+    # 2) skills list cold vs cached (mtime-keyed: second call re-reads nothing)
+    from . import hub_server as _hub
+    cached = dict(_hub._skills_cache)
+    _hub._skills_cache.clear()
+    try:
+        cold_started = _time.perf_counter()
+        cold = _hub.list_skills_impl('zcode')
+        cold_seconds = _time.perf_counter() - cold_started
+        warm_started = _time.perf_counter()
+        warm = _hub.list_skills_impl('zcode')
+        warm_seconds = _time.perf_counter() - warm_started
+        skills_note = {'cold_count': cold.get('count'),
+                       'warm_count': warm.get('count')}
+    finally:
+        _hub._skills_cache.clear()
+        _hub._skills_cache.update(cached)
+    # 3) JSON A/B: stdlib vs orjson over a canned NDJSON sample (10k lines)
+    sample_lines = []
+    for index in range(10000):
+        sample_lines.append(
+            '{"type":"status","phase":"step_start","turn":1,"step":%d,"seq":%d}'
+            % (index, index * 7))
+    sample = "\n".join(sample_lines)
+    std_started = _time.perf_counter()
+    std_count = sum(1 for _ in map(__import__('json').loads, sample_lines))
+    std_seconds = _time.perf_counter() - std_started
+    json_note = {'stdlib_10k_lines_s': round(std_seconds, 4),
+                 'parsed': std_count}
+    try:
+        import orjson  # noqa: F401  (optional fast extra)
+        or_started = _time.perf_counter()
+        or_count = sum(1 for _ in map(orjson.loads, sample_lines))
+        or_seconds = _time.perf_counter() - or_started
+        json_note['orjson_10k_lines_s'] = round(or_seconds, 4)
+        json_note['speedup'] = round(std_seconds / or_seconds, 2) if or_seconds else None
+        json_note['parsed_orjson'] = or_count
+    except ImportError:
+        json_note['orjson'] = 'not installed (optional extra [fast])'
+    return {
+        'status': 'ok',
+        'model_requests': 0,
+        'ledger_5000_notes_s': round(ledger_seconds, 4),
+        'ledger_bytes': ledger_bytes,
+        'skills_cold_s': round(cold_seconds, 4),
+        'skills_cached_s': round(warm_seconds, 4),
+        'skills': skills_note,
+        'json': json_note,
+    }
+
 def _bench_permission(_params):
     return {'decision': 'deny', 'reason': 'czs bench sends no model turn'}
 
@@ -1783,6 +1852,7 @@ async def run_fake_baseline(server_path, out_dir, *, steady_rounds=3,
         (FAKE_READ_LIST, lambda: bench_fake_read_list(
             scratch, tasks=2, runs_per_task=60, messages=40, trials=3)),
         (FAKE_UI_JOURNAL, lambda: bench_fake_ui_journal(scratch)),
+        ('ledger-and-json', lambda: bench_ledger_and_json(scratch)),
     ]
     for name, runner in runners:
         try:
