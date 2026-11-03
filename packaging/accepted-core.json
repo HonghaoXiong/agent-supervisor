@@ -4,8 +4,8 @@
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "0b70dfad65dde42e151a1b99ceeb7145a0fa4ddd",
-      "sha256": "bbf267ce63260745b9c00b3001c2420e36ba6987ab3eb78097dc40044feb3c76"
+      "blob": "e5d2267c7222b911081fd06e59134ff7a9826cef",
+      "sha256": "b224a268083b23fb8080430c8154189bd12602cc94098be1258e9af32ab9a344"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -16,20 +16,20 @@
       "sha256": "df7bd87f9659cb89ff0261207d2d88b0fbbaa15966d4e3c69e1030a8293f471c"
     },
     "src/zcode_supervisor/bench.py": {
-      "blob": "36bed8353a5bf773efba28250e3376d5444bdd5e",
-      "sha256": "5ed161b2583797c00405a4615bbb67be6a85a7943df546f3f3f890047c983a21"
+      "blob": "07f7e5b0d2a088b274f1efdb53e51c3efecd8680",
+      "sha256": "d55ca4152cda233dc4f746427a77ad1916ae06f829434a1bf29a3bf5dadb2bf6"
     },
     "src/zcode_supervisor/cli.py": {
       "blob": "2353612d9e877eab2d3fdb865963086c316db5b2",
       "sha256": "83359b56a88d584c865acb2170480966d737943ab86dcb6730d3d388487c7b1c"
     },
     "src/zcode_supervisor/codex_appserver.py": {
-      "blob": "db99fb6e47628fc556ac424b89e9a52fce3ff0f8",
-      "sha256": "a57f3ef0706a08e75f1c8f110ba60135047873cf6633cd5d9d25abeba7125983"
+      "blob": "4fcfe669338347af7dd243be76b0bcc99ebe6f1e",
+      "sha256": "9e8e5b896ee039a3a03b196cdf4317533c8c7cf047804a21e794fdd93f545942"
     },
     "src/zcode_supervisor/codex_driver.py": {
-      "blob": "00f4660317c56d8d08601046edd9f1fe7606639c",
-      "sha256": "e04ff623c556195235ce40e13c09fdd41db0356a73f89689810714917f766470"
+      "blob": "2e74dc61a55b1eda490574a4a24ee06b8a8c9b9d",
+      "sha256": "71eff5242503b7f1faefeb2cdaea933ad9d1ab591e15f5404be2e67cc9af0be2"
     },
     "src/zcode_supervisor/codex_monitor.py": {
       "blob": "c0ecda31ef8ad33ac061f490d7ae38e7bbbfa5b4",
@@ -55,6 +55,170 @@
       "blob": "c1f443290b130d1d7cbc32e865539a2b3dc1bbaa",
       "sha256": "9241a3715418e1560c2dacbe424fb4b0aa80be54f7b01ac40fbc2daf22358611"
     },
+    "src/zcode_supervisor/graphify-out/.graphify_analysis.json": {
+      "blob": "8b2841b068de6cadb6b21008ae650978c32e6c2a",
+      "sha256": "39b9926d2e14313172d18f115b6e1047d9ee0476203303a3fd377acf04d4f5de"
+    },
+    "src/zcode_supervisor/graphify-out/.graphify_root": {
+      "blob": "df39ac6ef5129709758a0a45fd1df9626f3c81bd",
+      "sha256": "6ba46c21b89d45726c3a4ac9eb60d8d95d6b746eead8a40975655c958aa2d03b"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/0a1752547f8c63cb52e740b8e7f000c965cb4eb606605c1d89512aab4ea1e493.json": {
+      "blob": "8e0c61a9e88bad9a69fe95f47e556d2fe380c5e4",
+      "sha256": "1f3b5c5a263a13f7b63ae8b16669e29cb4515bf5200664540d91340a6005be9b"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/0db43dd3c79bb3a2f3ed0e4153b110aedec0bea2d63e6ed985d57fed8efcacd4.json": {
+      "blob": "0f935d1a48f5be931dcf7d461a80e9b6bde54890",
+      "sha256": "73109b15c2dc9ed7564cbf319e20d132777b8903963a10691eef720268de7b36"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/21ddf82b4cdb870cfc0320bddb8d966d1729acd7bf6971b7f105767830c6f56d.json": {
+      "blob": "3b44d2e910dbdbeaa111fec187776bbf825e8aab",
+      "sha256": "229e6ea747fcec7d6a3c004852eb55fd25874bfca4be71b102dce239dad71fb0"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/24c02e65efd66c860fada803b8866e89e5baa16e0febe318faecc026890c1aae.json": {
+      "blob": "8b8457ebe0f63c131a82105c738b433b6dd0898b",
+      "sha256": "b501376e532b1fc677204348a97a155039d6a7c8707ece7b1149357e10e70ddd"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/28648ae1947149792d3a22c04e1aa03bbefa1cd25d69224e08c8a96e2622574e.json": {
+      "blob": "db6716271f6ecea3bafffd4187b76fdfeea6e230",
+      "sha256": "be52322597316475cb3ba950f18a671354c4bd0137c58c68ba033ddbb7b47bde"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/29a74d045d9e977b8198a445d87f543a03a3ef2e8f2695f0055249b4a277bc69.json": {
+      "blob": "f56a95536e25c3e503c7bf58e97d048d793e6187",
+      "sha256": "9382039fbbe308b0fe2e5197e18e076c831a2769160483e0c1456b50b493fffd"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/48e93719acf51eaae0b326c4cb22c2874b676b50e14ccda509a914fd9fc5e590.json": {
+      "blob": "e675f8a2f371ed89828420439133765096556403",
+      "sha256": "19b5fccef358288786384a420b3ed5e2c410e7c2f7e6586c805a935ed00ad63a"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/4b3346cf1229375a20bc9a9e7afa0aa686fd209da743bd2409788634a675c986.json": {
+      "blob": "dfad55c1f6225b7191f366fbce7192c313e746df",
+      "sha256": "5987cad585710078cd93ff1501319ed113d362420c5ac008a115ad7300ba87be"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/5271141d4d187ca3ec933bd5fdd58c26a379077c48dfb8db863dd838211fa739.json": {
+      "blob": "5c1f49c25da4d7fefa673c2ac88f818e493c8eb7",
+      "sha256": "38bb8cb11309169a3015fe1626a6cce874b1aa5e9e6281463e6e1b09f602aebc"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/5655c0871248d364994b958bc326a8c54dd7cd0221b24212f303c7de2083fb4e.json": {
+      "blob": "87777b06e0caca7502cd8187eb379e2649094063",
+      "sha256": "4b19a1de2e506ad7659aa2ad56a823713aa07b064f7f58a62b29a4b9f86b505a"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/5a71d44f7f5a53fd637d1117f70003b80b6666a82ad970db17b19ebb0b47ecfb.json": {
+      "blob": "7a395d4cfceef85f014d09a7f810ca115b30a2e1",
+      "sha256": "8611097262bb8c3548b44f6de66dbbb18a204d6ccd0df8774cd61ac03b8065fe"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/65427a1c90ba70dc7dc2f33d640c5893d60c9cf2e0e4e0383f0fb5520211008b.json": {
+      "blob": "3296deb1096664fbe6eda32898d964caa456de31",
+      "sha256": "6f83728a0fdd98419c7bdba90dfae38e3d0e0365c44d509ed837913d90b4b89e"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/68cf4525e103cb19446f3d6e2af01fc4d64f6925c5b417beab79fc97cc3af769.json": {
+      "blob": "6deea7413a6109838f5b307df8755040fe9453ed",
+      "sha256": "3afd403a94f9df7388adbbb9f2329f4b81ba4625c3ce71c6fa86e815f1a86f7e"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/75e621a0d444ee6ab6ff73f00a2bfa3aff31b8213a35448676f3ee69dee65e5b.json": {
+      "blob": "daa03bbc188ab5e8a60eb14d44b779ad833d5a50",
+      "sha256": "27f75d90f8fb098d7668b1548c756996e6fb40e3a47fb226123d56434e68a5ac"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/7cfcfe7c544bb5106bdeb1e7f5ebe01aadd94876ef2a0b29f47b12ac16a67e29.json": {
+      "blob": "6e2c0fdefc3de7b3f6e85fe7ef9dcda9b16b3f76",
+      "sha256": "c67edf100c3994cdf895307559621c75411e7376421713864820cae5a15a6dee"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/8606f59fa187b4b35c7a5d1256b450341a84a47a3c7ff673a8cf3ab519ded374.json": {
+      "blob": "1d063a3f7ef6fe9e0acaf7d603318a33618f3423",
+      "sha256": "956b4924f6b5f3058e6d80319c1b54c13d27dfe0f4b73d1781b1bf65ea7c8905"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/8738a20f07b78bc8c1364d76fb1f0bb1976ff9c02bd62a28ede9fb332cd2ea47.json": {
+      "blob": "87078d63747348784c55fe0f427c4cd5d0c0bcf3",
+      "sha256": "151675c8a13fba95afb8fe9869b3be90ed40bcca9f0924f54455ba9e0ecf64ea"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/9b49ca3acdcb283f13d22fc2bf3eab069a1cb233ac3d4f3f1fb0082a458728dd.json": {
+      "blob": "c4d48787fe825c63ea8282594b4bb29267e250e3",
+      "sha256": "37ac6c73f6213e5bc912cab207d101ca5e2bd35a7e525afedd154cc649bcd7ac"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/9ee424deee986eb574f34ed9d8da678d7520ac484ac6edbf587cee05a3a2764f.json": {
+      "blob": "b6d90f031b4b1656234537a4b1e66ba33690557e",
+      "sha256": "8d9349a4595755a69d561fbb53729660f489a3e2ddaeff1d42cf353dff5b05d3"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/9fa8d363ab1999c5b2239ae5c0389e510b846af72601949bb860cc238cf5abd4.json": {
+      "blob": "96dfa423ed9ce32935f4053cc42d1ebeb97e9e0c",
+      "sha256": "85aec0220057a6c214eca29af9b806587b5c96059b09c3c69cb9bf1235261b46"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/a0aee8f5ad7e4ce44f23f5bc7a61500316d1c248b851f107808cf50253b2a116.json": {
+      "blob": "66f0dc1216fb70c0643b9f0db520c4d3e807e8b1",
+      "sha256": "11d8dbd098168be04abc734fb1517b2a60186f250dbd836de6ff9e4ea94ebb46"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/ac49ae943e4ebcbbf3f1856c2e49f0d11fdd600345417e75f9373b742867d952.json": {
+      "blob": "c34d1bd1f51986b6307daf59a5839937cbe5ee58",
+      "sha256": "5c28f7c1e0690612dd22ba2aadce6e8339530c66707f1a8a84387e33b644e409"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/be2dcbe3eb75f9bdbf055a603a2fa92385d92a3d0c57e288603bef59b7477988.json": {
+      "blob": "793453172c211a1d6222fcdab94b2cca6fa20452",
+      "sha256": "3ed801af47cf54c8337b921a109f3a80d3a1a809881d777aef158442e88d8106"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/bf275b4839d17c2fd3dba37a8f95b5fd21675519863ec3adc36c900cbd784f85.json": {
+      "blob": "b178bddcb7acf7d4ea54ba8c606d13b7cc26b242",
+      "sha256": "bebd43948f77900ce9da84b0fff8153261d2ed7dbfd1b38b0dd0d2c15c4dca0e"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/cd9c206bca192aba714a7bc11b168395781d81b0eacfde256160c28e1234a7ba.json": {
+      "blob": "77d185bae4f2aab349fe7d27c0fbdf8372a5f124",
+      "sha256": "562afd21c635b20680a5bb1d243d9fb75b07834873bc8c1c4a71f92bd05ce9af"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/d3ed12c95be479b5b77848fd2879b83e0b9de4c1ae21298922f029b5ce86a6f1.json": {
+      "blob": "5daf78185fbd9196f52006927ff6d6ba869f7ee6",
+      "sha256": "0cc792f47215a3ca6f59e8806326b592cab8c99cdfcb4ce5af7e775b1754dffb"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/dffc3f3206bac185891dcffe0a6452fa751f5611c8d712a3836367e9050fda53.json": {
+      "blob": "19d74467e286066673c0d0c63f922c9d150c094d",
+      "sha256": "c8a1af90226db1a01941325729060e8d7bbd890d70be1d2a4f74b678044b5933"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/e0d9158c202984232348a157306618589e5bb0d26361eddbcefccc7646aaf121.json": {
+      "blob": "076afe527baff4a96ee8472ed14c85d7b9af6496",
+      "sha256": "9c139bd37b4e3044e3098c9aaa3835bed201d8fbc1c02ccb520944331c3b03f2"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/e186125410069a54dccb3e6efd6d7d8f9c19eda86a1e2b95f42b4089df11788b.json": {
+      "blob": "2a8acfb9e79a1b3c8fd4176e23ec5d805fc1ef49",
+      "sha256": "3e4c9dbb119c52bafcf8c601b5abae39c011bc223b40748d5723048a848f6f90"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/e2c42c2262b2b6b8bb9b67fd18c1e57cdf67d48d70980bd93c17c7dcdc1a6e1a.json": {
+      "blob": "24c220edaaf169e56d4d8e0852a31fbad73f9334",
+      "sha256": "d208c3f2bfea71121eaceea29e36bf425e6ce969638f345bb9cbde15da376bd5"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/e4101c194f510f39672875a2f68f0dc575d492908d11c3e1c19a06a2bf8c36c4.json": {
+      "blob": "c46d68652112863e0a44649ec112de21752af89c",
+      "sha256": "abd43fdc6db379c278831025377c0df649b00e6234745db925cb175bf8c273cf"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/e6f8b34b7711428a2e6ebed086000ee9281b2c97967e43f4e4e0fcfc86e288aa.json": {
+      "blob": "a5907027c03c3b7f5d826e7b0a9666f758034c9b",
+      "sha256": "dabf37417e0d523450224caac6679b4fba885da3fba771f425236772093eef1f"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/f2075b8f693ed75c3ee3829fcd2efb1c44ec486fc88c8c45649003ba51ddde55.json": {
+      "blob": "1d322b1c90db2bea6c1d83106f8267bca1b22a1b",
+      "sha256": "e57797db00e43f01ea502128257f0c52163d5aad02d8e1239dff3ec72becaba2"
+    },
+    "src/zcode_supervisor/graphify-out/cache/ast/v0.9.100-s33-g7154a062ba57/fd7acb65384b792ec28cfebc3c40dcac3abe008b77d83f7a4dd201f6eea35552.json": {
+      "blob": "022c069fc9436cd9c05cd9b7ef5e6acc9ec80f1e",
+      "sha256": "da47b1437610b69e6254774113f66cc8b3f1df2f8dc165bc0bab2c8ba7f4ab8a"
+    },
+    "src/zcode_supervisor/graphify-out/cache/last_query_stamp": {
+      "blob": "8ea609bd805ac9ef1ce966aa94b883ab59c3246b",
+      "sha256": "cc67636aa24311117090b461b5a836468b1efb3b0218a90452838a8b20e78fa1"
+    },
+    "src/zcode_supervisor/graphify-out/cache/stat-index.json": {
+      "blob": "941082627f6572cbea8e8495cb74dcfe566d3df9",
+      "sha256": "2f65376a283ff962b416850c11245fe00d2a163c9f340c3cc168423bc56c6882"
+    },
+    "src/zcode_supervisor/graphify-out/graph.html": {
+      "blob": "b53e7969b79c6410d37e5d78580362328b4b9a2b",
+      "sha256": "931b222187cd761c66032baa37a39a79b914d42c6a88e15f758f90c0a32f619f"
+    },
+    "src/zcode_supervisor/graphify-out/graph.json": {
+      "blob": "593b0b11b8f5349494417b3a761d4c739efc223d",
+      "sha256": "c4e07829b9f7a6ff364dab14b8188440859872ac4e25c2bca8c7504c7e8544c7"
+    },
+    "src/zcode_supervisor/graphify-out/manifest.json": {
+      "blob": "b83b3bf56b4e81f4af83d0ee3b1eaa8dc50e8eba",
+      "sha256": "70adbe5fc55c527806730a571ca6110224878cf669ed86f4a6b44904a3660ed4"
+    },
     "src/zcode_supervisor/habits.py": {
       "blob": "e0e336240ed21934c01144e68396a6721dcb2ae3",
       "sha256": "d29900a60c63bedab1fe4b164c1aad13fb4dbb4b48c98bc35fbf78b8122b475d"
@@ -64,8 +228,8 @@
       "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
     },
     "src/zcode_supervisor/hub_server.py": {
-      "blob": "c5f8507c12f05c6e94c6b9ae83ba4a09b82e26ab",
-      "sha256": "3ac78390d2bbc5dbd529efdcbf7c686b078514a470cc6f0f8dc393b384ba5ecb"
+      "blob": "c23a6ac7a1079be0ea2f551ba4ba4d8e1cd264d4",
+      "sha256": "c8c77fd897ddbe0fc40aceac927615d9d7527f8515835bf4c654d403a8338154"
     },
     "src/zcode_supervisor/mcp_readonly.py": {
       "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
@@ -140,10 +304,10 @@
       "sha256": "6ceeca261cab71e206d6e8e182d3ea192001d1950957dc81c2a17fdafca1a8f3"
     },
     "src/zcode_supervisor/zcode_resident.py": {
-      "blob": "d5a90aa80287d415fcafe34e4ae9f2e62475007d",
-      "sha256": "f541992385d4e9677e2e16a6898e451231caa7803e584ee3ebf5c430b7643943"
+      "blob": "9966cf29c6d03a3eb4657935206fc7158dede1d7",
+      "sha256": "82e5849927b51821c38a57f034ca48332018e258dede10e2d86903bc73c07b6d"
     }
   },
   "refreshed_at": "2026-11-03",
-  "refresh_reason": "v0.2.3 release: delegate attach/stop actions, dsh session reuse and stop handle, CLI 0.17.1 bundle pin d9afd58d (live ritual: doctor/probe/bounded allow task/attach-resume/tamper rejection)"
+  "refresh_reason": "v0.2.4 release: P-A architecture closure (all five worker channels write heartbeat ledgers, explicit ledger paths in task records, hub-restart recovery marking, bench ledger/skills/json section); graphified audit evidence docs/diagrams/zsc-code-graph"
 }
