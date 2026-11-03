@@ -1,4 +1,0 @@
-# Rust build artifacts and assembled (unsigned) bundle — rebuild bit-identically
-# via packaging.sh; see tasks/P3.3 reproducibility record.
-/target/
-*.app
