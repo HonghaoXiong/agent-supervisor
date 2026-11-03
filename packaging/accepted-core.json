@@ -4,8 +4,8 @@
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "dff7268361c0e5972e246e88ab402d068a06382f",
-      "sha256": "7ddd2bba50f813fe62436a00f6cdfc30ab2180548696f5697f787d9efb8ccb9d"
+      "blob": "f107d36a383e8cb3403e30cb8cceadeed93d7d67",
+      "sha256": "ff97b12405030ab72dbfe8cc5ba595a0a691a61270f8bbae33bd598083e9fc39"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -16,8 +16,8 @@
       "sha256": "df7bd87f9659cb89ff0261207d2d88b0fbbaa15966d4e3c69e1030a8293f471c"
     },
     "src/zcode_supervisor/bench.py": {
-      "blob": "07f7e5b0d2a088b274f1efdb53e51c3efecd8680",
-      "sha256": "d55ca4152cda233dc4f746427a77ad1916ae06f829434a1bf29a3bf5dadb2bf6"
+      "blob": "04fdec2e6907b64b368f9573e50c3d6efa8c7abc",
+      "sha256": "a2964cfb12f3ce2c2f73459772e9be4e79bbe8b07caa2afe6f7bba9d99a56457"
     },
     "src/zcode_supervisor/cli.py": {
       "blob": "ee7754f7a92d722a5db7742a7bea55b8cf132c4f",
@@ -28,8 +28,8 @@
       "sha256": "9e8e5b896ee039a3a03b196cdf4317533c8c7cf047804a21e794fdd93f545942"
     },
     "src/zcode_supervisor/codex_driver.py": {
-      "blob": "c8cb58028edd284d918ca5e0de6883180e2f2187",
-      "sha256": "b056de083618492addde094f194d8393f24c9cb671899a6029120a91d189e33c"
+      "blob": "6c16c1840f5f05032413a7d7437d7aaea5821ef7",
+      "sha256": "6ff1ee30101672415472aed11354421231cc1e045a83ed67e29232f6246aac11"
     },
     "src/zcode_supervisor/codex_monitor.py": {
       "blob": "c0ecda31ef8ad33ac061f490d7ae38e7bbbfa5b4",
@@ -52,8 +52,8 @@
       "sha256": "c362c7e14634e31d69e24d1097bf8b5b99b41abf5c12db71ca5dc55a1ca03fce"
     },
     "src/zcode_supervisor/dsh_driver.py": {
-      "blob": "c1f443290b130d1d7cbc32e865539a2b3dc1bbaa",
-      "sha256": "9241a3715418e1560c2dacbe424fb4b0aa80be54f7b01ac40fbc2daf22358611"
+      "blob": "09a56f088acce42d1f8525f742a3f1fe82c19979",
+      "sha256": "1a7d0d1862b329b6d1ba8bdc22333dada16e50e311dc57dcf930f8c40b9be031"
     },
     "src/zcode_supervisor/habits.py": {
       "blob": "e0e336240ed21934c01144e68396a6721dcb2ae3",
@@ -64,8 +64,8 @@
       "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
     },
     "src/zcode_supervisor/hub_server.py": {
-      "blob": "170e4f13ae1117cc5725626567572f411a8d57ab",
-      "sha256": "9e8298ca0a72e5f29d1e3ed710b7bec6691109c4cb274d140299b473304fd5bc"
+      "blob": "af7817facf72008d0c24f86088df32a53d4e5a3f",
+      "sha256": "c074ab7526fc48d2390c95540e6455e593f80c998ec80ad83b4ba4622ec4bbb7"
     },
     "src/zcode_supervisor/mcp_readonly.py": {
       "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
@@ -111,6 +111,10 @@
       "blob": "b527a90aa38e551c0eb56d93946da4c5e27c75e6",
       "sha256": "2ba69e64e4f4f0dbf499ef7a39acdefa48627ea62e906440535f455ba90eaa1f"
     },
+    "src/zcode_supervisor/transport.py": {
+      "blob": "75ab08b2d481b8b34f33cafada1f76de72d06457",
+      "sha256": "a885ec4cb9215eee59bbd46ae121413d15c23f9dcb104017d798aa15f9e500e2"
+    },
     "src/zcode_supervisor/tri_probe.py": {
       "blob": "e602529ab3591b73d893554a8a85516898f3525a",
       "sha256": "f8f00a727a1bf131fcc93ad804ab1ed761c25e234cdfe8fb34b325ed47de3426"
@@ -140,10 +144,10 @@
       "sha256": "6ceeca261cab71e206d6e8e182d3ea192001d1950957dc81c2a17fdafca1a8f3"
     },
     "src/zcode_supervisor/zcode_resident.py": {
-      "blob": "9966cf29c6d03a3eb4657935206fc7158dede1d7",
-      "sha256": "82e5849927b51821c38a57f034ca48332018e258dede10e2d86903bc73c07b6d"
+      "blob": "1ace0649d029ffe940ceb6f8deb61a6002c0cc39",
+      "sha256": "3d54d6d1cdefc1b6a1a0c674bfd0624f9f784888627842fb58057281977ce7d8"
     }
   },
   "refreshed_at": "2026-11-03",
-  "refresh_reason": "v0.2.5 release: P-B/P-C closure (skills field, events cap, pin-candidate, codex attach/stop, optional jsonschema hub extra)"
+  "refresh_reason": "v0.2.6: L1 binary IPC transport (UDS+MessagePack, all five channels telemetry push, 206x status read speedup, 35us RTT)"
 }
