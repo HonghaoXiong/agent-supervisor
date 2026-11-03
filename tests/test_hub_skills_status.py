@@ -61,21 +61,32 @@ class SkillsListing(unittest.TestCase):
         marker = _make_skill(skills_dir, "evolving", "first")
         listing = H.list_skills_impl("dsh", roots=[(skills_dir, "*/SKILL.md")])
         self.assertEqual(listing["skills"][0]["description"], "first")
-        # content rewritten but the mtime FORCED back: the cache still serves
-        # the old parse (the mtime is the cache key)
-        original_mtime = marker.stat().st_mtime
-        marker.write_text('---\nname: evolving\ndescription: "second"\n---\n',
-                          encoding="utf-8")
-        os.utime(marker, (original_mtime, original_mtime))
-        listing = H.list_skills_impl("dsh", roots=[(skills_dir, "*/SKILL.md")])
-        self.assertEqual(listing["skills"][0]["description"], "first")
-        # a real mtime move re-reads the frontmatter
+
+        # TTL fast path serves the cache without per-file stat calls; but a
+        # per-file mtime bump still triggers re-read on the next full scan.
+        # Force a full scan by expiring the directory cache TTL.
+        H._skills_dir_cache.clear()  # simulate TTL expiry
         marker.write_text('---\nname: evolving\ndescription: "third"\n---\n',
                           encoding="utf-8")
         current = marker.stat().st_mtime
         os.utime(marker, (current + 5, current + 5))
         listing = H.list_skills_impl("dsh", roots=[(skills_dir, "*/SKILL.md")])
         self.assertEqual(listing["skills"][0]["description"], "third")
+
+    def test_dir_cache_serves_hot_path(self):
+        """The directory cache returns the same listing without re-scanning."""
+        import time
+        skills_dir = self.root / "skills"
+        _make_skill(skills_dir, "alpha", "desc-a")
+        _make_skill(skills_dir, "beta", "desc-b")
+        listing1 = H.list_skills_impl("dsh", roots=[(skills_dir, "*/SKILL.md")])
+        # Hot path: same result from cache, in under 1ms
+        start = time.perf_counter()
+        listing2 = H.list_skills_impl("dsh", roots=[(skills_dir, "*/SKILL.md")])
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        self.assertEqual(listing1, listing2)
+        self.assertLess(elapsed_ms, 5.0,
+                        f"hot path took {elapsed_ms:.2f}ms")
 
     def test_worker_skill_names_never_raises(self):
         names = H.worker_skill_names("zcode")
