@@ -78,6 +78,7 @@ from .authority import Authority, inventory
 from .codex_driver import locate_rollout, run_readonly
 from . import dsh_driver
 from .deadline import CallBudget
+from . import model_roster
 from .session_reader import read_context as read_session_context
 from .splitlines_stream import eof_segments, scan_new as _scan_new
 from . import ui_projection
@@ -937,6 +938,16 @@ def worker_skill_names(worker, limit=40) -> list[str]:
     except Exception:  # noqa: BLE001 - advertisement must never fail a dispatch
         return []
     return [entry["name"] for entry in listing["skills"]][:max(1, limit)]
+
+
+def list_models_impl() -> dict:
+    """The local ZCode's model roster (identity fields only, zero model requests)."""
+    try:
+        roster = model_roster.read_model_roster()
+    except model_roster.RosterError as error:
+        raise HubError(error.code, str(error))
+    roster["hub_tool_version"] = HUB_TOOL_VERSION
+    return roster
 
 
 # --------------------------------------------------------------------------
@@ -2062,6 +2073,11 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         # Capability advertisement (2026-11-03): the orchestrator learns what
         # this worker can be asked to use, one bounded name list per receipt.
         "worker_skills": worker_skill_names(worker),
+        # 2026-11-04: bounded model advertisement (zcode only) — the
+        # orchestrator learns which vendor models it can pin through the
+        # contract 'model' field without a separate roster query.
+        "worker_models": (model_roster.worker_model_tokens()
+                          if worker == "zcode" else []),
         **result_payload,
     }
     if error_text:
@@ -2119,6 +2135,15 @@ def _tools() -> list[dict]:
             "inputSchema": {"type": "object", "properties": {
                 "worker": {"type": "string", "enum": ["codex", "zcode", "dsh"]},
             }, "required": ["worker"], "additionalProperties": False},
+        },
+        {
+            "name": "list_models",
+            "description": "The local ZCode's configured models (providerId/modelId pairs "
+                           "usable in a delegate contract's zcode 'model' field; "
+                           "personal-added models flagged; credentials never exposed). "
+                           "Zero model requests.",
+            "inputSchema": {"type": "object", "properties": {},
+                            "additionalProperties": False},
         },
         {
             "name": "task_status",
@@ -2239,6 +2264,8 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
             elif name == "list_skills":
                 value = await _offload_read(list_skills_impl,
                                             arguments.get("worker"))
+            elif name == "list_models":
+                value = await _offload_read(list_models_impl)
             elif name == "task_status":
                 value = await _offload_read(task_status_impl,
                                             config, arguments.get("task_id"),

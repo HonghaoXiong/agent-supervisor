@@ -167,6 +167,16 @@ def parser():
     skills_cmd.add_argument('worker', help='zcode | codex | dsh')
     skills_cmd.add_argument('--json', action='store_true',
                             help='Machine-readable JSON instead of compact lines')
+    models_cmd = sub.add_parser(
+        'models', help="List the local ZCode's configured models "
+                       "(providerId/modelId pairs for contract 'model' fields); "
+                       'no model calls, credentials never read into the output')
+    models_cmd.add_argument('--user-config', type=Path,
+                            default=None,
+                            help='ZCode user provider config (default '
+                                 '~/.zcode/v2/provider_config.json)')
+    models_cmd.add_argument('--json', action='store_true',
+                            help='Machine-readable JSON instead of compact lines')
     pin_cmd = sub.add_parser(
         'pin-candidate', help='STATIC pin candidate for the installed ZCode '
         'bundle (hash arithmetic only; adding the pin stays a human review '
@@ -306,6 +316,28 @@ def main(argv=None):
                     desc = f" — {entry['description']}" if entry.get('description') else ''
                     source = entry['root'].rstrip('/').rsplit('/', 1)[-1]
                     print(f"  {entry['name']}{desc}  [{source}]")
+            return 0
+        if args.action == 'models':
+            from .model_roster import read_model_roster, RosterError
+            try:
+                roster = read_model_roster(user_config=args.user_config)
+            except RosterError as error:
+                print(json.dumps({'ok': False, 'error': error.code,
+                                  'detail': str(error)[:300]}, ensure_ascii=False))
+                return 2
+            if args.json:
+                print(json.dumps(roster, ensure_ascii=False, indent=2))
+            else:
+                print(f"zcode models: {roster['model_count']} "
+                      f"({roster['source']})")
+                for provider in roster['providers']:
+                    models = ', '.join(
+                        entry['modelId'] + ('*' if entry['personal'] else '')
+                        for entry in provider['models'])
+                    print(f"  {provider['providerName']} "
+                          f"[{provider['providerId']}]: {models}")
+                print("  (* = personally added; use providerId/modelId in "
+                      "the zcode contract 'model' field)")
             return 0
         config = load_config(args.config)
         if args.action == 'pin-candidate':

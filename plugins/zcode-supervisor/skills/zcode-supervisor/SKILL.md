@@ -89,6 +89,31 @@ Capability + latency conventions (2026-11-03):
   — same session, same workspace (zcode/dsh). `action=stop` +
   `attach_to=<running task id>` signals an in-flight dsh dispatch to stop.
 
+Capability conventions (2026-11-04):
+
+* **Pick the model per task type**: query `czs models` (or the hub
+  `list_models` tool) once per session — it lists the local ZCode's vendor
+  models as `providerId/modelId` pairs (personally-added models flagged;
+  credentials are never exposed), and every zcode delegate receipt
+  re-advertises a bounded `worker_models` list. Pin the choice explicitly
+  in the contract's `model` field — zcode wants
+  `{"providerId": ..., "modelId": ..., "options": ...}` (`options`
+  optional), codex only `{"model": "<name>"}`, dsh is profile-driven (null).
+  Route heavy code generation and architecture work to the strongest tier
+  (e.g. a `*-pro` model), quick scans/reviews/formatting to the flash tier;
+  omitting `model` means the worker's default — say so when that is
+  intentional.
+* **Skills-first kickoff for software work**: when starting development on,
+  optimizing, or adding a module to an existing codebase, don't rebuild the
+  understanding yourself — first delegate an analysis pass: name the skills
+  to run explicitly (pick them from `czs skills zcode` / hub `list_skills`,
+  e.g. workflow- and achievement-style reporting skills), scope the target
+  repository by ABSOLUTE path in the task prompt, and state exactly which
+  report you want back. Then research, plan and optimize on top of the
+  returned report, using `action=attach` follow-ups on the same worker
+  session. One repository per task: a skills prompt must never be ambiguous
+  about which repo it operates on.
+
 This sends real ZCode model requests and consumes that computer's quota. Existing
 user authorization for the task carries through; installing the plugin alone
 does not authorize arbitrary work or an unbounded experiment.
