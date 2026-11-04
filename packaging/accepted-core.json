@@ -16,8 +16,8 @@
       "sha256": "df7bd87f9659cb89ff0261207d2d88b0fbbaa15966d4e3c69e1030a8293f471c"
     },
     "src/zcode_supervisor/bench.py": {
-      "blob": "04fdec2e6907b64b368f9573e50c3d6efa8c7abc",
-      "sha256": "a2964cfb12f3ce2c2f73459772e9be4e79bbe8b07caa2afe6f7bba9d99a56457"
+      "blob": "a1ed3f22445708d966dcebf1535fb9237fd6ded6",
+      "sha256": "2c1964cefd76e9d556c2894081316f0b59f28cbf7c586972090a354d7464a6f9"
     },
     "src/zcode_supervisor/cli.py": {
       "blob": "ee7754f7a92d722a5db7742a7bea55b8cf132c4f",
@@ -64,8 +64,8 @@
       "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
     },
     "src/zcode_supervisor/hub_server.py": {
-      "blob": "1c904908235c76f85ad815a127ba5151f8915179",
-      "sha256": "4deebb8ff4833787573ab586c2fa839909272fdc6e58a694985761ce13b73b71"
+      "blob": "b4a884c98486bbc235227af6dce3b961dad15f85",
+      "sha256": "58a75bff9263f16b2a5e3e86d1438577043538290243cadff9b6f2e5f1aaa262"
     },
     "src/zcode_supervisor/mcp_readonly.py": {
       "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
@@ -148,6 +148,6 @@
       "sha256": "3d54d6d1cdefc1b6a1a0c674bfd0624f9f784888627842fb58057281977ce7d8"
     }
   },
-  "refreshed_at": "2026-11-03",
-  "refresh_reason": "v0.2.7: dispatch overhead 0.115ms (260x target) — skills directory-cache (27ms to 0.02ms, 2527x), contract mtime-cache, L1 UDS telemetry retained"
+  "refreshed_at": "2026-11-04",
+  "refresh_reason": "v0.2.7 review fixes: hub serve fails loud on missing anyio/mcp (hub-dependencies-missing; [hub] extra now declares anyio), P0.0 fixture-path provenance note in bench.py. Verified locally: builder version-drift checks (positive rebuild byte-identical to 81ca609db29f, negative rejects drift), bare-venv dependency negative + hub-venv positive, full release build green. Full offline suite NOT re-run in this refresh — acceptance pending on the dev machine."
 }
