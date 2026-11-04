@@ -3,9 +3,11 @@
 from __future__ import annotations
 
 import argparse
+import ast
 import hashlib
 import json
 from pathlib import Path
+import re
 import subprocess
 import tempfile
 import zipfile
@@ -19,6 +21,31 @@ TEMPLATE_FILES = {
     "skills/zcode-supervisor/SKILL.md", "skills/zcode-supervisor/agents/openai.yaml",
     "skills/zcode-supervisor/references/delegation.md",
 }
+
+
+def package_version(repo: Path) -> str:
+    """The single version authority: ``__version__`` in the package __init__."""
+    tree = ast.parse((repo / "src/zcode_supervisor/__init__.py").read_text(encoding="utf-8"))
+    for node in tree.body:
+        if isinstance(node, ast.Assign) and any(
+                isinstance(target, ast.Name) and target.id == "__version__" for target in node.targets):
+            return ast.literal_eval(node.value)
+    raise ValueError("src/zcode_supervisor/__init__.py has no __version__; it is the version authority")
+
+
+def pyproject_version(repo: Path) -> str:
+    text = (repo / "pyproject.toml").read_text(encoding="utf-8")
+    try:
+        import tomllib
+    except ModuleNotFoundError:
+        if "[project]" not in text:
+            raise ValueError("pyproject.toml has no [project] table")
+        match = re.search(r'^version\s*=\s*"([^"]+)"',
+                          text.split("[project]", 1)[1], re.MULTILINE)
+        if match is None:
+            raise ValueError("pyproject.toml [project] has no version")
+        return match.group(1)
+    return tomllib.loads(text)["project"]["version"]
 
 
 def template_files(template: Path) -> list[Path]:
@@ -56,9 +83,16 @@ def build(repo: Path, output: Path) -> Path:
     template = repo / "plugins" / PLUGIN
     portable = json.loads((template / "plugin.json").read_text())
     legacy = json.loads((template / ".codex-plugin/plugin.json").read_text())
-    version = portable["version"]
-    if portable["name"] != PLUGIN or legacy["name"] != PLUGIN or legacy["version"] != version:
-        raise ValueError("Plugin manifests disagree")
+    version = package_version(repo)
+    if portable["name"] != PLUGIN or legacy["name"] != PLUGIN:
+        raise ValueError("Plugin manifests disagree on the plugin name")
+    drift = [(f"plugins/{PLUGIN}/plugin.json", portable.get("version")),
+             (f"plugins/{PLUGIN}/.codex-plugin/plugin.json", legacy.get("version")),
+             ("pyproject.toml", pyproject_version(repo))]
+    stale = [f"{location}: {found!r}" for location, found in drift if found != version]
+    if stale:
+        raise ValueError("Version drift against src/zcode_supervisor/__init__.py "
+                         f"__version__ = {version!r}: " + "; ".join(stale))
     output = output.expanduser().absolute()
     output.mkdir(parents=True, exist_ok=True)
     release_name = PLUGIN + "-" + version
@@ -120,7 +154,7 @@ def build(repo: Path, output: Path) -> Path:
         write(release, ".agents/plugins/marketplace.json",
               (json.dumps(marketplace, ensure_ascii=False, indent=2) + "\n").encode())
         manifest = {"schema_version": 1, "name": PLUGIN, "version": version,
-                    "core_version": "0.2.7",
+                    "core_version": version,
                     "accepted_core": pins, "runtime_dependencies": ["Python>=3.11", "Node.js", "supported signed-in ZCode", "Codex plugin CLI"],
                     "model_requests_during_install": 0,
                     "scope": "Baseline CLI delegation and discoverable skill; fixed-model packet field included (verified selection plus provider receipts); no live strict budget or Codex cost claims.",
