@@ -4,8 +4,8 @@
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "eb4cbef534c7f304f313915a3b207432d0ef74d7",
-      "sha256": "ecfdfa2481a22a024323c560e444a815124134b8d0735d0e08741a5872e88192"
+      "blob": "241dcdb7e7bf07e402373090c909fe10962c93df",
+      "sha256": "fbda49affadbc06c888948db7950bc37670c64df345ad26a89f7a848621c7779"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -153,5 +153,5 @@
     }
   },
   "refreshed_at": "2026-11-04",
-  "refresh_reason": "v0.2.7 model-roster feature: read-only zcode model roster from the user provider config (model_roster.py; identity fields only, access fields never projected) surfaced via 'czs models', hub list_models tool, and bounded worker_models receipt advertisement; SKILL.md adds model-per-task-type and skills-first kickoff conventions (absolute repo targeting). Verified locally against the live user config: 4 providers / 14 models, disabled provider excluded, credential grep clean, truncation + negative paths green, full release build green. Full offline suite re-run 2026-11-04 in the hub venv (Python 3.12, mcp 2.3.0 + msgpack 1.2.4): 1216 tests green (1 env-conditional skip), including test_distribution against a real git checkout; live model-pinning round trip NOT re-qualified in this batch (prior 2026-10-24 evidence covers the unchanged packet.model path)."
+  "refresh_reason": "v0.2.8 release: model roster (czs models CLI, hub list_models tool, bounded worker_models receipt advertisement; identity fields only, access fields never projected) + skills-first kickoff conventions + hub serve dependency fail-loud (anyio/mcp declared in [hub]) + builder single-source versioning + dev-only doc marks. Full offline suite green in the hub venv 2026-11-04 (1216 tests, 1 env-conditional skip, incl. test_distribution on a real git checkout); release build verified."
 }
