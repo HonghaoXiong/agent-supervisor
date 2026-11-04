@@ -12,7 +12,7 @@
 python3 tools/build_macos_plugin.py --output dist
 ```
 
-产物为 `dist/zcode-supervisor-macos-0.1.4.zip`、SHA256 和同名版本解压树。
+产物为 `dist/zcode-supervisor-macos-<version>.zip`、SHA256 和同名版本解压树（版本号单一来源为 `src/zcode_supervisor/__init__.py` 的 `__version__`，构建器校验全部版本引用一致）。
 只复制显式列出的源、许可证、模板和文档；不打包 `.czs`、out、模型/provider/认证配置、
 CLI bundle、工作日志、原项目输入或个人 skills 库。运行证据属于每台机器的独立私有目录。
 
@@ -26,7 +26,7 @@ CLI bundle、工作日志、原项目输入或个人 skills 库。运行证据�
 
 `Check.command` 和安装器共用标准库诊断，检查依赖及所需 Codex 插件子命令，输出稳定错误码、
 修复建议与 supported/unsupported/unknown 能力表。已安装技能也可使用包内 `scripts/diagnostics.py`。
-插件版本 0.1.4 与执行核心版本 0.1.0 分列，核心仍来自同一组已验收 Git blobs（自 0.1.3 起随包携带三方编排 hub：tri-probe/常驻驱动/合同库/MCP 控制面）。
+早期发行曾将插件版本与执行核心版本分列（0.1.4/0.1.0），自 0.2.0 起二者同步（单一版本源见上文）；核心仍来自同一组已验收 Git blobs（自 0.1.3 起随包携带三方编排 hub：tri-probe/常驻驱动/合同库/MCP 控制面）。
 
 `Validate.command` 只初始化 Codex app-server 并查询技能目录，过滤报告为本插件信息，不发送
 thread/turn 或 ZCode 模型请求。可用 `--receipt` 汇总目标机器另行授权的小任务，原始证据留在当地。

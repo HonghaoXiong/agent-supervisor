@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """Generate the shared Python/Rust wire golden for the supervisor UI.
 
+Dev-machine only: golden comparison targets the local gitignored ui/ and
+tests/ trees; not runnable from the public source-only checkout.
+
 Starts the REAL P1.1 UiEventServer (frozen core, read-only use) on an
 owner-only temp socket, drives one deterministic scenario (baseline task
 + post-cut discovery task + gap stream), and records the exact frames a

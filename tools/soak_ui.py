@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """P3.2 soak harness: multi-session UI-event soak over the REAL P1.1 stack.
 
+Dev-machine only: references the local gitignored tests/ tree; not runnable
+from the public source-only checkout.
+
 Drives the production ``UiEmitter -> UiJournal -> UiEventServer`` pipeline
 (real owner-only UDS, real bounded journal) with FAKE producers and FAKE
 consumers only — no model, no real CLI, no remote (``model_requests == 0``

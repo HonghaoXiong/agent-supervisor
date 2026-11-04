@@ -1,6 +1,9 @@
 #!/usr/bin/env python3
 """P0.0 bench entry: verify the fixed fixtures, then run the fake/replay baseline.
 
+Dev-machine only: requires the local gitignored tests/ tree; not runnable
+from the public source-only checkout.
+
 Verifies the pinned UI fixture digest and the communication fault manifest
 against the fixture child, then runs the fake/replay baseline sections
 (cold spawn/handshake, app-server initialize/thread rounds, resident

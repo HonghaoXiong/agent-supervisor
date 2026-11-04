@@ -12,11 +12,11 @@ Python 包名为 `codex-zcode-supervisor`（仓库名 agent-supervisor），命�
 - 保存成功与失败证据；提交服务器作业和回收结果可以拆成两个短任务。
 - 本机配置独立生成，不携带原开发电脑的路径、账户、模型凭据或任务记录。
 
-**当前只接受已审查的 ZCode CLI 0.16.9 bundle 指纹。** 配置可迁移不等于兼容所有 ZCode 版本。macOS 已有真实联调基础；Linux 面向 POSIX 运行与离线测试，仍须在目标机器完成真实联调。原生 Windows 尚未验证。详见[兼容性与补丁](docs/COMPATIBILITY.md)。
+**仅接受已审查指纹的 ZCode CLI bundle**（已审清单与版本见[兼容性与补丁](docs/COMPATIBILITY.md)，随审查滚动更新）。 配置可迁移不等于兼容所有 ZCode 版本。macOS 已有真实联调基础；Linux 面向 POSIX 运行与离线测试，仍须在目标机器完成真实联调。原生 Windows 尚未验证。
 
 ## 安装与首次使用
 
-多台 Mac 使用 Codex 插件时，优先使用已构建的 `zcode-supervisor-macos-0.2.0.zip`：
+多台 Mac 使用 Codex 插件时，优先使用已构建的 `zcode-supervisor-macos-<version>.zip`（版本号以 [pyproject.toml](pyproject.toml) 为准）：
 解压后运行 `Install.command`，重启 Codex 并开新聊天，对它说“使用 ZCode Supervisor 检查环境并委派任务”。
 `Check.command` 生成无模型环境诊断；`Validate.command` 验证本机技能发现并生成可回传报告。
 插件内含已审核心与自动发现技能，无需克隆本仓或单独 pip 安装。
@@ -74,11 +74,13 @@ czs run \
 
 `delivery_ok=true` 表示本次交付检查通过，不代表软件需求、科学方法或长期数值稳定性已经验收。原始日志也可能包含私有代码和模型输出；`.czs/` 不应上传。
 
+离线单元测试在持有本地 `tests/` 树的开发机上运行（`tests/` 与 CI 配置不随本仓库分发）：
+
 ```bash
 python -m pip install -e .
 python -m unittest discover -s tests -v
 ```
 
-CI 在 macOS/Linux、Python 3.11/3.13 上运行离线单元测试，不使用模型凭据、不提交远程作业。原适配器的真实审批、拒绝、同会话续接以及一次独立小型远程提交/回收曾通过验证；迁移后的适配器及目标机器仍须各自验收。见[本次独立版验证记录](VALIDATION.md)和[验证方法](docs/VALIDATION.md)。
+离线矩阵为 macOS/Linux、Python 3.11/3.13，不使用模型凭据、不提交远程作业。原适配器的真实审批、拒绝、同会话续接以及一次独立小型远程提交/回收曾通过验证；迁移后的适配器及目标机器仍须各自验收。见[验证方法](docs/VALIDATION.md)。
 
 版权与第三方来源见 [LICENSE](LICENSE) 和 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)。本仓库不分发 ZCode 应用、CLI bundle、登录凭据或原项目代码。

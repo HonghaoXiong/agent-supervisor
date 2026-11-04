@@ -27,7 +27,7 @@ czs --config /absolute/project/.czs/config.json doctor
 2. **工具层（适用性选择）**：`tools` 按工作区文件 glob 判定适用性。`executor` 类工具作为额外精确字符串 Bash 命令注入任务包（`habit-` 前缀、执行器脚本哈希进 `trusted_hashes`、命令原文披露进 prompt 供 worker 逐字复制），默认 `required=false`（建议性）；`unavailable` 类工具每次运行都如实报告不可用及原因。
 3. **执行层（实际可执行）**：以运行结束时的命令回执为准。结果 JSON 的 `habits` 块记录 profile 指纹、各规则/工具的适用与执行状态；提示词提到工具不构成执行证据。
 
-profile 只做扩展、绝不放宽权限：与任务包命令重号、命令串重合或受信哈希不一致都会硬错误拒收；profile 必须位于 work_root 之外。工具命令的 `{workspace}` 占位符必须独立成词且不得预加引号：预引号或嵌套形式在加载与派发前都会被拒收，替换时以 shell 安全引用渲染为单一参数。schema 与冲突判据见 `src/zcode_supervisor/profile.py` 与 `tests/test_profile.py`。
+profile 只做扩展、绝不放宽权限：与任务包命令重号、命令串重合或受信哈希不一致都会硬错误拒收；profile 必须位于 work_root 之外。工具命令的 `{workspace}` 占位符必须独立成词且不得预加引号：预引号或嵌套形式在加载与派发前都会被拒收，替换时以 shell 安全引用渲染为单一参数。schema 与冲突判据见 `src/zcode_supervisor/profile.py` 与 `tests/test_profile.py`（后者位于不随仓库分发的开发机本地 tests/ 树）。
 
 ### 从现有 ZCode 习惯一次性导入
 

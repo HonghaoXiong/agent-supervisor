@@ -734,6 +734,8 @@ async def bench_codex_exec_with_model(codex_path, trials, out_dir,
 # through the REAL ProtocolClient / CodexAppServerClient / ResidentZCode. No
 # real CLI, model call, or remote task is ever involved: model_requests stays
 # 0 and each section proves it from the child's own counters.
+# Fixture/spec paths under tests/ refer to the local dev tree (gitignored,
+# not distributed with this repository; see docs/VALIDATION.md).
 
 FAKE_COLD = 'fake-cold-lifecycle'
 FAKE_APPSERVER = 'fake-appserver'

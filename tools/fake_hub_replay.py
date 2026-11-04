@@ -2,6 +2,10 @@
 """P1.2 fake-hub replay: three discovery timepoints over the REAL P1.1
 UiEventServer, with the four-zero counters, plus the live Rust round trip.
 
+Dev-machine only: the optional Rust round trip requires the local gitignored
+ui/ tree; the replay sections also read fixtures from the gitignored tests/
+tree. Not runnable from the public source-only checkout.
+
 For each timepoint (after_subscribe / hello_only / between_hello_and_
 snapshot) the harness freezes the terminal index (never writes it), creates
 a brand-new running task at exactly the right phase, and asserts a plain
