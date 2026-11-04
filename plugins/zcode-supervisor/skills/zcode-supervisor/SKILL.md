@@ -77,6 +77,9 @@ Capability + latency conventions (2026-11-03):
   persistent MCP server (`czs hub serve`) and register zcode contracts with an
   explicit `"mode": "resident"` — the shared warm process sets up in 94/68ms
   versus 604ms cold. Old contracts without a mode keep their cold default.
+  `hub serve` needs the `[hub]` extra (mcp + anyio); the plugin's stdlib-only
+  czs CLI cannot serve — run it from the hub venv launcher (`czs-hub-mcp.sh`)
+  or an environment with `pip install 'codex-zcode-supervisor[hub]'`.
 * **Status never queues**: the hub `task_status` tool (or `czs progress`)
   reads running tasks' heartbeat ledgers directly — check it before assuming
   a worker is stuck.

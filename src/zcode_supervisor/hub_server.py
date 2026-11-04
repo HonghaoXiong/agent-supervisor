@@ -2320,8 +2320,25 @@ def parser() -> argparse.ArgumentParser:
     return result
 
 
+def missing_serve_dependencies() -> list[str]:
+    """Third-party modules `hub serve` imports directly (stdlib czs runs without them)."""
+    import importlib.util
+    return [name for name in ("anyio", "mcp")
+            if importlib.util.find_spec(name) is None]
+
+
 def main(argv=None) -> int:
     args = parser().parse_args(argv)
+    missing = missing_serve_dependencies()
+    if missing:
+        print(json.dumps({
+            "error": "hub-dependencies-missing",
+            "detail": ("czs hub serve imports these directly and they are not "
+                       "installed: " + ", ".join(missing)),
+            "remediation": ("Run via the hub venv launcher (czs-hub-mcp.sh) or install "
+                            "the [hub] extra: pip install 'codex-zcode-supervisor[hub]'"),
+        }, ensure_ascii=False), file=sys.stderr)
+        return 2
     from .runtime import load_config
 
     try:
