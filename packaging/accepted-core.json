@@ -2,8 +2,8 @@
   "acceptance": "0.3.0 development candidate: T01-T18 implementation, offline validation in progress; not independently accepted and not a replacement installation",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "2427e7cccab0c31ced000c6f92bd3d3db47e1236",
-      "sha256": "53e23ef500132c164ed91076ad5d14829b3be5704a9106809892d3640b6f1122"
+      "blob": "7a3e7fd3bb98c3b20eef093d26837b009985134f",
+      "sha256": "27d2ee074d2fec4d90dafd77839f2ebe9a3bc2e04898bdd2c2ed57c33a1f9699"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -339,5 +339,7 @@
     }
   },
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
-  "schema_version": 1
+  "schema_version": 1,
+  "refreshed_at": "2026-11-05",
+  "refresh_reason": "0.3.1 version bump (audit-fix patch release); only __version__ changed in this pinned file"
 }
