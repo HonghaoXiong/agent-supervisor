@@ -1,0 +1,41 @@
+{
+  "schema_version": "zsc.practice-catalog/v1",
+  "practices": [
+    {
+      "id": "seismic-event-boundary", "revision": 1, "status": "active",
+      "title": "先分清加载、成核与事件边界",
+      "task_kinds": ["feature", "verification", "debug"], "domains": ["seismic"], "requires_features": {},
+      "questions": ["加载、缓慢滑动、成核和快滑的事件边界由什么独立观测量定义？", "时间窗、空间窗和边界条件会不会把同一过程误分成多个事件或合并多个事件？"],
+      "first_actions": ["列出事件定义、触发观测量和时间空间窗口的判定链"],
+      "evidence_required": ["事件定义、独立观测量和窗口敏感性记录"],
+      "not_applicable": ["求解器步或输出帧不能直接等同于物理事件"],
+      "stop_conditions": ["事件边界能由独立量复核，或歧义被明确保留时停止"],
+      "source_ids": ["design-derived:seismic:event-boundary"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "seismic-energy-partition", "revision": 1, "status": "active",
+      "title": "用能量与边界记账约束事件解释",
+      "task_kinds": ["new_method", "verification", "debug"], "domains": ["seismic"], "requires_features": {},
+      "questions": ["外部加载、储存、耗散和输出能量是否在相同时间窗与边界上记账？", "能量分项的符号、积分区间和缺测处理能否解释事件强弱差异？"],
+      "first_actions": ["统一事件窗口并核对各能量分项的来源、符号与积分路径"],
+      "evidence_required": ["同窗口能量账、边界说明和缺测清单"],
+      "not_applicable": ["能量闭合不自动证明摩擦机理或事件判定正确"],
+      "stop_conditions": ["账务差异被定位或作为未闭合证据显式上报时停止"],
+      "source_ids": ["design-derived:seismic:energy-partition"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "seismic-rate-state-semantics", "revision": 1, "status": "active",
+      "title": "核对摩擦状态、速率与时间语义",
+      "task_kinds": ["feature", "calibration", "verification"], "domains": ["seismic"], "requires_features": {},
+      "questions": ["滑移、滑移率、摩擦状态和特征时间的单位、参考系与采样位置是否逐环一致？", "状态更新是在同一物理时刻同步完成，还是混用了不同阶段和输出时刻？"],
+      "first_actions": ["沿摩擦输入到事件输出核对速率、状态与时间的语义映射"],
+      "evidence_required": ["变量语义表、更新顺序和最小事件诊断"],
+      "not_applicable": ["不能通过调摩擦参数掩盖状态或时间映射错误"],
+      "stop_conditions": ["语义链和更新顺序有独立对照后停止"],
+      "source_ids": ["design-derived:seismic:rate-state-semantics"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    }
+  ]
+}

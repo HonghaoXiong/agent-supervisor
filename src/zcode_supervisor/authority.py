@@ -225,6 +225,56 @@ class Authority:
         """
         self._handed_scan = current
 
+    def runtime_artifact_hash(self, name):
+        """Return the fresh hash of a producer-bound runtime artifact.
+
+        A path prefix is never sufficient: pre-existing inputs stay frozen,
+        run entries must match their first-observed bytes, and drafts must be
+        the exact script (or trusted path bytes) approved for this packet.
+        """
+        if name in self.before or not runtime_owned(name) \
+                or not self.orchestration or not self.workflow_launches:
+            return None
+        entry = self.workspace / name
+        try:
+            info = entry.lstat()
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                return None
+            digest = sha256_regular(entry)
+        except OSError:
+            return None
+        if name in ('.zcode/workflow-runs/.gitignore',
+                    '.zcode/workflow-drafts/.gitignore'):
+            return digest if digest == hashlib.sha256(b'*\n').hexdigest() else None
+        parts = Path(name).parts
+        if (len(parts) == 3 and parts[0] == '.zcode'
+                and parts[1] == 'workflow-runs' and parts[2].endswith('.mjs')):
+            run_id = 'dwfrun-' + parts[2][7:-4]
+            return digest if digest == self.runtime_entry_bytes.get(run_id) else None
+        if len(parts) == 3 and parts[0] == '.zcode' and parts[1] == 'workflow-drafts':
+            workflow = self.orchestration.get('workflow', {})
+            raw_name = workflow.get('name') or 'workflow'
+            slug = re.sub(r'\s+', '-', raw_name.strip())
+            slug = ''.join(char for char in slug if char.isalnum() or char in '_.-')[:64]
+            slug = re.sub(r'^[.-]+|[.-]+$', '', slug) or 'workflow'
+            if set(slug) == {'.'}:
+                slug = 'workflow'
+            pattern = rf'{re.escape(slug)}(?:-(?:[2-9]|[1-9][0-9]{{1,2}}|1000))?\.dwf\.ts'
+            if not re.fullmatch(pattern, parts[2]):
+                return None
+            if workflow.get('script') is not None:
+                try:
+                    expected = hashlib.sha256(workflow['script'].encode('utf-8')).hexdigest()
+                except UnicodeEncodeError:
+                    return None
+            else:
+                source = Path(workflow.get('path', ''))
+                if not source.is_absolute():
+                    source = self.workspace / source
+                expected = self.packet.get('trusted_hashes', {}).get(str(source.resolve(strict=False)))
+            return digest if expected is not None and digest == expected else None
+        return None
+
     def check_frozen(self):
         """Verify packet, workspace inputs and trusted executables.
 
@@ -250,39 +300,11 @@ class Authority:
         # not exist before the run are classified as new runtime artifacts
         # (recorded with hashes; evidence, not an origin guarantee under this
         # server version's broker-less child boundary).
-        if self.orchestration:
-            launched_ids = {run_id.split('dwfrun-', 1)[-1]
-                            for run_id in self.workflow_launches.values()}
-            new_runtime = set()
-            for name in changed:
-                if name in self.before or not runtime_owned(name):
-                    continue
-                # Producer accounting (N2), real native layout (verified in
-                # the pinned CLI, writeChildEntryFile ~offset 14173530): the
-                # runtime writes FLAT .zcode/workflow-runs/<runId>.mjs plus a
-                # first-write .gitignore containing exactly '*\n'. Only those
-                # exact shapes for a run THIS task launched are artifacts;
-                # anything else — named run directories, extra files — has no
-                # producer binding and stays a violation.
-                parts = Path(name).parts
-                if (len(parts) == 3 and parts[0] == '.zcode'
-                        and parts[1] == 'workflow-runs'
-                        and parts[2].endswith('.mjs')
-                        and parts[2][:-4].startswith('dwfrun-')
-                        and parts[2][7:-4] in {rid.split('dwfrun-', 1)[-1]
-                                                for rid in self.runtime_entry_bytes}):
-                    run_id = 'dwfrun-' + parts[2][7:-4]
-                    entry = self.workspace / name
-                    current = (sha256_regular(entry)
-                               if entry.is_file() and not entry.is_symlink() else None)
-                    if current is not None and current == self.runtime_entry_bytes.get(run_id):
-                        new_runtime.add(name)
-                elif (name == '.zcode/workflow-runs/.gitignore'
-                        and launched_ids
-                        and self.workspace.joinpath(name).read_text(errors='replace') == '*\n'):
-                    new_runtime.add(name)
-        else:
-            new_runtime = set()
+        # Runtime files are admitted only by the same producer-bound check
+        # used by the final changed-file projection below.
+        new_runtime = {name for name in changed
+                       if self.runtime_artifact_hash(name) is not None} \
+            if self.orchestration else set()
         self.runtime_artifacts = sorted(new_runtime)
         violating = changed - self.allowed - new_runtime
         if violating:
@@ -362,12 +384,21 @@ class Authority:
                             and not record_from_launch:
                         raise ValueError('Child origin dispatch identity differs from the registered child')
                 elif is_actor and record is None:
-                    # An approved launch proves the run exists, not that every
-                    # actor identity in a request exists. Actors enter the
-                    # registry only from trusted facts (subagents poll or
-                    # subagent_spawned events); is_actor merely waives the
-                    # parent-turn binding for a record that is already there.
-                    record = None
+                    # This ZCode version does not list workflow actors in the
+                    # parent's session/subagents inventory. The broker origin is
+                    # host-generated (not a model JSON claim); admit it only
+                    # when every identity field agrees with THIS approved run.
+                    # Arbitrary/foreign runs and direct Agent children still
+                    # require an independently observed child registration.
+                    run_id = actor_match.group(1)
+                    approved_tid = next(tid for tid, value in self.workflow_launches.items()
+                                        if value == run_id)
+                    if origin.get('parentSessionId') != self.session_id or agent_id != child \
+                            or dispatch_id not in (None, approved_tid):
+                        raise ValueError('Workflow actor origin differs from the approved launch')
+                    record = {'agentId': agent_id, 'parentToolCallId': f'workflow:{run_id}',
+                              'subagentType': 'zcode-workflow', 'status': 'running'}
+                    self.children[child] = record
                 # Dispatch-observed registration is no longer sufficient on
                 # its own: an origin can quote a scheduled parent dispatch id
                 # while inventing the child identity (verified counterexample).
@@ -454,7 +485,7 @@ class Authority:
                 # adjustable_settings is appended by the runtime variant of
                 # the tool schema (verified live); everything else is fixed.
                 allowed_fields = {'name', 'script', 'path', 'args', 'max_concurrency',
-                                  'subagent_model', 'adjustable_settings'}
+                                  'subagent_model', 'adjustable_settings', 'script_line_offset'}
                 if set(data) - allowed_fields:
                     raise ValueError('Unexpected CreateWorkflow input field')
                 adjustable = data.get('adjustable_settings', {})
@@ -473,17 +504,35 @@ class Authority:
                         or not isinstance(adjustable['concurrency_ceiling'], int)
                         or adjustable['concurrency_ceiling'] <= 0):
                     raise ValueError('adjustable_settings.concurrency_ceiling must be a positive integer')
-                if 'args' in data:
-                    # Reviewer finding 4: no packet field pins workflow args,
-                    # so the channel stays closed until the schema declares it.
-                    raise ValueError('Workflow args are not part of this contract')
+                if 'script_line_offset' in data:
+                    offset = data['script_line_offset']
+                    if 'path' not in workflow or isinstance(offset, bool) \
+                            or not isinstance(offset, int) or offset <= 0:
+                        raise ValueError('script_line_offset is only valid as a positive path-script offset')
+                    reviewed = read_regular(self.workspace / workflow['path']).decode('utf-8')
+                    end = reviewed.find('*/') if reviewed.startswith('/* zcode-workflow') else -1
+                    expected_offset = reviewed[:end + 2].count('\n') + 1 if end >= 0 else 1
+                    if offset != expected_offset:
+                        raise ValueError('script_line_offset differs from the reviewed path script')
+                if 'args' in data or 'args' in workflow:
+                    if 'args' not in workflow or 'args' not in data \
+                            or data['args'] != workflow['args']:
+                        raise ValueError('Workflow args do not match the pinned contract')
                 if 'script' in workflow and ('path' in data or 'args' in data):
                     raise ValueError('Inline-script contract cannot be launched by path or args')
                 if 'path' in workflow and 'script' in data:
-                    # Launching by path, the runtime re-attaches the file
-                    # content as an inline script field; accept it only when it
-                    # is byte-identical to the frozen reviewed file.
-                    if data['script'] != read_regular(self.workspace / workflow['path']).decode('utf-8'):
+                    # Path launches strip the metadata comment before the
+                    # runtime re-attaches the executable script body.
+                    reviewed = read_regular(self.workspace / workflow['path']).decode('utf-8')
+                    expected_script = reviewed
+                    end = reviewed.find('*/') if reviewed.startswith('/* zcode-workflow') else -1
+                    if end >= 0:
+                        expected_script = reviewed[end + 2:]
+                        if expected_script.startswith('\r\n'):
+                            expected_script = expected_script[2:]
+                        elif expected_script.startswith(('\n', '\r')):
+                            expected_script = expected_script[1:]
+                    if data['script'] != expected_script:
                         raise ValueError('Runtime script differs from the reviewed file bytes')
                 if 'script' in workflow:
                     if data.get('script') != workflow['script']:
@@ -671,6 +720,9 @@ def _workflow_input_equivalent(tool, actual, approved, workspace):
     if actual.get('name') != approved.get('name'):
         return False
     if actual.get('max_concurrency') != approved.get('max_concurrency'):
+        return False
+    if ('args' in actual) != ('args' in approved) \
+            or actual.get('args') != approved.get('args'):
         return False
     actual_path = actual.get('path')
     approved_path = approved.get('path')

@@ -36,8 +36,13 @@ thread/turn 或 ZCode 模型请求。可用 `--receipt` 汇总目标机器另行
 ZCode 自行登录。Intel/Apple Silicon 使用同一纯 Python 包，但这不等于两种硬件都已完成
 实际模型联调。未知 ZCode bundle 指纹保持拒绝。ZCode 升级后的兼容性需要独立复核。
 
-已审 baseline 不含 packet.model 可选特性；强制固定模型、严格 all-actor 请求前置预算及
-原八路逐 Skill 消费不能因安装成功而声称通过。实际 Codex 成本对照也未完成。
+0.3 的核心包括持久 WorkOwner、完整设计到独立验收生命周期、原生 CreateWorkflow
+与随包 path template、冷/常驻 scoped 配对、知识复用和协商式只读桌面投影。
+随包 `WORKFLOW.md` 与 `CAPABILITY-MATRIX.md` 是功能边界入口。公开 RPC 不支持严格
+provider token/cost cap，严格预算请求在派发前 fail-closed；实际货币成本仍未知。
+本轮完成了 4 任务×4 条件的真实对照：16 个 worker 均交付、独立 oracle 质量 14/16；
+完整协议有无经验均为 4/4，单轮墙钟/token 差异不构成稳定收益证明。原始 live
+回执属于各机器的私有验收证据，不随公开仓库或插件分发。
 
 插件采用 [OpenAI 官方打包格式](https://developers.openai.com/plugins/build/plugins)，
 包含 portable root manifest 和 Codex compatibility manifest；桌面运行声明参考

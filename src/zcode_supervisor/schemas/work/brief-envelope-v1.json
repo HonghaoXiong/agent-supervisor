@@ -1,0 +1,15 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "zsc.brief-envelope/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task_id", "work_id", "attempt_id", "profile", "producer", "body_ref", "receipt_refs", "validation", "acceptance"],
+  "properties": {
+    "schema_version": {"const": "zsc.brief-envelope/v1"},
+    "task_id": {"type": "string"}, "work_id": {"type": "string"}, "attempt_id": {"type": "string"},
+    "profile": {"enum": ["native-workflow", "skill-assisted", "plain-recon"]},
+    "producer": {"type": "object"}, "body_ref": {"$ref": "artifact_ref.schema.json"},
+    "receipt_refs": {"type": "array", "items": {"$ref": "artifact_ref.schema.json"}},
+    "validation": {"type": "object"}, "acceptance": {"const": "not_evaluated"}
+  }
+}

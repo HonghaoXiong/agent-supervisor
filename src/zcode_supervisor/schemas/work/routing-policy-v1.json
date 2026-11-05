@@ -1,0 +1,49 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "zsc.routing-policy/v1",
+  "type": "object",
+  "required": ["schema_version", "defaults", "model_metadata", "stage_requirements"],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {"const": "zsc.routing-policy/v1"},
+    "defaults": {
+      "type": "object",
+      "propertyNames": {"enum": ["plan", "recon", "implementation", "verification"]},
+      "additionalProperties": {"type": "string", "pattern": "^[^/]+/[^/]+$"}
+    },
+    "model_metadata": {
+      "type": "object",
+      "propertyNames": {"pattern": "^[^/]+/[^/]+$"},
+      "additionalProperties": {
+        "type": "object", "required": ["quality", "permissions"], "additionalProperties": false,
+        "properties": {
+          "quality": {"type": "number"},
+          "permissions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        }
+      }
+    },
+    "stage_requirements": {
+      "type": "object",
+      "propertyNames": {"enum": ["plan", "recon", "implementation", "verification"]},
+      "additionalProperties": {
+        "type": "object", "required": ["min_quality", "permissions"], "additionalProperties": false,
+        "properties": {
+          "min_quality": {"type": "number"},
+          "permissions": {"type": "array", "items": {"type": "string"}, "uniqueItems": true}
+        }
+      }
+    },
+    "budgets": {
+      "type": "object", "additionalProperties": false,
+      "properties": {
+        "max_wall_time_s": {"type": ["number", "null"], "minimum": 0},
+        "max_concurrency": {"type": "integer", "minimum": 1},
+        "allowed_commands": {"type": "array", "items": {"type": "string"}, "uniqueItems": true},
+        "require_strict_provider_budget": {"type": "boolean", "default": false},
+        "max_provider_tokens": {"type": ["integer", "null"], "minimum": 1},
+        "max_provider_cost_usd": {"type": ["number", "null"], "minimum": 0}
+      }
+    },
+    "max_new_attempts": {"type": "integer", "minimum": 0, "maximum": 1, "default": 1}
+  }
+}

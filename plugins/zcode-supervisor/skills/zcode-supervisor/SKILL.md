@@ -89,6 +89,39 @@ Capability + latency conventions (2026-11-03):
   — same session, same workspace (zcode/dsh). `action=stop` +
   `attach_to=<running task id>` signals an in-flight dsh dispatch to stop.
 
+Orientation and durable workflow conventions (0.3):
+
+* **Orient before investigation**: build a TaskFrame/v1 (goal, task_kinds,
+  domains, features, evidence_refs) and run `czs work prepare --request <json>`
+  (or hub `prepare_work`). It is deterministic and sends zero model requests.
+  Optional `theme_ids` select the bundled mechanics, seismic, flow/transport,
+  thermal, stratigraphy/geomorphology or reaction/geochemistry question sets;
+  they are investigation aids, never scientific verdicts.
+* **Use one explicit owner for the full lifecycle**: start
+  `czs work serve --state-root <private-directory>` in the foreground. CLI and
+  hub MCP share that owner through `WorkService`; adapter exit does not kill
+  workers. Create work, run recon, submit and validate the brief, accept a
+  versioned design, implement, deliver, verify independently, then record
+  acceptance. Mutations require `expected_revision` and `idempotency_key`.
+  Start returns an accepted attempt/task, not a completed worker result.
+* **Native and packaged workflows are capability-gated**: the ZCode cold path
+  supports declared CreateWorkflow orchestration, including the packaged
+  `templates/recon/architecture.dwf.ts` with host-pinned bytes and args. Load
+  `dynamic-workflows` explicitly and use the exact declaration; never replace
+  it with a direct Agent or modified script. Resident orchestration remains
+  unsupported and must select cold. Unknown skills and missing host evidence
+  remain missing rather than being silently satisfied.
+* **Acceptance stays independent**: a valid ArchitectureBrief, completed
+  worker, or `delivery_ok=true` is not design/code acceptance. Keep candidate
+  and design hashes, dependency checks and verifier identity bound; rework
+  uses a new candidate. The workflow never merges or publishes automatically.
+* **Provider limits fail closed**: observed usage is retained, but public RPCs
+  do not provide strict provider token/cost caps or monetary cost. A routing
+  policy that requires those caps is rejected before dispatch as
+  `provider-budget-unsupported`; missing measurements stay unknown.
+* Read the packaged `docs/WORKFLOW.md` and `docs/CAPABILITY-MATRIX.md` for the
+  lifecycle, recovery, read-only UI negotiation and scoped live boundaries.
+
 Capability conventions (2026-11-04):
 
 * **Pick the model per task type**: query `czs models` (or the hub

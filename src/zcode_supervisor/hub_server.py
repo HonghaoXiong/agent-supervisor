@@ -831,8 +831,9 @@ _SKILLS_CACHE_TTL_S = 30.0
 def _skill_description(path: Path) -> str | None:
     """The frontmatter ``description`` line only; bodies are never read."""
     try:
-        head = path.open("rb").read(_FRONTMATTER_BYTES).decode("utf-8",
-                                                               errors="replace")
+        with path.open("rb") as stream:
+            head = stream.read(_FRONTMATTER_BYTES).decode("utf-8",
+                                                           errors="replace")
     except OSError:
         return None
     lines = head.splitlines()
@@ -848,7 +849,7 @@ def _skill_description(path: Path) -> str | None:
     return None
 
 
-def list_skills_impl(worker, roots=None) -> dict:
+def list_skills_impl(worker, roots=None, *, strict=False) -> dict:
     """Enumerate one worker's skills: name, source root, description line.
 
     Duplicate names (the same skill installed at several roots, e.g. plugin
@@ -860,6 +861,11 @@ def list_skills_impl(worker, roots=None) -> dict:
     after ONE stat call (the root dir); individual files are only
     stat/read when the directory mtime moved (skill add/remove). This
     turns ~27ms (106 per-file stats) into ~0.02ms on the hot path.
+
+    When ``strict`` is true (admission path), directory-glob and per-file
+    stat failures raise SkillScanError instead of being silently skipped —
+    an unreadable catalog is not an empty catalog. The best-effort default
+    (strict=False) preserves the receipt-advertisement behavior.
     """
     if worker not in DEFAULT_SKILL_ROOTS:
         raise HubError("invalid-argument",
@@ -870,7 +876,7 @@ def list_skills_impl(worker, roots=None) -> dict:
     import time as _time
     cache_key = worker + ":" + ",".join(str(r) for r, _ in scanned)
     dir_entry = _skills_dir_cache.get(cache_key)
-    if dir_entry is not None:
+    if not strict and dir_entry is not None:
         cache_age = _time.time() - dir_entry[0]
         if cache_age < _SKILLS_CACHE_TTL_S:
             all_unchanged = True
@@ -895,7 +901,14 @@ def list_skills_impl(worker, roots=None) -> dict:
         root = Path(root)
         if not root.is_dir():
             continue
-        for marker in sorted(root.glob(pattern)):
+        try:
+            markers = sorted(root.glob(pattern))
+        except OSError as error:
+            if strict:
+                raise SkillScanError(
+                    f"cannot scan skill directory {root}: {error}") from error
+            continue
+        for marker in markers:
             if marker.name != "SKILL.md":
                 continue
             name = marker.parent.name
@@ -906,7 +919,10 @@ def list_skills_impl(worker, roots=None) -> dict:
             key = str(marker)
             try:
                 mtime = marker.stat().st_mtime
-            except OSError:
+            except OSError as error:
+                if strict:
+                    raise SkillScanError(
+                        f"cannot stat skill file {marker}: {error}") from error
                 continue
             cached = _skills_cache.get(key)
             if cached is None or cached[0] != mtime:
@@ -929,6 +945,10 @@ def list_skills_impl(worker, roots=None) -> dict:
         _skills_dir_cache[f"{cache_key}:{root}"] = (dir_mtime, [])
     _skills_dir_cache[cache_key] = (_time.time(), result)
     return result
+
+
+class SkillScanError(OSError):
+    """Directory or file scan failed in the strict admission path."""
 
 
 def worker_skill_names(worker, limit=40) -> list[str]:
@@ -1041,7 +1061,7 @@ def _task_ledger_dirs(config, record) -> list[Path]:
 
 async def default_zcode_runner(config, task_id: str, contract: dict,
                                timeout_s=None, ui_emitter=None,
-                               resume=None) -> dict:
+                               resume=None, trusted_inputs=None) -> dict:
     """Translate the contract into a czs packet and run protocol.execute.
 
     The packet is written under ``work_root/hub-tasks/<task_id>/`` (outside the
@@ -1055,23 +1075,13 @@ async def default_zcode_runner(config, task_id: str, contract: dict,
     from math import ceil
 
     from . import protocol
+    from .worker_packets import contract_to_zcode_packet, materialize_trusted_inputs
 
     task_dir = Path(config.work_root) / "hub-tasks" / task_id
     common.ensure_directory(task_dir)
-    packet = {
-        "workspace": contract["workspace"],
-        "prompt": contract["prompt"],
-        "allowed_files": list(contract.get("allowed_files", [])),
-        "commands": list(contract.get("commands", [])),
-        "trusted_hashes": {},
-    }
-    if isinstance(contract.get("model"), dict):
-        packet["model"] = contract["model"]
-    # P-B G4: the reviewer-named skills become the packet's orchestration
-    # allowlist — the advertised capability becomes loadable on the worker.
-    if contract.get("skills"):
-        packet["orchestration"] = {"skills": {"allowed":
-                                              list(contract["skills"])}}
+    trusted_inputs = trusted_inputs or {}
+    packet = contract_to_zcode_packet(contract, trusted_inputs=trusted_inputs)
+    materialize_trusted_inputs(packet, trusted_inputs)
     packet_path = task_dir / "packet.json"
     common.write_json(packet_path, packet)
     out_path = task_dir / "run.json"
@@ -1201,23 +1211,10 @@ def _field(source, name: str, default=None):
     return getattr(source, name, default)
 
 
-def _zcode_packet(contract: dict) -> dict:
-    """Translate a contract into a czs task packet.
-
-    Same shape :func:`default_zcode_runner` writes for the cold path; the
-    resident branch reuses it so both zcode modes hand the Authority identical
-    packets.
-    """
-    packet = {
-        "workspace": contract["workspace"],
-        "prompt": contract["prompt"],
-        "allowed_files": list(contract.get("allowed_files", [])),
-        "commands": list(contract.get("commands", [])),
-        "trusted_hashes": {},
-    }
-    if isinstance(contract.get("model"), dict):
-        packet["model"] = contract["model"]
-    return packet
+def _zcode_packet(contract: dict, trusted_inputs=None) -> dict:
+    """Translate a contract through the shared cold/resident packet converter."""
+    from .worker_packets import contract_to_zcode_packet
+    return contract_to_zcode_packet(contract, trusted_inputs=trusted_inputs or {})
 
 
 class ResidentWorkers:
@@ -1420,7 +1417,8 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                         appserver_driver_factory=None,
                         appserver_concurrency=0,
                         workers=None,
-                        ui_emitter=None, ui_initiator_resolver=None) -> dict:
+                        ui_emitter=None, ui_initiator_resolver=None,
+                        dispatch_binding=None, trusted_inputs=None) -> dict:
     """Execute one registered contract on its worker; async coroutine.
 
     Dispatch follows the contract's ``(worker, mode)`` pair: zcode ``cold``
@@ -1471,6 +1469,9 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
     worker = contract["worker"]
     mode = contract.get("mode") or {"zcode": "cold", "dsh": "headless"}.get(
         worker, "exec")
+    if trusted_inputs is not None and (action != "start" or worker != "zcode" \
+            or mode != "cold" or not isinstance(trusted_inputs, dict)):
+        raise HubError("unsupported", "trusted inputs are internal to a zcode cold start")
     # --- attach resolution (P2): which session does this follow-up continue?
     resume_session = None
     if action == "attach":
@@ -1580,11 +1581,24 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                        "codex CLI not found on this host; "
                        "cannot start the app-server client")
 
-    task_id = uuid.uuid4().hex
+    digest = contracts.contract_digest(contract)
+    if dispatch_binding is None:
+        task_id = uuid.uuid4().hex
+    else:
+        # Internal durable-owner path only; MCP delegate arguments never expose this.
+        from .work_dispatch import DispatchBinding
+        if not isinstance(dispatch_binding, DispatchBinding) or action != "start" \
+                or not re.fullmatch(r"[0-9a-f]{32}", dispatch_binding.reserved_task_id):
+            raise HubError("invalid-argument", "invalid internal dispatch binding")
+        if dispatch_binding.contract_sha256 != digest:
+            raise HubError("dispatch-contract-mismatch",
+                           "reserved task binding does not match the registered contract")
+        task_id = dispatch_binding.reserved_task_id
+        if _task_record_path(config, task_id).exists():
+            raise HubError("task-id-reserved", "reserved task id is already occupied")
     tasks_dir = _tasks_dir(config)
     common.ensure_directory(tasks_dir)
     evidence_dir = Path(evidence_root) / "tasks" / task_id
-    digest = contracts.contract_digest(contract)
     started = time.monotonic()
     record: dict = {
         "task_id": task_id,
@@ -1614,6 +1628,9 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
     if action == "attach":
         record["attached_to"] = attach_to
         record["resumed_session"] = resume_session
+    if dispatch_binding is not None:
+        record["dispatch_intent_id"] = dispatch_binding.intent_id
+        record["attempt_id"] = dispatch_binding.attempt_id
     _write_task_record(_task_record_path(config, task_id), record)
     # P-B G4 (pre-try: refusals must surface as HubError, not runner-error).
     # Named skills must exist on THIS zcode worker before dispatch — the
@@ -1626,7 +1643,23 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                 "skills require the cold path: resident packets reject "
                 "orchestration; register the follow-up without a mode "
                 "(cold default) to use skills")
-        available = set(worker_skill_names(worker))
+        # P0-A Task 1 + R4: admission reads the FULL catalog in STRICT mode.
+        # The bounded worker_skill_names is receipt ADVERTISEMENT only.
+        # strict=True raises SkillScanError on directory-glob or per-file
+        # stat failures — an unreadable catalog must refuse loudly, never
+        # masquerade as an empty one that reports skills as "not installed".
+        try:
+            listing = list_skills_impl(worker, strict=True)
+        except SkillScanError as error:
+            raise HubError(
+                "skill-discovery-failed",
+                str(error)[:200]) from error
+        except Exception as error:  # noqa: BLE001 - refuse, never guess
+            raise HubError(
+                "skill-discovery-failed",
+                ("cannot read the zcode skill catalog: "
+                 f"{type(error).__name__}: {error}")[:200]) from error
+        available = {entry["name"] for entry in listing["skills"]}
         unknown = [name for name in contract["skills"]
                    if name not in available]
         if unknown:
@@ -1975,6 +2008,7 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
             except (TypeError, ValueError):
                 resident_params = set()
             if "telemetry_socket" in resident_params:
+                telemetry = get_telemetry(config)
                 resume_kwargs["telemetry_socket"] = telemetry.socket_path
             run = await _invoke(resident.run_packet, packet_dir / "packet.json",
                                 task_dir / "run.json", timeout_s=timeout_s,
@@ -2015,6 +2049,8 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
                                    "the injected zcode runner accepts no "
                                    "resume; cannot attach through it")
                 cold_kwargs["resume"] = resume_session
+            if trusted_inputs is not None:
+                cold_kwargs["trusted_inputs"] = trusted_inputs
             run = await _invoke(zcode_runner, config, task_id, contract,
                                 timeout_s, **cold_kwargs)
             run = run if isinstance(run, dict) else {}
@@ -2090,7 +2126,7 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
 # --------------------------------------------------------------------------
 
 def _tools() -> list[dict]:
-    return [
+    tools = [
         {
             "name": "health",
             "description": "Worker health view: human-approved health.json merged with "
@@ -2146,6 +2182,35 @@ def _tools() -> list[dict]:
                             "additionalProperties": False},
         },
         {
+            "name": "prepare_work",
+            "description": "Deterministic work orientation: match a TaskFrame/v1 "
+                           "(goal, task_kinds, domains, features, evidence_refs) "
+                           "against the bundled practice catalog; returns matched "
+                           "practices (candidate/conditional, never a scientific "
+                           "verdict), unresolved fields, suggested probes and a "
+                           "worker prompt. Zero model requests, no config needed.",
+            "inputSchema": {"type": "object", "properties": {
+                "frame": {"type": "object"},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 10},
+                "theme_ids": {"type": "array", "items": {"type": "string"}, "uniqueItems": True},
+            }, "required": ["frame"], "additionalProperties": False},
+        },
+        {
+            "name": "validate_brief",
+            "description": "Validate an ArchitectureBrief/v1 structure and locate its "
+                           "claims in the CURRENT workspace of a REGISTERED "
+                           "contract (the workspace cannot be supplied by the "
+                           "caller). Read-only; never executes commands, never "
+                           "confers design or scientific acceptance.",
+            "inputSchema": {"type": "object", "properties": {
+                "contract_id": {"type": "string"},
+                "brief": {"type": "object"},
+                "expected_frame_sha256": {"type": "string"},
+            }, "required": ["contract_id", "brief",
+                            "expected_frame_sha256"],
+               "additionalProperties": False},
+        },
+        {
             "name": "task_status",
             "description": "Recent hub tasks with live heartbeat verdicts for running "
                            "ones (reads progress ledgers directly — status queries "
@@ -2186,6 +2251,16 @@ def _tools() -> list[dict]:
                "additionalProperties": False},
         },
     ]
+    from .work_tools import MCP_ACTIONS
+    for name in MCP_ACTIONS:
+        tools.append({
+            "name": name,
+            "description": "Durable collaboration work API; forwarded to the independent "
+                           "local owner. Mutations require expected_revision and an "
+                           "idempotency_key; start means accepted, not completed.",
+            "inputSchema": {"type": "object", "additionalProperties": True},
+        })
+    return tools
 
 
 def build_server(config, evidence_root: Path, *, codex_path=None,
@@ -2212,6 +2287,7 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
     import mcp.types as types
 
     evidence_root = Path(evidence_root)
+    from .work_tools import MCP_ACTIONS as WORK_MCP_ACTIONS
     workers = ResidentWorkers(
         config, evidence_root, codex_path=codex_path,
         resident_factory=resident_factory, appserver_factory=appserver_factory,
@@ -2266,6 +2342,57 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
                                             arguments.get("worker"))
             elif name == "list_models":
                 value = await _offload_read(list_models_impl)
+            elif name == "prepare_work":
+                from functools import partial
+                from .work_tools import prepare_work_impl
+                from .work_contracts import WorkInputError as _WorkInputError
+                try:
+                    # _offload_read takes positional args only; the
+                    # keyword-only limit rides along via partial.
+                    value = await _offload_read(
+                        partial(prepare_work_impl,
+                                limit=arguments.get("limit", 5),
+                                theme_ids=arguments.get("theme_ids", ())),
+                        arguments.get("frame"))
+                except _WorkInputError as error:
+                    return error_result("work-input-invalid",
+                                        json.dumps({"code": error.code,
+                                                    "issues": error.issues},
+                                                   ensure_ascii=False)[:500])
+            elif name == "validate_brief":
+                from .work_tools import validate_brief_impl
+                from .work_contracts import WorkInputError as _WorkInputError
+                try:
+                    value = await _offload_read(
+                        validate_brief_impl, config,
+                        arguments.get("contract_id"),
+                        arguments.get("brief"),
+                        arguments.get("expected_frame_sha256"))
+                except _WorkInputError as error:
+                    return error_result("work-input-invalid",
+                                        json.dumps({"code": error.code,
+                                                    "issues": error.issues},
+                                                   ensure_ascii=False)[:500])
+                # Schema/source failures are REPORTS, not exceptions: keep
+                # the full BriefValidation payload and flag is_error so the
+                # orchestrator cannot mistake them for a pass.
+                if value.get("schema_valid") is False \
+                        or value.get("sources_valid") is False:
+                    return types.CallToolResult(
+                        content=[types.TextContent(
+                            type="text",
+                            text=json.dumps(value, ensure_ascii=False))],
+                        is_error=True)
+            elif name in WORK_MCP_ACTIONS:
+                from functools import partial
+                from .work_models import WorkError
+                from .work_tools import WorkService
+                try:
+                    service = WorkService.for_state_root(Path(config.state_dir) / "work-owner")
+                    value = await _offload_read(
+                        partial(service.invoke, WORK_MCP_ACTIONS[name]), arguments)
+                except WorkError as error:
+                    return error_result(error.code, str(error))
             elif name == "task_status":
                 value = await _offload_read(task_status_impl,
                                             config, arguments.get("task_id"),

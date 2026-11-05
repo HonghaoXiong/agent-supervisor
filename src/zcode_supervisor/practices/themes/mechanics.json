@@ -1,0 +1,41 @@
+{
+  "schema_version": "zsc.practice-catalog/v1",
+  "practices": [
+    {
+      "id": "mechanics-material-geometry", "revision": 1, "status": "active",
+      "title": "先核对材料、构形与本构闭合物件",
+      "task_kinds": ["feature", "new_method", "verification"], "domains": ["mechanics"], "requires_features": {},
+      "questions": ["材料分区、几何构形、位移或速度边界与本构对象是否指向同一套状态和坐标约定？", "接口两侧的材料身份、几何映射和本构参数域是否有可审查的来源？"],
+      "first_actions": ["列出材料、几何、本构与边界的对象归属和接口映射"],
+      "evidence_required": ["对象归属表、接口映射和适用域来源"],
+      "not_applicable": ["不能把变量同名视为材料或本构语义相同"],
+      "stop_conditions": ["对象归属和映射有证据闭合，或冲突被登记为独立裁定时停止"],
+      "source_ids": ["design-derived:mechanics:material-geometry"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "mechanics-interface-balance", "revision": 1, "status": "active",
+      "title": "用力学接口的守恒与单位追问局部异常",
+      "task_kinds": ["debug", "verification"], "domains": ["mechanics"], "requires_features": {},
+      "questions": ["位移、速度、牵引力或应力跨过接口时，方向、法向、单位和采样位置是否一致？", "局部平衡检查与整体响应的差异能否定位到边界、积分或数据映射？"],
+      "first_actions": ["对接口两侧的量纲、方向、位置和守恒检查逐项对照"],
+      "evidence_required": ["接口量纲表、守恒检查和最小反例"],
+      "not_applicable": ["局部残差很小不能替代独立接口检查"],
+      "stop_conditions": ["异常已由独立量复现并定位，或接口检查闭合时停止"],
+      "source_ids": ["design-derived:mechanics:interface-balance"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "mechanics-history-state", "revision": 1, "status": "active",
+      "title": "追问路径相关状态的所有权与历史连续性",
+      "task_kinds": ["feature", "debug", "verification"], "domains": ["mechanics"], "requires_features": {"moving_state": true},
+      "questions": ["应变、损伤或其他内部状态在 restart、重网格和材料搬运后仍属于同一个物理对象吗？", "路径相关变量的初始化、更新和迁移顺序是否与历史语义一致？"],
+      "first_actions": ["追踪一个内部状态从初始化到迁移和重启的所有权链"],
+      "evidence_required": ["状态所有权链、迁移顺序和历史连续性对照"],
+      "not_applicable": ["场值插值相近不能单独证明历史状态保持正确"],
+      "stop_conditions": ["历史链闭合或已构造出可复现的身份丢失反例时停止"],
+      "source_ids": ["design-derived:mechanics:history-state"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    }
+  ]
+}

@@ -10,6 +10,10 @@ Python 包名为 `codex-zcode-supervisor`（仓库名 agent-supervisor），命�
 - 显式文件范围、冻结输入哈希、精确 Bash 命令与次数/时间预算。
 - 审批与实际工具调用绑定，核验前台命令退出码、超时和文件变化。
 - 保存成功与失败证据；提交服务器作业和回收结果可以拆成两个短任务。
+- 0.3 增加持久 WorkOwner、版本化设计/候选、幂等生命周期、独立验收、
+  依赖检查、知识复用与只读桌面投影；CLI 和 MCP 共用同一服务。
+- ZCode cold 路径支持声明式 CreateWorkflow 及随包调研模板；resident
+  对不支持的能力明确回退 cold，严格 provider 预算不可用时在派发前拒绝。
 - 本机配置独立生成，不携带原开发电脑的路径、账户、模型凭据或任务记录。
 
 **仅接受已审查指纹的 ZCode CLI bundle**（已审清单与版本见[兼容性与补丁](docs/COMPATIBILITY.md)，随审查滚动更新）。 配置可迁移不等于兼容所有 ZCode 版本。macOS 已有真实联调基础；Linux 面向 POSIX 运行与离线测试，仍须在目标机器完成真实联调。原生 Windows 尚未验证。

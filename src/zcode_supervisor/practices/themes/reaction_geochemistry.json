@@ -1,0 +1,41 @@
+{
+  "schema_version": "zsc.practice-catalog/v1",
+  "practices": [
+    {
+      "id": "reaction-species-units", "revision": 1, "status": "active",
+      "title": "先核对物种身份、浓度基准与动力学单位",
+      "task_kinds": ["feature", "calibration", "verification"], "domains": ["reaction_geochemistry"], "requires_features": {},
+      "questions": ["物种名称、组分索引、浓度基准和动力学参数单位是否在输入、反应与输出间一致？", "摩尔、质量、体积分数及溶液或固体基准是否在接口处被隐式混用？"],
+      "first_actions": ["沿物种数据流核对名称、索引、浓度与参数单位"],
+      "evidence_required": ["物种单位表、索引映射和接口最小反例"],
+      "not_applicable": ["数值非负或曲线平滑不能证明物种与单位正确"],
+      "stop_conditions": ["物种和基准链闭合或单位冲突被复核时停止"],
+      "source_ids": ["design-derived:reaction_geochemistry:species-units"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "reaction-kinetic-time", "revision": 1, "status": "active",
+      "title": "分清反应速率、动力学时间与耦合更新",
+      "task_kinds": ["feature", "debug", "verification"], "domains": ["reaction_geochemistry"], "requires_features": {"coupled_processes": true},
+      "questions": ["反应速率、累积反应量和动力学时间是否使用同一单位与阶段时刻？", "反应、输运和温度更新的先后顺序是否制造了未声明的时间错位？"],
+      "first_actions": ["对齐速率积分、状态更新和输运耦合的时间语义"],
+      "evidence_required": ["反应时间轴、更新顺序和速率积分对照"],
+      "not_applicable": ["调快或调慢速率不能替代时间语义核查"],
+      "stop_conditions": ["反应时间链闭合或错位被最小算例复现时停止"],
+      "source_ids": ["design-derived:reaction_geochemistry:kinetic-time"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "reaction-conservation-ledger", "revision": 1, "status": "active",
+      "title": "让反应、边界与存量变化共享同一物质账",
+      "task_kinds": ["feature", "new_method", "verification"], "domains": ["reaction_geochemistry"], "requires_features": {},
+      "questions": ["反应生成消耗、边界进出、相态转移和存量变化是否在同一物种与时段上闭合？", "局部反应记账与全局元素或组分账不一致时，是否漏掉了边界、沉淀或输出路径？"],
+      "first_actions": ["建立物种和元素两个视角的反应边界存量账并定位差异"],
+      "evidence_required": ["反应物质账、边界相态说明和未闭合项"],
+      "not_applicable": ["反应方程看似配平不能替代实际实现的物质账"],
+      "stop_conditions": ["实际实现的账闭合或未闭合路径被具名保留时停止"],
+      "source_ids": ["design-derived:reaction_geochemistry:conservation-ledger"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    }
+  ]
+}

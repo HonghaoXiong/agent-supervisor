@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "codex-zcode-supervisor"
-version = "0.2.8"
+version = "0.3.0"
 description = "Evidence-audited Codex to ZCode delegation through the ZCode app-server protocol"
 readme = "README.md"
 license = "Apache-2.0"
@@ -29,4 +29,4 @@ Repository = "https://github.com/HonghaoXiong/agent-supervisor"
 where = ["src"]
 
 [tool.setuptools.package-data]
-zcode_supervisor = ["patches/*.patch"]
+zcode_supervisor = ["patches/*.patch", "practices/*.json", "practices/themes/*.json", "templates/recon/*.ts", "schemas/*.json", "schemas/work/*.json"]

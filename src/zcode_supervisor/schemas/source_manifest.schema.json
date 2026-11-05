@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zcode-supervisor.local/schema/zsc.source-manifest.v1.json",
+  "title": "SourceManifest/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "roots", "scope", "files", "directory_members", "environment", "skill_fingerprints", "checker_fingerprints", "coverage", "limits"],
+  "properties": {
+    "schema_version": {"const": "zsc.source-manifest/v1"},
+    "roots": {"type": "array"},
+    "scope": {"type": "object"},
+    "files": {"type": "array"},
+    "directory_members": {"type": "array"},
+    "environment": {"type": "object"},
+    "skill_fingerprints": {"type": "object"},
+    "checker_fingerprints": {"type": "object"},
+    "coverage": {"type": "object"},
+    "limits": {"type": "object"}
+  }
+}

@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "zsc.design-decision/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "decision_id", "revision", "work_id", "brief_ref", "B0_ref", "selected_option", "interface_contracts", "invariants", "allowed_changes", "task_dag", "acceptance_checks", "open_questions", "supersedes"],
+  "properties": {
+    "schema_version": {"const": "zsc.design-decision/v1"},
+    "decision_id": {"type": "string", "minLength": 1, "maxLength": 128},
+    "revision": {"type": "integer", "minimum": 1},
+    "work_id": {"type": "string", "minLength": 1},
+    "brief_ref": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "B0_ref": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "selected_option": {"type": "object", "additionalProperties": false, "required": ["id", "rationale"], "properties": {"id": {"type": "string"}, "rationale": {"type": "string"}}},
+    "interface_contracts": {"type": "array", "items": {"$ref": "interface-contract-v1.json"}},
+    "invariants": {"type": "array", "items": {"type": "string"}},
+    "allowed_changes": {"type": "object", "additionalProperties": {"type": "array", "items": {"type": "string"}}},
+    "task_dag": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["task_id", "depends_on"], "properties": {"task_id": {"type": "string"}, "depends_on": {"type": "array", "items": {"type": "string"}}}}},
+    "acceptance_checks": {"type": "array", "items": {"type": "object", "additionalProperties": false, "required": ["id", "qualification", "oracle_ref", "registered_command_id", "required"], "properties": {"id": {"type": "string"}, "qualification": {"type": "string"}, "oracle_ref": {"type": "string"}, "registered_command_id": {"type": "string"}, "required": {"type": "boolean"}}}},
+    "dependency_rationales": {"type": "object", "additionalProperties": {"type": "object", "additionalProperties": false, "required": ["decision_id", "status", "reason"], "properties": {"decision_id": {"type": "string"}, "status": {"enum": ["unknown", "not_applicable"]}, "reason": {"type": "string", "minLength": 1}}}},
+    "open_questions": {"type": "array", "items": {"type": "string"}},
+    "supersedes": {"type": ["string", "null"]}
+  }
+}

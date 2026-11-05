@@ -1,0 +1,41 @@
+{
+  "schema_version": "zsc.practice-catalog/v1",
+  "practices": [
+    {
+      "id": "thermal-source-time", "revision": 1, "status": "active",
+      "title": "先核对热源、温度响应与时间尺度语义",
+      "task_kinds": ["feature", "calibration", "verification"], "domains": ["thermal"], "requires_features": {},
+      "questions": ["热源施加、温度输出和物理时间是否使用同一时刻、时段与单位？", "瞬时温度与时段平均、累计热量和阶段末状态是否被混作同一观测量？"],
+      "first_actions": ["对齐热源、状态更新与温度输出的时间轴和统计口径"],
+      "evidence_required": ["时间轴对照、热源记账和输出采样定义"],
+      "not_applicable": ["升温或降温趋势本身不能验证时间尺度"],
+      "stop_conditions": ["时间与热账语义闭合，或差异有独立反例时停止"],
+      "source_ids": ["design-derived:thermal:source-time"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "thermal-boundary-identity", "revision": 1, "status": "active",
+      "title": "区分温度边界、热流边界与材料界面",
+      "task_kinds": ["feature", "debug", "verification"], "domains": ["thermal"], "requires_features": {},
+      "questions": ["边界温度、界面温度和热流方向是否在相同位置与法向上定义？", "材料界面的热物性、几何映射和边界更新是否使用了同一份当前状态？"],
+      "first_actions": ["逐接口核对温度、热流、材料与几何边界的位置和更新时刻"],
+      "evidence_required": ["热边界对象表、界面映射和独立通量检查"],
+      "not_applicable": ["边界场平滑不能证明界面热流连续"],
+      "stop_conditions": ["界面检查闭合或边界冲突被独立复核时停止"],
+      "source_ids": ["design-derived:thermal:boundary-identity"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "thermal-history-transport", "revision": 1, "status": "active",
+      "title": "在移动与耦合过程中保持热历史可追踪",
+      "task_kinds": ["feature", "new_method", "verification"], "domains": ["thermal"], "requires_features": {"moving_state": true, "coupled_processes": true},
+      "questions": ["温度和累计热历史在平流、重网格与多场耦合后属于节点、单元还是材料对象？", "热状态迁移是否误用了当前场重建了过去历史？"],
+      "first_actions": ["追踪温度与热历史在移动、耦合和重启中的所有权"],
+      "evidence_required": ["热历史迁移链、耦合更新顺序和重启对照"],
+      "not_applicable": ["当前温度场一致不代表热历史相同"],
+      "stop_conditions": ["热历史身份与更新顺序有证据闭合时停止"],
+      "source_ids": ["design-derived:thermal:history-transport"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    }
+  ]
+}

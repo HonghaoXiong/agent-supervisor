@@ -1,0 +1,41 @@
+{
+  "schema_version": "zsc.practice-catalog/v1",
+  "practices": [
+    {
+      "id": "stratigraphy-material-layer-age", "revision": 1, "status": "active",
+      "title": "分清物质、地层单元与层龄身份",
+      "task_kinds": ["feature", "new_method", "verification"], "domains": ["stratigraphy_geomorphology"], "requires_features": {},
+      "questions": ["物质标识、地层单元和层龄是同一个字段的不同名称，还是各自独立的历史属性？", "沉积、侵蚀和再搬运后，层龄与物质来源是否仍按定义解释？"],
+      "first_actions": ["列出物质、层单元、层龄和来源字段的定义及转换链"],
+      "evidence_required": ["地层身份字典、转换链和事件前后对照"],
+      "not_applicable": ["颜色或材料编号不能直接当作层龄证据"],
+      "stop_conditions": ["身份定义与转换链闭合，或歧义被保留时停止"],
+      "source_ids": ["design-derived:stratigraphy_geomorphology:material-layer-age"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "stratigraphy-mesh-history", "revision": 1, "status": "active",
+      "title": "核对网格、地形与地层历史的映射",
+      "task_kinds": ["feature", "debug", "verification"], "domains": ["stratigraphy_geomorphology"], "requires_features": {"moving_state": true},
+      "questions": ["地形更新、网格重构和地表过程后，地层厚度与层序映射还指向原来的物质吗？", "输出表面与真实地层界面是否混用了冻结基准、当前网格和插值结果？"],
+      "first_actions": ["追踪地层界面在地形和网格更新前后的坐标与物质映射"],
+      "evidence_required": ["界面映射、网格历史与物质对照"],
+      "not_applicable": ["几何外观相近不能证明层序历史未丢失"],
+      "stop_conditions": ["界面与物质链闭合或丢失位置可复现时停止"],
+      "source_ids": ["design-derived:stratigraphy_geomorphology:mesh-history"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "stratigraphy-sediment-provenance", "revision": 1, "status": "active",
+      "title": "用源区到沉积区的物质账检查地表过程",
+      "task_kinds": ["feature", "calibration", "verification"], "domains": ["stratigraphy_geomorphology"], "requires_features": {},
+      "questions": ["侵蚀、搬运、沉积和离开模型的物质是否在同一区域与时段上记账？", "源区岩性、沉积通量和最终层序之间是否存在未说明的混合或丢失？"],
+      "first_actions": ["按源区和沉积区核对物质量、岩性与输出通量"],
+      "evidence_required": ["物质来源账、区域时段定义和层序对照"],
+      "not_applicable": ["沉积厚度符合预期不能单独证明来源与搬运路径正确"],
+      "stop_conditions": ["物质账与层序能相互复核，或缺口被登记时停止"],
+      "source_ids": ["design-derived:stratigraphy_geomorphology:sediment-provenance"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    }
+  ]
+}

@@ -81,7 +81,7 @@ REQUIRED = (
 )
 WORKERS = ("zcode", "codex", "dsh")
 OPTIONAL = ("snapshots", "output_schema", "mode", "sandbox", "stall_timeout_ms",
-               "skills")
+               "skills", "orchestration")
 
 ZCODE_MODES = ("cold", "resident")
 CODEX_MODES = ("exec", "app-server")
@@ -391,6 +391,19 @@ def validate_contract(contract: dict) -> dict:
                     problems.append(
                         "skills entries must be trimmed non-empty strings "
                         "(<=160 chars)")
+
+    # --- native orchestration (T04) --------------------------------------
+    value = contract.get("orchestration")
+    if "orchestration" in contract:
+        if worker != "zcode":
+            problems.append("orchestration is zcode-only")
+        if contract.get("skills"):
+            problems.append("skills and orchestration are mutually exclusive")
+        try:
+            from .orchestration import validate_orchestration
+            validate_orchestration(value)
+        except (ValueError, KeyError) as error:
+            problems.append(f"orchestration invalid: {error}")
 
     # --- budget (recorded, not enforced, in P0) -------------------------
     value = contract.get("budget")

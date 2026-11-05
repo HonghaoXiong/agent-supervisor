@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zcode-supervisor.local/schema/zsc.artifact-ref.v1.json",
+  "title": "ArtifactRef/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "sha256", "kind", "byte_count"],
+  "properties": {
+    "schema_version": {"const": "zsc.artifact-ref/v1"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "kind": {"type": "string", "minLength": 1},
+    "byte_count": {"type": "integer", "minimum": 0}
+  }
+}

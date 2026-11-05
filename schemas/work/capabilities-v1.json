@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://zcode-supervisor.local/schema/zsc.capabilities.v1.json",
+  "title": "Capabilities/v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "worker", "bundle_sha256", "capabilities", "unknowns", "discovery"],
+  "properties": {
+    "schema_version": {"const": "zsc.capabilities/v1"},
+    "worker": {"enum": ["zcode", "codex", "dsh"]},
+    "bundle_sha256": {"type": ["string", "null"]},
+    "capabilities": {"type": "array"},
+    "unknowns": {"type": "array", "items": {"type": "string"}},
+    "discovery": {"type": "object"}
+  }
+}

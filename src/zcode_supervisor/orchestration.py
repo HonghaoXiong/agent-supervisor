@@ -153,7 +153,7 @@ def validate_orchestration(value: Any) -> dict:
     if "workflow" in value:
         workflow = value["workflow"]
         if not isinstance(workflow, dict) or set(workflow) - {
-                "name", "script", "path", "max_concurrency", "subagent_model"}:
+                "name", "script", "path", "args", "max_concurrency", "subagent_model"}:
             raise ValueError("Invalid workflow specification")
         if "name" in workflow:
             _plain_str(workflow["name"], "workflow name", 64)
@@ -176,6 +176,38 @@ def validate_orchestration(value: Any) -> dict:
             if candidate.is_absolute() or ".." in candidate.parts \
                     or candidate.as_posix() != script_path or candidate.suffix != ".ts":
                 raise ValueError("workflow path must be a normalized relative .ts file")
+        if "args" in workflow:
+            # Args are executable input, not free-form model text. Only a
+            # host-frozen path workflow may pin them; the broker compares the
+            # exact JSON value at launch and again on runtime-expanded input.
+            if script_path is None or not isinstance(workflow["args"], dict):
+                raise ValueError("workflow args require a path workflow and a JSON object")
+            def check_json(item, depth=0):
+                if depth > 32:
+                    raise ValueError("workflow args exceed the 32-level nesting limit")
+                if item is None or type(item) in (bool, str, int):
+                    return
+                if type(item) is float:
+                    import math
+                    if math.isfinite(item):
+                        return
+                    raise ValueError("workflow args must contain finite JSON numbers")
+                if isinstance(item, list):
+                    for child in item:
+                        check_json(child, depth + 1)
+                    return
+                if isinstance(item, dict):
+                    for key, child in item.items():
+                        if not isinstance(key, str):
+                            raise ValueError("workflow args object keys must be strings")
+                        check_json(child, depth + 1)
+                    return
+                raise ValueError("workflow args must contain JSON values only")
+            check_json(workflow["args"])
+            import json as _json
+            if len(_json.dumps(workflow["args"], ensure_ascii=False, sort_keys=True,
+                    separators=(",", ":"), allow_nan=False).encode("utf-8")) > 65536:
+                raise ValueError("workflow args exceed the 64KiB canonical JSON limit")
         concurrency = workflow.get("max_concurrency")
         if isinstance(concurrency, bool) or not isinstance(concurrency, int) \
                 or not 1 <= concurrency <= _MAX_CONCURRENCY:
@@ -199,7 +231,7 @@ def session_options(base: dict, orch: dict | None) -> dict:
     if not orch:
         return dict(base)
     options = dict(base)
-    tools = {"Read", "Write", "Edit", "Bash"}
+    tools = set(base.get("toolAllowlist", ["Read", "Write", "Edit", "Bash"]))
     if "agents" in orch:
         tools.update(AGENT_TOOLS)
     if "workflow" in orch:

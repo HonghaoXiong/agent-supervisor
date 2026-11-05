@@ -16,6 +16,14 @@ from .runtime import load_config
 
 DEFAULT_CLI = Path('/Applications/ZCode.app/Contents/Resources/glm/zcode.cjs')
 
+WORK_REQUEST_ACTIONS = {
+    'authorize': 'authorize', 'capabilities': 'capabilities', 'create': 'create',
+    'recon': 'recon', 'submit-brief': 'submit-brief', 'accept-design': 'accept-design',
+    'implement': 'implement', 'submit-delivery': 'submit-delivery', 'verify': 'verify',
+    'accept': 'accept', 'rework': 'rework', 'cancel': 'cancel', 'reconcile': 'reconcile',
+    'artifact': 'artifact', 'revalidate': 'knowledge-revalidate',
+}
+
 
 def create_project(directory, cli_path=None, provider_config=None, node='node'):
     """Generate local configuration and a harmless, reviewable first task."""
@@ -177,6 +185,52 @@ def parser():
                                  '~/.zcode/v2/provider_config.json)')
     models_cmd.add_argument('--json', action='store_true',
                             help='Machine-readable JSON instead of compact lines')
+    work_cmd = sub.add_parser(
+        'work', help='Work orientation: deterministic practice matching and '
+                     'architecture-brief validation; no model calls')
+    work_sub = work_cmd.add_subparsers(dest='work_action', required=True)
+    work_prepare = work_sub.add_parser(
+        'prepare', help='Orientation/v1 from a TaskFrame/v1 JSON request '
+                        '(works without a config)')
+    work_prepare.add_argument('--request', type=Path, required=True,
+                              help='Path to the TaskFrame/v1 JSON document')
+    work_prepare.add_argument('--limit', type=int, default=5,
+                              help='Matched practices to return (1..10)')
+    work_prepare.add_argument('--theme', action='append', default=[], dest='theme_ids',
+                              help='Optional composable practice theme (repeatable)')
+    work_validate = work_sub.add_parser(
+        'validate-brief', help='Validate an ArchitectureBrief/v1 against a '
+                               'registered contract workspace')
+    work_validate.add_argument('--contract-id', required=True)
+    work_validate.add_argument('--brief', type=Path, required=True,
+                               help='Path to the ArchitectureBrief/v1 JSON '
+                                    'document')
+    work_validate.add_argument('--expected-frame-sha256', required=True,
+                               help='64-hex sha256 of the accepted task frame')
+    work_serve = work_sub.add_parser(
+        'serve', help='Run the independent local work owner (foreground; no system service)')
+    work_serve.add_argument('--state-root', type=Path, default=Path('.zsc/work-owner'),
+                            help='Private SQLite/control-socket directory')
+    work_serve.add_argument('--ui-socket', type=Path, default=None,
+                            help='Read-only UI socket (default <state-root>/ui-events.sock)')
+    work_serve.add_argument('--no-ui', action='store_true',
+                            help='Retain the legacy control-only foreground owner')
+    for command in WORK_REQUEST_ACTIONS:
+        request_cmd = work_sub.add_parser(
+            command, help=f'Forward work {command} to the independent local owner')
+        request_cmd.add_argument('--request', type=Path, required=True,
+                                 help='Bounded JSON request document')
+        request_cmd.add_argument('--state-root', type=Path, default=Path('.zsc/work-owner'))
+    work_status = work_sub.add_parser('status', help='Read work state without waiting for a worker')
+    work_status.add_argument('--work-id', required=True)
+    work_status.add_argument('--attempt-id', default=None)
+    work_status.add_argument('--state-root', type=Path, default=Path('.zsc/work-owner'))
+    knowledge_cmd = work_sub.add_parser('knowledge', help='Search, propose or review persistent knowledge')
+    knowledge_sub = knowledge_cmd.add_subparsers(dest='knowledge_action', required=True)
+    for command in ('search', 'propose', 'review', 'revalidate'):
+        item = knowledge_sub.add_parser(command)
+        item.add_argument('--request', type=Path, required=True)
+        item.add_argument('--state-root', type=Path, default=Path('.zsc/work-owner'))
     pin_cmd = sub.add_parser(
         'pin-candidate', help='STATIC pin candidate for the installed ZCode '
         'bundle (hash arithmetic only; adding the pin stays a human review '
@@ -339,6 +393,112 @@ def main(argv=None):
                 print("  (* = personally added; use providerId/modelId in "
                       "the zcode contract 'model' field)")
             return 0
+        if args.action == 'work':
+            if args.work_action == 'serve':
+                from .work_control import WorkOwner, WorkUiHost
+                if args.no_ui:
+                    owner = WorkOwner(args.state_root).start()
+                    print(json.dumps({'ok': True, 'pid': os.getpid(),
+                                      'control_socket': str(owner.socket_path)}), flush=True)
+                    try:
+                        owner.wait()
+                    except KeyboardInterrupt:
+                        owner.stop()
+                    return 0
+                async def serve():
+                    host = WorkUiHost(args.state_root, socket_path=args.ui_socket)
+                    await host.start()
+                    print(json.dumps({'ok': True, 'pid': os.getpid(),
+                        'control_socket': str(host.owner.socket_path),
+                        'ui_socket': str(host.server.socket_path),
+                        'collaboration_version': 1}), flush=True)
+                    try:
+                        await host.wait()
+                    finally:
+                        await host.close()
+                try:
+                    asyncio.run(serve())
+                except KeyboardInterrupt:
+                    pass
+                return 0
+            if args.work_action == 'status' or args.work_action in WORK_REQUEST_ACTIONS \
+                    or args.work_action == 'knowledge':
+                from .work_contracts import WorkInputError, read_json_input
+                from .work_models import WorkError
+                from .work_tools import WorkService
+                try:
+                    service = WorkService.for_state_root(args.state_root)
+                    if args.work_action == 'status':
+                        result = service.invoke('status', {'work_id': args.work_id,
+                                                          'attempt_id': args.attempt_id})
+                    else:
+                        if args.work_action == 'knowledge':
+                            action = 'knowledge-' + args.knowledge_action
+                        else:
+                            action = WORK_REQUEST_ACTIONS[args.work_action]
+                        request = read_json_input(args.request, max_bytes=16 * 1024 * 1024)
+                        if not isinstance(request, dict):
+                            raise WorkInputError('schema-invalid', [{
+                                'code': 'request-not-object', 'path': '$',
+                                'message': 'work request must be a JSON object'}])
+                        if action == 'authorize':
+                            result = service.client.call('authorize', request)
+                        else:
+                            result = service.invoke(action, request)
+                except WorkInputError as error:
+                    print(json.dumps({'ok': False, 'error': error.code,
+                                      'issues': error.issues}, ensure_ascii=False))
+                    return 2
+                except (WorkError, OSError, ValueError) as error:
+                    print(json.dumps({'ok': False,
+                                      'error': getattr(error, 'code', 'invalid-argument'),
+                                      'detail': str(error)[:500]}, ensure_ascii=False))
+                    return 2
+                print(json.dumps(result, ensure_ascii=False, indent=2))
+                return 0
+            from . import work_tools
+            from .contracts import ContractError
+            from .work_contracts import (WorkInputError,
+                                         read_json_input)
+            try:
+                if args.work_action == 'prepare':
+                    if isinstance(args.limit, bool) \
+                            or not 1 <= args.limit <= 10:
+                        raise WorkInputError('work-input-invalid', [{
+                            'code': 'bad-limit', 'path': '$.limit',
+                            'message': 'limit must be an integer in 1..10'}])
+                    # R2: admission reads use the capped shared helper
+                    # (limit + 1 bytes), never unbounded read_bytes().
+                    frame = read_json_input(args.request,
+                                            max_bytes=64 * 1024)
+                    result = work_tools.prepare_work_impl(frame, limit=args.limit,
+                                                          theme_ids=args.theme_ids)
+                    print(json.dumps(result, ensure_ascii=False, indent=2))
+                    return 0
+                brief = read_json_input(args.brief,
+                                        max_bytes=256 * 1024)
+                config = load_config(args.config)
+                result = work_tools.validate_brief_impl(
+                    config, args.contract_id, brief,
+                    args.expected_frame_sha256)
+            except WorkInputError as error:
+                print(json.dumps({'ok': False, 'error': error.code,
+                                  'issues': error.issues},
+                                 ensure_ascii=False))
+                return 2
+            except ContractError as error:
+                print(json.dumps({'ok': False, 'error': 'contract-rejected',
+                                  'detail': str(error)[:300]},
+                                 ensure_ascii=False))
+                return 2
+            except (OSError, ValueError) as error:
+                print(json.dumps({'ok': False, 'error': 'config-invalid',
+                                  'detail': str(error)[:300]},
+                                 ensure_ascii=False))
+                return 2
+            print(json.dumps(result, ensure_ascii=False, indent=2))
+            return 0 if (result.get('schema_valid')
+                         and result.get('sources_valid') is True) else 2
         config = load_config(args.config)
         if args.action == 'pin-candidate':
             from .runtime import pin_candidate

@@ -1,10 +1,6 @@
-tests/
-.github/
-ui/
-AGENTS.md
-VALIDATION.md
 __pycache__/
 *.pyc
-*.egg-info/
+.pytest_cache/
 dist/
+*.egg-info/
 graphify-out/

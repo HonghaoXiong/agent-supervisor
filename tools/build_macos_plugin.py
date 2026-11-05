@@ -118,7 +118,8 @@ def build(repo: Path, output: Path) -> Path:
             write(release, f"plugins/{PLUGIN}/{name}", data)
         # USAGE entry-point section is rewritten for plugin users; the accepted
         # index (including the packet.model feature) is the content authority.
-        for name in ("USAGE.md", "COMPATIBILITY.md"):
+        for name in ("USAGE.md", "COMPATIBILITY.md", "WORK-ORIENTATION.md",
+                     "WORKFLOW.md", "CAPABILITY-MATRIX.md"):
             data = subprocess.run(["git", "show", ":docs/" + name], cwd=repo,
                                   capture_output=True, check=True).stdout
             if name == "USAGE.md":

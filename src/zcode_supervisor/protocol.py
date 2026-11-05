@@ -983,6 +983,13 @@ def outcome_label(kind, problems=None):
     return text
 
 
+def _session_tool_allowlist(packet):
+    tools = ['Read', 'Write', 'Edit']
+    if packet.get('commands'):
+        tools.append('Bash')
+    return tools
+
+
 async def execute(args, config, ui_emitter=None):
     if args.resume and not re.fullmatch(r'sess_[A-Za-z0-9_-]+', args.resume):
         raise ValueError('Invalid resume session ID')
@@ -1155,7 +1162,8 @@ async def execute(args, config, ui_emitter=None):
             await asyncio.wait_for(client.start(), remaining())
             from .orchestration import session_options
             options = session_options({'workspace':{'workspacePath':str(workspace),'workspaceKey':str(workspace)},
-                                       'mcpServers':[], 'toolAllowlist':['Read','Write','Edit','Bash'],
+                                       'mcpServers':[], 'toolAllowlist':_session_tool_allowlist(
+                                           authority.packet),
                                        'dynamicWorkflowEnabled':False}, authority.orchestration)
             if args.resume:
                 reg = json.loads(read_regular(state_dir/(args.resume+'.json')))
@@ -1276,14 +1284,22 @@ async def execute(args, config, ui_emitter=None):
                                                  f'{skill_binding["target"]}, now {final_target}')
                     except ValueError as error:
                         problems_orch.append(f'skill closure verification failed: {error}')
+                idle_polls = 0
                 while ledger.expired() is None:
                     if client.failure:
                         raise ValueError(client.failure)
                     ledger.note('poll', 'orchestration')
-                    while processed < len(client.events):
-                        event = client.events[processed]
-                        processed += 1
-                        authority.note_event(event)
+                    if router_sub is not None:
+                        if router_sub.overflowed:
+                            raise RouterOverflow(
+                                'event subscription backlog overflowed for ' + str(sid))
+                        for _seq, event in router_sub.drain():
+                            authority.note_event(event)
+                    else:
+                        while processed < len(client.events):
+                            event = client.events[processed]
+                            processed += 1
+                            authority.note_event(event)
                     try:
                         subagents = await rpc('session/subagents', {'sessionId': sid})
                         # The poll is the authoritative child registry; every
@@ -1311,9 +1327,23 @@ async def execute(args, config, ui_emitter=None):
                     still_running = list(subagents.get('running', []))
                     active_runs = [rid for rid, status in run_states
                                    if status in ('pending', 'running')]
-                    if not still_running and not active_runs:
-                        break
+                    session_info = snapshot_orch.get('session', {}) \
+                        if isinstance(snapshot_orch, dict) else {}
+                    runtime_info = snapshot_orch.get('runtime', {}) \
+                        if isinstance(snapshot_orch, dict) else {}
+                    session_idle = session_info.get('status') == 'idle' \
+                        and not runtime_info.get('pendingRequestIds')
+                    if not still_running and not active_runs and session_idle:
+                        # A workflow completion can enqueue a host-generated
+                        # follow-up turn. Require a stable idle boundary so the
+                        # worker consumes that notification before postflight.
+                        idle_polls += 1
+                        if idle_polls >= 2:
+                            break
+                    else:
+                        idle_polls = 0
                     await asyncio.sleep(2)
+                orchestration_result['idle_polls'] = idle_polls
                 orchestration_result['children'] = authority.children
                 # Final boundary only (N3): mid-wait running states were never
                 # failures; judge terminal completeness after the last poll.
@@ -1432,24 +1462,48 @@ async def execute(args, config, ui_emitter=None):
                                 problems_orch.append(f'goal is not verified at audit: {status!r}')
                     elif not problems_orch or 'goal final show failed' not in str(problems_orch):
                         problems_orch.append('goal still busy at the audit boundary')
+                # Drain the terminal workflow/follow-up frames before taking
+                # the evidence slice; polling RPCs do not consume subscriptions.
+                if router_sub is not None:
+                    if router_sub.overflowed:
+                        raise RouterOverflow(
+                            'event subscription backlog overflowed for ' + str(sid))
+                    for _seq, event in router_sub.drain():
+                        authority.note_event(event)
+                else:
+                    while processed < len(client.events):
+                        event = client.events[processed]
+                        processed += 1
+                        authority.note_event(event)
                 # P2.2-repair1 C/F-4: orchestration evidence scans read the
                 # SAME evidence slice as the later audits — the routed
                 # history when incremental, the shared store when legacy.
                 evidence_source = ([frame for _seq, frame in router_sub.history]
                                    if router_sub is not None else client.events)
                 orchestration_tool_results = []
+                tool_names = {}
                 for event in evidence_source:
                     payload = event.get('payload')
                     if not isinstance(payload, dict):
                         continue
+                    if payload.get('kind') in ('tool_call', 'scheduled') \
+                            and isinstance(payload.get('toolCallId'), str) \
+                            and isinstance(payload.get('toolName'), str):
+                        tool_names[payload['toolCallId']] = payload['toolName']
+                for event in evidence_source:
+                    payload = event.get('payload')
+                    if not isinstance(payload, dict):
+                        continue
+                    tool_name = payload.get('toolName') \
+                        or tool_names.get(payload.get('toolCallId'))
                     if event.get('type') == 'tool.updated' and payload.get('kind') == 'result' \
-                            and payload.get('toolName') in ('CreateWorkflow', 'TaskOutput',
-                                                            'GetWorkflowRun', 'ListWorkflowRuns'):
+                            and tool_name in ('CreateWorkflow', 'TaskOutput',
+                                              'GetWorkflowRun', 'ListWorkflowRuns'):
                         content = ((payload.get('result') or {}).get('content')
                                    if isinstance(payload.get('result'), dict) else None)
                         orchestration_tool_results.append({
                             'toolCallId': payload.get('toolCallId'),
-                            'tool': payload.get('toolName'),
+                            'tool': tool_name,
                             'content': str(content)[:1500] if content is not None else None})
                 orchestration_result['workflow_tool_results'] = orchestration_tool_results
                 skill_calls = []
@@ -1563,21 +1617,7 @@ async def execute(args, config, ui_emitter=None):
                 # match the trusted per-run content record (or it is the
                 # exact-content .gitignore of a launched run).
                 def _final_artifact(name):
-                    if name in before or not runtime_owned(name):
-                        return False
-                    if name == '.zcode/workflow-runs/.gitignore' \
-                            and authority.workflow_launches \
-                            and (workspace / name).read_text(errors='replace') == '*\n':
-                        return True
-                    parts = Path(name).parts
-                    if (len(parts) == 3 and parts[0] == '.zcode'
-                            and parts[1] == 'workflow-runs' and parts[2].endswith('.mjs')):
-                        run_id = 'dwfrun-' + parts[2][7:-4]
-                        entry = workspace / name
-                        return (entry.is_file() and not entry.is_symlink()
-                                and sha256_regular(entry)
-                                == authority.runtime_entry_bytes.get(run_id))
-                    return False
+                    return authority.runtime_artifact_hash(name) is not None
                 result['changed_files'] = [name for name in changed_all if not _final_artifact(name)]
                 runtime_artifacts = [name for name in changed_all if _final_artifact(name)]
                 if runtime_artifacts:

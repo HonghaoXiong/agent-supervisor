@@ -44,6 +44,7 @@ from . import ui_registry
 from .ui_events import HUB_STREAM_ID  # noqa: F401 - protocol documentation
 from .ui_journal import UiJournal, _SubscriptionError
 from .ui_projection import _env_enabled
+from .ui_work import UiWorkError, UiWorkJournal, negotiate_collaboration
 
 __all__ = ["UiEventServer", "UiTransportError", "start_ui_service",
            "SOCKET_NAME", "peer_euid"]
@@ -55,15 +56,20 @@ UNIX_PATH_MAX = 104
 MAX_LINE_BYTES = 256 * 1024
 PROTOCOL_VERSION = 1
 _ALLOWED_OPS = frozenset(
-    ("hello", "snapshot", "snapshot-events", "subscribe"))
+    ("hello", "snapshot", "snapshot-events", "subscribe",
+     "work-snapshot", "work-events", "work-evidence", "work-subscribe"))
 #: strict per-op request fields (PLAN §4.1: 越权字段 fail-closed)
 _OP_FIELDS = {
-    "hello": frozenset(("op", "v", "client")),
+    "hello": frozenset(("op", "v", "client", "collaboration")),
     "snapshot": frozenset(("op", "v", "snapshot_cursor", "page_cursor")),
     "snapshot-events": frozenset(("op", "v", "snapshot_cursor",
                                   "page_cursor")),
     "subscribe": frozenset(("op", "v", "stream_id", "snapshot_cursor",
                             "after_seq", "filters")),
+    "work-snapshot": frozenset(("op", "v", "cursor", "limit")),
+    "work-events": frozenset(("op", "v", "after_seq")),
+    "work-evidence": frozenset(("op", "v", "work_id", "cursor", "limit")),
+    "work-subscribe": frozenset(("op", "v", "after_seq")),
 }
 
 _libc = None
@@ -117,6 +123,9 @@ class _Connection:
         self.subscription = None
         self.writer_task = None
         self.heartbeat_task = None
+        self.collaboration = None
+        self.work_queue = None
+        self.work_pump_task = None
         self.closed = False
         self.frames_sent = 0
         self.frames_dropped = 0
@@ -196,7 +205,7 @@ class _Connection:
         release = getattr(self.journal, "release_pages", None)
         if callable(release):
             release(self.client_id)
-        for task in (self.writer_task, self.heartbeat_task):
+        for task in (self.writer_task, self.heartbeat_task, self.work_pump_task):
             if task is not None and not task.done():
                 task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
@@ -232,7 +241,15 @@ class _Connection:
             hello = self.journal.hello()
             hello["ok"] = True
             hello["v"] = PROTOCOL_VERSION
+            if "collaboration" in payload:
+                self.collaboration = negotiate_collaboration(payload["collaboration"])
+                hello["collaboration"] = self.collaboration
+                if self.collaboration and self.collaboration.get("v") == 1:
+                    hello["work_ops"] = ["work-snapshot", "work-events",
+                                         "work-evidence", "work-subscribe"]
             await self._send(hello)
+        elif op.startswith("work-"):
+            await self._handle_work(op, payload)
         elif op == "snapshot":
             await self._send(self.journal.snapshot(
                 payload.get("snapshot_cursor"),
@@ -298,6 +315,55 @@ class _Connection:
                 await self._send({"ok": False, "error": "invalid_request",
                                   "detail": "stream_id required"})
 
+    async def _handle_work(self, op, payload):
+        capability = {"work-snapshot": "work-snapshot", "work-events": "work-events",
+                      "work-subscribe": "work-events", "work-evidence": "evidence-summaries"}[op]
+        if not isinstance(self.collaboration, dict) or self.collaboration.get("v") != 1 \
+                or capability not in self.collaboration.get("capabilities", []):
+            await self._send({"ok": False, "error": "forbidden",
+                              "detail": "capability-not-negotiated"})
+            return
+        try:
+            if op == "work-snapshot":
+                await self._send(self.server.work_journal.snapshot(
+                    cursor=payload.get("cursor"), limit=payload.get("limit", 20)))
+            elif op == "work-events":
+                await self._send(self.server.work_journal.events(
+                    after_seq=payload.get("after_seq", 0)))
+            elif op == "work-evidence":
+                await self._send(self.server.work_journal.evidence(
+                    payload.get("work_id"), cursor=payload.get("cursor"),
+                    limit=payload.get("limit", 10)))
+            else:
+                if self.work_pump_task is not None:
+                    await self._send({"ok": False, "error": "invalid_request",
+                                      "detail": "already work-subscribed"})
+                    return
+                replay = self.server.work_journal.events(after_seq=payload.get("after_seq", 0))
+                self.work_queue = asyncio.Queue(maxsize=256)
+                for event in replay["events"]:
+                    self.work_queue.put_nowait(event)
+                await self._send({"ok": True, "subscribed": "work",
+                                  "high_watermark": replay["high_watermark"]})
+                self.work_pump_task = asyncio.create_task(self._work_pump())
+        except UiWorkError as error:
+            if error.code == "event-gap":
+                await self._send({"type": "work-gap", "gap": json.loads(error.message)})
+            else:
+                await self._send({"ok": False, "error": error.code, "detail": error.message})
+
+    async def _work_pump(self):
+        try:
+            while not self.closed and self.work_queue is not None:
+                event = await self.work_queue.get()
+                if event.get("type") == "work-gap":
+                    await self._send(event)
+                    break
+                if not await self._send({"type": "work-event", "event": event}):
+                    break
+        except (ConnectionError, OSError):
+            pass
+
     # -- streaming side ---------------------------------------------------------
     async def _pump(self) -> None:
         """Drain the bounded subscription queue to the wire.
@@ -356,8 +422,10 @@ class UiEventServer:
 
     def __init__(self, journal: UiJournal, *, socket_path=None,
                  state_dir=None, heartbeat_s: float = 15.0,
-                 register_service: bool = False):
+                 register_service: bool = False, work_journal=None):
         self.journal = journal
+        self.work_journal = work_journal if work_journal is not None else UiWorkJournal()
+        self._work_listener = self.work_journal.add_listener(self._publish_work)
         self.heartbeat_s = float(heartbeat_s)
         # one-click discovery (ui_registry): only the gated production
         # path (start_ui_service — on by default since 2026-10-24; rolled
@@ -372,11 +440,33 @@ class UiEventServer:
             socket_path = Path(state_dir) / SOCKET_NAME
         self.socket_path = Path(socket_path)
         self._server = None
+        self._loop = None
         self._bound_ino = None
         self.connections: set[_Connection] = set()
         #: optional deterministic wire-backpressure hook for bench/tests
         #: (production default: None — never set outside fakes)
         self.write_gate = None
+
+    # -- security checks (all fail-closed, no fallback) ----------------------
+    def _publish_work(self, event):
+        if self._loop is None:
+            return
+        with contextlib.suppress(RuntimeError):
+            self._loop.call_soon_threadsafe(self._queue_work, event)
+
+    def _queue_work(self, event):
+        for connection in list(self.connections):
+            queue = connection.work_queue
+            if queue is None:
+                continue
+            try:
+                queue.put_nowait(event)
+            except asyncio.QueueFull:
+                while not queue.empty():
+                    queue.get_nowait()
+                queue.put_nowait({"type": "work-gap", "gap": {
+                    "retention_floor": event["seq"], "high_watermark": event["seq"],
+                    "reason": "slow-consumer-overflow"}})
 
     # -- security checks (all fail-closed, no fallback) ----------------------
     def _validate_parent(self) -> Path:
@@ -445,6 +535,7 @@ class UiEventServer:
 
     # -- lifecycle -------------------------------------------------------------
     async def start(self) -> None:
+        self._loop = asyncio.get_running_loop()
         self._validate_path_length()  # fail before anything else on purpose
         self._validate_parent()
         self._validate_path_free()
@@ -522,6 +613,10 @@ class UiEventServer:
             self._registry_entry = None
 
     async def close(self) -> None:
+        if self._work_listener is not None:
+            self._work_listener()
+            self._work_listener = None
+        self._loop = None
         if self._registry_task is not None:
             self._registry_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):

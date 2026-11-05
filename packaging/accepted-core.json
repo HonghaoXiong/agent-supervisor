@@ -1,27 +1,37 @@
 {
-  "schema_version": 1,
-  "acceptance": "2026-11-03 acceptance: v0.2.1 stall-timeout progress ledger (per-event heartbeats to <out>.progress.jsonl, wall fuse default 86400 under stall), czs progress + codex-status read-only views, and the dsh headless hub worker (third worker; NDJSON event wire live-probed 2026-11-03, exit code 0 even on error, success judged from events). Offline suite: 1136 tests green in the hub venv (Python 3.12, mcp installed), including 34 new tests for ledger/stall/dsh driver/dsh contracts; test_distribution requires a real git checkout and runs at release build time. NOT re-qualified live in this batch: no live zcode model run, no live dsh model run, no codex app-server round trip — prior live evidence (2026-10-26/31) covers those channels' unchanged paths.",
-  "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
+  "acceptance": "0.3.0 development candidate: T01-T18 implementation, offline validation in progress; not independently accepted and not a replacement installation",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "241dcdb7e7bf07e402373090c909fe10962c93df",
-      "sha256": "fbda49affadbc06c888948db7950bc37670c64df345ad26a89f7a848621c7779"
+      "blob": "2427e7cccab0c31ced000c6f92bd3d3db47e1236",
+      "sha256": "53e23ef500132c164ed91076ad5d14829b3be5704a9106809892d3640b6f1122"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
       "sha256": "935a1c1166b0c1ea35a82256345000bf2c73ded718d77773bc27a71ecce28f7d"
     },
+    "src/zcode_supervisor/architecture_brief.py": {
+      "blob": "ac3e3849db57d2b1017603195b690315e1a201d1",
+      "sha256": "df7558b6e4ebdbf7dd6693ab07b346f22efc7323e31b1611b01b0d4f32f4d435"
+    },
+    "src/zcode_supervisor/artifact_store.py": {
+      "blob": "08bc161f3f1f497bfeaf54ecf70550ab2bc4950e",
+      "sha256": "7e83ba9363d541693fe9053d2399427dd155450922848fef50bd23a911014974"
+    },
     "src/zcode_supervisor/authority.py": {
-      "blob": "a568872d0f671f771b78ce3efda4aaa25b4d190c",
-      "sha256": "df7bd87f9659cb89ff0261207d2d88b0fbbaa15966d4e3c69e1030a8293f471c"
+      "blob": "cd14707f0fe5214ff0983706f0c1160044cb4ee8",
+      "sha256": "2d0d1d2bbd8ab98f345504e8f5ef5203e6e62dc114b691d244bc2a668d5f4fe1"
     },
     "src/zcode_supervisor/bench.py": {
       "blob": "a1ed3f22445708d966dcebf1535fb9237fd6ded6",
       "sha256": "2c1964cefd76e9d556c2894081316f0b59f28cbf7c586972090a354d7464a6f9"
     },
+    "src/zcode_supervisor/capability_registry.py": {
+      "blob": "a4a250d26eae9bf0decb0ec2cf9a6a34165e8404",
+      "sha256": "df3a5f15eaf75a92dd7ef8200f0e66b6bac787d87f95f0f3286b06f80505dc22"
+    },
     "src/zcode_supervisor/cli.py": {
-      "blob": "73d98033cd1b579a8260798e446884e94ccd4c9e",
-      "sha256": "26151c6248e9e2179c6bca75f00c94da63e81e6df9cc12f1b437184bf1499270"
+      "blob": "c66c1cc69a2a5994608a52ad291af1e51cf17da3",
+      "sha256": "eb008429f4296d8df3b2348f73081dc79283723094eefaddebc607e9468b41d5"
     },
     "src/zcode_supervisor/codex_appserver.py": {
       "blob": "4fcfe669338347af7dd243be76b0bcc99ebe6f1e",
@@ -35,17 +45,29 @@
       "blob": "c0ecda31ef8ad33ac061f490d7ae38e7bbbfa5b4",
       "sha256": "a7c2c8bcf99098e8c4a7cbe06b634d1b2a9edc136fbe48753def2c01c6040397"
     },
+    "src/zcode_supervisor/collaboration.py": {
+      "blob": "972df37d6e4757b0ab711f8c4d62ecd3dc5ab3b9",
+      "sha256": "48c60a6acc8121e26c74aa39cc1996ada3d041f152033e298de546bd0bb9483c"
+    },
     "src/zcode_supervisor/common.py": {
       "blob": "457a02627ba5e091531f99353209357b5c60eb06",
       "sha256": "06379f7cc49aef82c60d3732e9aa36b8d0b9e630f62c62ff2ff2deed04709cae"
     },
+    "src/zcode_supervisor/contract_compile.py": {
+      "blob": "1d252aee530ca128aecdc6246040f152070377dc",
+      "sha256": "0a22c200f69b64fe13bf47a82693e03222167d241e00e3b3ee805758d52e0b95"
+    },
     "src/zcode_supervisor/contracts.py": {
-      "blob": "f632a1802031e6f7a857154c1d6365209ce5a202",
-      "sha256": "72cc1160e81777500d19d3c9395855d24560ff9389e6353d8f52f0e8f885471f"
+      "blob": "c61fd1853e68443fcddaeef512e4460ad28e92a6",
+      "sha256": "6971502dabc781838dd16d824c4b29c04e580f8686efa95cf6fef970215d2a40"
     },
     "src/zcode_supervisor/deadline.py": {
       "blob": "af08b7b93f2b6b83cd8c4d75836e47bf80c314f7",
       "sha256": "d752ac2c86ce6ba7fe66b99c83eb1ee4ad841850fae2f98707e84660d335fb48"
+    },
+    "src/zcode_supervisor/dependency_checks.py": {
+      "blob": "166f99aefd2ce84765207498ca5f2bb01d1f3885",
+      "sha256": "2db0e11e9e53bdce50353a8eacffe81e2b0bdd20058e81589c908121ae2b3ee0"
     },
     "src/zcode_supervisor/digest.py": {
       "blob": "0d7f359764ecd3ff3cf0a9cee5f54208a4ec359c",
@@ -64,20 +86,32 @@
       "sha256": "fe34ce64e759c303abaa1899f49432873793085802df3b516905fd8104b053c2"
     },
     "src/zcode_supervisor/hub_server.py": {
-      "blob": "da9f1bb4e9f555310acc88a9075f3d1a4c34c043",
-      "sha256": "8cb9182847b93c41d490465da2f386c3645a8da004d839629edf10a131cdd404"
+      "blob": "f96805e70f899221175582cdac9dee4420d08b54",
+      "sha256": "dcc3476ced61c071d3a4046ed888bfaaf27db205b05597ccebd20150430e7a0c"
+    },
+    "src/zcode_supervisor/knowledge_delta.py": {
+      "blob": "1802da916673b7bde2be6a69434b04552acf1dd8",
+      "sha256": "6042f75b1a2c1e035686c9ed724bc27aea947c4c74db1d9d204eef58ab998272"
+    },
+    "src/zcode_supervisor/knowledge_store.py": {
+      "blob": "6418f75068fe8f9e9bcde9219cdff4f3ce2c5f1c",
+      "sha256": "abb3bfe84f288b3d99f7a9b19d2914effd76eeabbadb5064e9e259131140185d"
     },
     "src/zcode_supervisor/mcp_readonly.py": {
       "blob": "787a9a291f2e082c78c8f47b8a5b7bde31038a0d",
       "sha256": "6a47a099f4c51a4bb49de1b0ab32c6e2908d77a2f0833dfea309fd7f80789d14"
+    },
+    "src/zcode_supervisor/model_roster.py": {
+      "blob": "aa31d0d9e9679e6127074dfce3e2af893511d1e1",
+      "sha256": "bd3edc99e23c2655ed2b3ce4b7b0fc6587ad3e72fd5f46221301226ab1e78d20"
     },
     "src/zcode_supervisor/notify.py": {
       "blob": "255344734dc05a8a5bbc0df98dae90723f91473c",
       "sha256": "7f2ac2c261a9d1459dcfba2cf2585783291cf7caa0c2403e58a19806d4e1b5d6"
     },
     "src/zcode_supervisor/orchestration.py": {
-      "blob": "9f18808ca0e3454b1ccac9a6823935d9703ec2b1",
-      "sha256": "ff752c3a27ff3f577c51b94c7a89e1c945649b2b398fd465fe68798f5279c60d"
+      "blob": "3d1e818211eae96031585832b4f41cb66d2ef0e9",
+      "sha256": "163a103a389b4edfefed7b13cb5978c4b4928be185aa34fef9b184e13e403958"
     },
     "src/zcode_supervisor/patches/zcode-permission-allowlist.patch": {
       "blob": "8792f8ec94b1d2697bd981edd3529de3863fb33c",
@@ -87,6 +121,38 @@
       "blob": "a209c2341aa8114a57fc8fb5c1e20d3d4c6f49b0",
       "sha256": "101f9dd82fa313fd36c0ca2f3074142b89ab22c33bcb16161a97fb0a996ef9dd"
     },
+    "src/zcode_supervisor/practice_catalog.py": {
+      "blob": "d2d3319cb641ade1ba8e7eed18820a99426b1742",
+      "sha256": "14a05eef1d55a20530cde21b55e3819d8fc77dc33ddd70c12199d3563ff92e39"
+    },
+    "src/zcode_supervisor/practices/scientific-development-v1.json": {
+      "blob": "1fb1d005db231b0950b85c12170e402255594c3f",
+      "sha256": "f85b76111d21e29233eeb9820fbd4ec51e86d0e7a0c3f8454243e3d296e3fef0"
+    },
+    "src/zcode_supervisor/practices/themes/flow_transport.json": {
+      "blob": "13c0eb85ecfce1930f1550f52b542db12fa75aa7",
+      "sha256": "2a6b76ef70a138f388c0a164f64568dcc84540f266d860fb795e13216a48a7a8"
+    },
+    "src/zcode_supervisor/practices/themes/mechanics.json": {
+      "blob": "2819359cb310f3508a064c0191a36785964fa6a4",
+      "sha256": "da45a0d3ee72552ea1d6c7b62a525639ea7a49bd0bdafd0f604842595c2ec330"
+    },
+    "src/zcode_supervisor/practices/themes/reaction_geochemistry.json": {
+      "blob": "dc801e071136950330b61f47d5f6e7528df2b777",
+      "sha256": "6c429865586a2f2f8cf3bb8485b792654abdcc452aebe8ea8ce96b7acf28b24c"
+    },
+    "src/zcode_supervisor/practices/themes/seismic.json": {
+      "blob": "76176f7915c0485803e68493a804022d8d4cbd88",
+      "sha256": "4b1865d447574527bceb8d9c8ac78e5b586dcbd4ea6752e1a5909a6257470b23"
+    },
+    "src/zcode_supervisor/practices/themes/stratigraphy_geomorphology.json": {
+      "blob": "4aaf535b816becb76158291dd4880202a1054b4c",
+      "sha256": "cf0dd7e59136b0ffd638b00cbbb19935e42b96f757fe46d5bdf74ce258335b68"
+    },
+    "src/zcode_supervisor/practices/themes/thermal.json": {
+      "blob": "28624b8fd281ca229e7625877d53089c6a7d0c8e",
+      "sha256": "3d1ca42d9093b2f58fed829eb2b2d13dd8316028cd39e2392ad9a4fc55b9f60d"
+    },
     "src/zcode_supervisor/profile.py": {
       "blob": "24620c3d009487d11e914b462a274a3dd5ad0c3d",
       "sha256": "349baef41ec575b49cda4c75fb1fc5a7d9a81ed20abae7e19803563b0e3a28fe"
@@ -95,13 +161,77 @@
       "blob": "f43c3f7dc6b067c008524acef574f25d3cfbc3f5",
       "sha256": "62d163e010554c1b55888505791047e0f2c8744b9ee95b1f051307d578a30477"
     },
+    "src/zcode_supervisor/project_profiles.py": {
+      "blob": "e0315aae8818e074bd00196e0eca14ac25320280",
+      "sha256": "60386d6174937c1372d1a72736d3495ab536dcad16a0fdde223bbf4d2203ae1d"
+    },
     "src/zcode_supervisor/protocol.py": {
-      "blob": "fc9b13a3fd0fae0384a3122d5fcf5617619fa256",
-      "sha256": "5315a011aaed9ab45e534d50ccd3594e6f06b4ca509e96ed601d082a4d06a02e"
+      "blob": "5cbe14b5fd6f633d79d5f30e4a9939f9b94b5424",
+      "sha256": "ebff6789ceeacc87ae151a567f8b0c45745cb63847981ded9f1db175c7916fac"
+    },
+    "src/zcode_supervisor/recon_templates.py": {
+      "blob": "525466198ab272a5e274b5d24f12d431a6f334e4",
+      "sha256": "8f0de495ec50b90a041f181c40e04504f0944ba796299c4bf3041ecfab47cfb9"
     },
     "src/zcode_supervisor/runtime.py": {
       "blob": "a204ea97edbfbedd2029c6e549994d55e9dcf29a",
       "sha256": "10d1d8fd8ded4ee12f39d1de847cc5bcdf319c51e60de54a7a563ca11c21ae50"
+    },
+    "src/zcode_supervisor/schemas/artifact_ref.schema.json": {
+      "blob": "81a157faaa487ae301bccbfefdb0c639a31f9670",
+      "sha256": "510ef352209867c08cb4e58526cf32c45960b0b92742da03d144bca511e2fcd5"
+    },
+    "src/zcode_supervisor/schemas/source_manifest.schema.json": {
+      "blob": "4fc0560c167d387a2bceca5bf8c3304dd555a8b7",
+      "sha256": "56cf9dfdef5315df2346db0b8ff946a15c217261794a86b99d841522bf5d4b50"
+    },
+    "src/zcode_supervisor/schemas/work/acceptance-v1.json": {
+      "blob": "5c934510499b8208866497338cb6741e7d424081",
+      "sha256": "d7a93876a87bf7b6ebb743920a5a7586017040acfa7983e9d38045e2e39da0c7"
+    },
+    "src/zcode_supervisor/schemas/work/brief-envelope-v1.json": {
+      "blob": "e78d71e0754ea4fd367dcd2a0c852b3980b824fe",
+      "sha256": "7bf225c64d8699f772b76e820e513600db1149e95ed2c5b3acd23548d616675e"
+    },
+    "src/zcode_supervisor/schemas/work/capabilities-v1.json": {
+      "blob": "ce5d0945fed3e9e1dbc5091133af78c97ba72ebf",
+      "sha256": "89773aee13e56c5c0c8050436a2951af639a1bfdcfe92a686d2914ac9b15c902"
+    },
+    "src/zcode_supervisor/schemas/work/delivery-v1.json": {
+      "blob": "19968a80193b3138316010327b3417e0b119f6e8",
+      "sha256": "a3f85a31cc991e7201c3b73529dd6aa565d64749c5a692ce2419b841071e362c"
+    },
+    "src/zcode_supervisor/schemas/work/design-decision-v1.json": {
+      "blob": "8d237dc93d919d580f3812c53469865a8364dec8",
+      "sha256": "b7f7574ad7969d46dc32614f7ebfc2093723b59442cbfcec45ba911a9b6a60cf"
+    },
+    "src/zcode_supervisor/schemas/work/interface-contract-v1.json": {
+      "blob": "a71bacd7f889e8eb9ca49906d2643981b11f8cee",
+      "sha256": "b20eca119e5481f50be555c90f60730e0a1d24a9df8d82a6bb72c3ae2257f3e9"
+    },
+    "src/zcode_supervisor/schemas/work/knowledge-claim-v1.json": {
+      "blob": "99abc78140ecd115f31304dcc3ec70876254f861",
+      "sha256": "a705a8bece99fcc5dd0ef32cb4a86662ef2e8f936c48963865487df471ca5d36"
+    },
+    "src/zcode_supervisor/schemas/work/project-profile-ref-v1.json": {
+      "blob": "9a6d6913122abf52cb38fd2112501438760ffccf",
+      "sha256": "b5689b300c162febf8a53cdc19069594a1c7ad1c3ef88eeeed860151f4d9c584"
+    },
+    "src/zcode_supervisor/schemas/work/routing-policy-v1.json": {
+      "blob": "4298265a1fe136747ddf32f642abdcf0a48f9ef2",
+      "sha256": "10252c74c0b8348e67efa46871177307efc4973184d47f00d2ec4036de2d04b5"
+    },
+    "src/zcode_supervisor/schemas/work/work-authorization-v1.json": {
+      "blob": "8f7d314cad248b1889edc836fc0acb3e70f51950",
+      "sha256": "8c61a461e5069440890f0b1bc45c8825b5a7bfa07efc019ed97b857459519c1f"
+    },
+    "src/zcode_supervisor/schemas/work/work-event-v1.json": {
+      "blob": "e3214cbb7727d5c7809eb39cb92c10bbac1a22b6",
+      "sha256": "2f71af46014b8cedaf419a207b67febd4575366165e27d3a910c98f2cab7b100"
+    },
+    "src/zcode_supervisor/schemas/work/work-spec-v1.json": {
+      "blob": "956c1150f03e8e019aebd78b504b91af634bdb64",
+      "sha256": "7ae40e9c17f4a3ae624c805fadef1d65550688b1b0661c63e1505515f85b4b54"
     },
     "src/zcode_supervisor/session_reader.py": {
       "blob": "68d0ae3ee7a80bcc3cf9cfe5afc643d05b35f6f1",
@@ -110,6 +240,10 @@
     "src/zcode_supervisor/splitlines_stream.py": {
       "blob": "b527a90aa38e551c0eb56d93946da4c5e27c75e6",
       "sha256": "2ba69e64e4f4f0dbf499ef7a39acdefa48627ea62e906440535f455ba90eaa1f"
+    },
+    "src/zcode_supervisor/templates/recon/architecture.dwf.ts": {
+      "blob": "1b23b0a006e8f0ebd5f0bf2296b303f9b5c8b1d1",
+      "sha256": "076a8e75fa93395946b9feff51cdcd791d6f464c3a9f0cb89bef2db0d4567b7a"
     },
     "src/zcode_supervisor/transport.py": {
       "blob": "75ab08b2d481b8b34f33cafada1f76de72d06457",
@@ -136,22 +270,74 @@
       "sha256": "c0acb57f30f25f6864e71d4465fbfc72df93993b87eaae01d1d6752017aaef1b"
     },
     "src/zcode_supervisor/ui_server.py": {
-      "blob": "d16d33da51602cb57a5ae74326fedfe20aa6c2d6",
-      "sha256": "ebb3666013bcb9a84342a5d990018dd1e1a466d0bac55c2838f338c4e8c6de61"
+      "blob": "99fedcb95c7ffe41d542ccef0e542a6e0eff6543",
+      "sha256": "1e02b8fdf922fc304a7ce765a9c7cd03c1d2ab17af61af5d109baec85d4d7449"
+    },
+    "src/zcode_supervisor/ui_work.py": {
+      "blob": "5a14d907b9d0b760846effd3d7a7567d7db9c7f5",
+      "sha256": "8316b27de436fc7409be685a91d07d4f9423dc4b174bd735768a493881b75d55"
+    },
+    "src/zcode_supervisor/work_authorization.py": {
+      "blob": "29f01cd46e63c42a2c1aa5950544e2d15c4be395",
+      "sha256": "2da7da9f11ab63c44ddbe36a54aa76babd2d41db53475854b48ae797994cedac"
+    },
+    "src/zcode_supervisor/work_contracts.py": {
+      "blob": "e580262deafffb7db2587847dd8665075f5c03a4",
+      "sha256": "d30668bab9aca7a4737af9d06d982727ca4c6f88640afe32b59ea2db3bef4c81"
+    },
+    "src/zcode_supervisor/work_control.py": {
+      "blob": "5e0bc86c38e2ad0194b6c68f235854deb08df000",
+      "sha256": "fcf0916b9b44c24a3c127f3d87ada49c9ce339e4fc2a56eea1016a4b38880491"
+    },
+    "src/zcode_supervisor/work_dispatch.py": {
+      "blob": "35597f1805be1385b850deb0f0e42b8ced37a14c",
+      "sha256": "6cf1eacbe0af89e9a744abc3af6be15aac9668e968eec105a8bfe7de0768e378"
+    },
+    "src/zcode_supervisor/work_evaluation.py": {
+      "blob": "b6fc2eae73730eefcad64e17dbed0411e2e560c0",
+      "sha256": "0d048790a688f10eddf62c85ecb6f9cc16ee3bb2039cf03a1d684c46d35f79c5"
+    },
+    "src/zcode_supervisor/work_manifest.py": {
+      "blob": "dc47a81fcc80147c849fc8707c67e2ff49488582",
+      "sha256": "1d4c98303ba7b1c939c92dd6eb17cf8b7cf77ee34174e468d991c310b28285a2"
+    },
+    "src/zcode_supervisor/work_models.py": {
+      "blob": "e2978485ea6007588c5e6fba57d67727a0bed0eb",
+      "sha256": "52f9002b95fbf0f7a0b842d6c6c82a1b130e0f48461d27481132ed0815720845"
+    },
+    "src/zcode_supervisor/work_orientation.py": {
+      "blob": "8d2b21e993ab6522d1288e362ff4405f20566496",
+      "sha256": "8c8f2044f0527ffb84a608e014b729f26f514c2da5baac3ad99312adb3641f30"
+    },
+    "src/zcode_supervisor/work_policy.py": {
+      "blob": "17483cde35720b0bd589b3762218b2b16633e9e6",
+      "sha256": "dbc4cce89d6d2a09e42988d0fc503091d71e73d195ae0de7c2a11f205ddf62e1"
+    },
+    "src/zcode_supervisor/work_scheduler.py": {
+      "blob": "b0eab94c3da5473ea1b54d3710fa52055fe9aae0",
+      "sha256": "be283b41838ec0bd04761a6ec8bcd7bf0a5abe9dbf6d197144d122b77c351433"
+    },
+    "src/zcode_supervisor/work_store.py": {
+      "blob": "52992401247e7062875ff482ff898b27013909f2",
+      "sha256": "d0a7ab72f47e161b4c31aeedb727a3b151014a2d30a00f27c800f67be00a2389"
+    },
+    "src/zcode_supervisor/work_tools.py": {
+      "blob": "e7bc7af1ff05b0832efa0b53daceba1f351e3b47",
+      "sha256": "2a6910bf0852ca6b6ddfc29248ee48a5524e77666f202b01e73e9b96abc311fc"
     },
     "src/zcode_supervisor/worker_health.py": {
       "blob": "0694e5beb7f81859fcad2f99504f96c6ba028b64",
       "sha256": "6ceeca261cab71e206d6e8e182d3ea192001d1950957dc81c2a17fdafca1a8f3"
     },
+    "src/zcode_supervisor/worker_packets.py": {
+      "blob": "02cfd5ab6b18f43fcf1a5a04842e1aa8c26dbd87",
+      "sha256": "7e2be182a52f421e6d657654a0d91c9cb8a9ac0102b35624ca4cb7643f04513e"
+    },
     "src/zcode_supervisor/zcode_resident.py": {
       "blob": "1ace0649d029ffe940ceb6f8deb61a6002c0cc39",
       "sha256": "3d54d6d1cdefc1b6a1a0c674bfd0624f9f784888627842fb58057281977ce7d8"
-    },
-    "src/zcode_supervisor/model_roster.py": {
-      "blob": "aa31d0d9e9679e6127074dfce3e2af893511d1e1",
-      "sha256": "bd3edc99e23c2655ed2b3ce4b7b0fc6587ad3e72fd5f46221301226ab1e78d20"
     }
   },
-  "refreshed_at": "2026-11-04",
-  "refresh_reason": "v0.2.8 release: model roster (czs models CLI, hub list_models tool, bounded worker_models receipt advertisement; identity fields only, access fields never projected) + skills-first kickoff conventions + hub serve dependency fail-loud (anyio/mcp declared in [hub]) + builder single-source versioning + dev-only doc marks. Full offline suite green in the hub venv 2026-11-04 (1216 tests, 1 env-conditional skip, incl. test_distribution on a real git checkout); release build verified."
+  "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
+  "schema_version": 1
 }

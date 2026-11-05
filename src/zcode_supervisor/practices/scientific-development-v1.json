@@ -1,0 +1,322 @@
+{
+  "schema_version": "zsc.practice-catalog/v1",
+  "practices": [
+    {
+      "id": "existing-mechanism",
+      "revision": 1,
+      "status": "active",
+      "title": "先判断需求与已有机制，再引入新方法",
+      "task_kinds": ["new_method", "feature"],
+      "domains": [],
+      "requires_features": {},
+      "questions": [
+        "要引入的方程、本构、算法或后处理能力，现有代码是否已有等价实现？",
+        "已有实现的参数域、物理尺度与本次需求的实际缺口是什么？",
+        "是否存在满足条件的『不改』或『满足条件后再做』方案？"
+      ],
+      "first_actions": [
+        "审计现有实现的能力与适用域",
+        "对照需求列出参数域与物理尺度差异",
+        "用参考模型或最小诊断确认真实缺口"
+      ],
+      "evidence_required": [
+        "源码能力对照表",
+        "适用域说明",
+        "最小诊断或参考模型结果"
+      ],
+      "not_applicable": [
+        "已有机制确认缺失且无等价路径时，直接进入新方法设计",
+        "新颖性和引用量不能单独证明需求成立"
+      ],
+      "stop_conditions": [
+        "最小诊断证明缺口不存在时停止扩展调查并记录『不改』结论",
+        "证据相互冲突或影响面无法界定时升级为独立审查"
+      ],
+      "source_ids": ["case-derived:existing-mechanism"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "data-semantics",
+      "revision": 1,
+      "status": "active",
+      "title": "先核对语义，再调物理参数",
+      "task_kinds": ["debug", "feature", "verification"],
+      "domains": [],
+      "requires_features": {},
+      "questions": [
+        "输出退化为常数、端点、异常范围或跨模块失真时，单位、坐标、采样位置、时刻、排序、边界和缺测是否逐环一致？",
+        "能否构造最小反例区分数据问题与真实物理异常？"
+      ],
+      "first_actions": [
+        "检查输入输出范围与映射关系",
+        "核对单位与坐标约定",
+        "构造最小反例定位失真环节"
+      ],
+      "evidence_required": [
+        "输入输出范围记录",
+        "映射关系说明",
+        "最小反例"
+      ],
+      "not_applicable": [
+        "真实物理异常不应一律归因于数据错误",
+        "语义链路核对通过之前不调物理参数"
+      ],
+      "stop_conditions": [
+        "语义链路逐环确认一致后停止",
+        "发现跨模块约定冲突时升级到接口裁定"
+      ],
+      "source_ids": ["case-derived:data-semantics"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "effective-configuration",
+      "revision": 1,
+      "status": "active",
+      "title": "查实际生效配置，而非调用者意图",
+      "task_kinds": ["debug", "feature", "operations"],
+      "domains": [],
+      "requires_features": {},
+      "questions": [
+        "初始化、边界条件、求解器参数或配置看似无效时，最终生效值来自默认值、覆盖顺序还是动态更新？",
+        "调用链上每一环的前后状态是什么？"
+      ],
+      "first_actions": [
+        "追配置的默认值与覆盖顺序",
+        "检查动态更新与最终生效状态",
+        "记录前后状态对照"
+      ],
+      "evidence_required": [
+        "调用链记录",
+        "前后状态与有效参数对照"
+      ],
+      "not_applicable": [
+        "具体 API 陷阱属于项目绑定层，不在通用规则中展开"
+      ],
+      "stop_conditions": [
+        "定位到生效环节且能复现前后差异时停止"
+      ],
+      "source_ids": ["case-derived:effective-configuration"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "state-identity",
+      "revision": 1,
+      "status": "active",
+      "title": "明确状态的物理归属与身份",
+      "task_kinds": ["feature", "debug", "verification"],
+      "domains": [],
+      "requires_features": {"moving_state": true},
+      "questions": [
+        "移动网格、粒子、重网格化、材料搬运、历史追踪或重启中，状态属于节点、单元、粒子还是材料对象？",
+        "身份在迁移与重启中是否稳定且所有权明确？"
+      ],
+      "first_actions": [
+        "区分状态对象的类别与所有权",
+        "检查身份在迁移与重启中的稳定性",
+        "核对状态迁移路径"
+      ],
+      "evidence_required": [
+        "对象类别与所有权说明",
+        "身份稳定性证据",
+        "状态迁移记录"
+      ],
+      "not_applicable": [
+        "固定网格上的局部运算不应强加粒子追踪方案"
+      ],
+      "stop_conditions": [
+        "身份与所有权无歧义且迁移可复核时停止"
+      ],
+      "source_ids": ["case-derived:state-identity"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "coupling-accounting",
+      "revision": 1,
+      "status": "active",
+      "title": "时间推进与耦合须有一致的记账边界",
+      "task_kinds": ["feature", "debug", "verification"],
+      "domains": [],
+      "requires_features": {"coupled_processes": true},
+      "questions": [
+        "多过程耦合、子步、试算回退、累计量、反应或输出调度中，时间与龄期的定义是否一致？",
+        "接受步何时提交、收支项有哪些、恢复是否幂等、分裂误差如何控制？"
+      ],
+      "first_actions": [
+        "统一时间与龄期定义",
+        "明确接受步提交与收支项",
+        "检查幂等恢复路径与分裂误差"
+      ],
+      "evidence_required": [
+        "记账边界说明",
+        "收支项清单",
+        "幂等恢复验证"
+      ],
+      "not_applicable": [
+        "守恒对象与允许源汇由当前方程指定，不能跨方程搬用"
+      ],
+      "stop_conditions": [
+        "记账边界一致且守恒检查闭合时停止"
+      ],
+      "source_ids": ["case-derived:coupling-accounting"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "parallel-consistency",
+      "revision": 1,
+      "status": "active",
+      "title": "并行先确认依赖与同步语义",
+      "task_kinds": ["feature", "debug", "performance", "verification", "operations"],
+      "domains": [],
+      "requires_features": {"distributed": true},
+      "questions": [
+        "哪些量是 local、哪些是 global？通信参与者与空分区如何处理？",
+        "哪些判定真正需要全局一致（归约/广播），触发点在哪里？"
+      ],
+      "first_actions": [
+        "标注每个控制量的 local/global 归属",
+        "列出通信参与者与空分区行为",
+        "仅对需要全局一致的判定安排归约或广播"
+      ],
+      "evidence_required": [
+        "local/global 清单",
+        "通信模式说明",
+        "空分区与触发点验证"
+      ],
+      "not_applicable": [
+        "局部统计不应一律全局化",
+        "未证明依赖与同步语义前不做并行重写"
+      ],
+      "stop_conditions": [
+        "同步语义覆盖全部控制路径且负例验证通过时停止"
+      ],
+      "source_ids": ["case-derived:parallel-consistency"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "numerical-validation",
+      "revision": 1,
+      "status": "active",
+      "title": "区分代码正确、数值正确与物理有效",
+      "task_kinds": ["new_method", "feature", "debug", "verification"],
+      "domains": [],
+      "requires_features": {},
+      "questions": [
+        "本次改动属于代码正确、数值正确还是物理有效？风险对应哪种证据？",
+        "解析解、制造解、独立参考、守恒、时间与网格细化、敏感性中哪些是必需的？"
+      ],
+      "first_actions": [
+        "按风险选择验证层级",
+        "选定独立参考与细化策略",
+        "界定适用域"
+      ],
+      "evidence_required": [
+        "分层验证记录",
+        "细化与敏感性结果",
+        "适用域说明"
+      ],
+      "not_applicable": [
+        "有界性或单调性只在该模型要求时检验，非所有任务全套执行",
+        "数值通过不等于物理有效"
+      ],
+      "stop_conditions": [
+        "所选层级的证据闭合且适用域明确时停止"
+      ],
+      "source_ids": ["case-derived:numerical-validation"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "observation-independence",
+      "revision": 1,
+      "status": "active",
+      "title": "观测比较先检查等价性与独立性",
+      "task_kinds": ["calibration", "verification"],
+      "domains": [],
+      "requires_features": {"observations": true},
+      "questions": [
+        "标定、反演或对比的观测与模拟在空间、时间、尺度、定义上是否对齐？",
+        "测量量与派生量是否区分？校准与留出集关系如何？不确定度和可辨识性是否评估？"
+      ],
+      "first_actions": [
+        "对齐空间、时间、尺度与定义",
+        "区分测量与派生量",
+        "划分校准与留出集并评估不确定度"
+      ],
+      "evidence_required": [
+        "对齐说明",
+        "校准与留出划分",
+        "不确定度与可辨识性评估"
+      ],
+      "not_applicable": [
+        "不等价资料可作明确标注的参照，不能充当验证证据"
+      ],
+      "stop_conditions": [
+        "对齐与独立性核查完成时停止"
+      ],
+      "source_ids": ["case-derived:observation-independence"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "measured-performance",
+      "revision": 1,
+      "status": "active",
+      "title": "性能优化先定位成本并保持数学语义",
+      "task_kinds": ["performance", "operations"],
+      "domains": [],
+      "requires_features": {},
+      "questions": [
+        "慢、内存大或 I/O 增长的主成本在哪里（分阶段计时、RSS、I/O）？",
+        "规模趋势如何？是否有同输入独立对照？换语言或加核数前数学语义是否保持？"
+      ],
+      "first_actions": [
+        "分阶段计时与资源测量",
+        "拟合规模趋势",
+        "建立同输入独立对照"
+      ],
+      "evidence_required": [
+        "计时、RSS 与 I/O 记录",
+        "规模趋势",
+        "同输入对照结果"
+      ],
+      "not_applicable": [
+        "不能只凭换语言或增加核数判断收益",
+        "优化不得改变数学语义"
+      ],
+      "stop_conditions": [
+        "瓶颈定位且对照可复现时停止；语义等价存疑时先回退"
+      ],
+      "source_ids": ["case-derived:measured-performance"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    },
+    {
+      "id": "runtime-provenance",
+      "revision": 1,
+      "status": "active",
+      "title": "验收绑定实际代码、环境和场景",
+      "task_kinds": ["feature", "debug", "performance", "operations"],
+      "domains": [],
+      "requires_features": {},
+      "questions": [
+        "实际加载路径与构建身份是否与声称一致？依赖与输入是否完整？",
+        "退出证据、连续与重启及串并行比较是否覆盖本次场景？"
+      ],
+      "first_actions": [
+        "核对实际加载路径与构建身份",
+        "记录依赖与输入清单",
+        "按场景安排连续、重启与串并行比较"
+      ],
+      "evidence_required": [
+        "加载路径与构建身份证据",
+        "退出码与产物记录",
+        "重启与串并行比较"
+      ],
+      "not_applicable": [
+        "局部验证不能替代整链验证与生产资格"
+      ],
+      "stop_conditions": [
+        "来源链条可复核且场景覆盖明确时停止"
+      ],
+      "source_ids": ["case-derived:runtime-provenance"],
+      "validated_scope": "历史案例支持此检查步骤；新工程适用性待核查。active 仅表示允许作为调查候选，不构成科学结论。"
+    }
+  ]
+}

@@ -1,0 +1,41 @@
+{
+  "schema_version": "zsc.practice-catalog/v1",
+  "practices": [
+    {
+      "id": "flow-source-sink-ledger", "revision": 1, "status": "active",
+      "title": "先建立流量与源汇的统一记账",
+      "task_kinds": ["feature", "debug", "verification"], "domains": ["flow_transport"], "requires_features": {},
+      "questions": ["边界通量、内部源汇、储存变化和输出流量是否采用同一符号、单位与时间窗？", "局部流量平衡与全域平衡不一致时，缺的是哪一段记账？"],
+      "first_actions": ["按控制体列出边界、源汇、储存和输出的流量账"],
+      "evidence_required": ["控制体流量账、符号约定和不平衡定位"],
+      "not_applicable": ["流量图趋势合理不能替代守恒检查"],
+      "stop_conditions": ["不平衡闭合或差异被具名保留时停止"],
+      "source_ids": ["design-derived:flow_transport:source-sink-ledger"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "flow-pressure-transport-interface", "revision": 1, "status": "active",
+      "title": "把压力边界与输运接口放在同一合同里",
+      "task_kinds": ["feature", "new_method", "verification"], "domains": ["flow_transport"], "requires_features": {"coupled_processes": true},
+      "questions": ["压力、流量和浓度跨过模块时，压力基准、法向、单位、网格位置和版本是否一致？", "压力边界变化与输运响应之间是否存在未声明的相位或时间滞后？"],
+      "first_actions": ["核对压力边界、通量接口和组分输运的共同数据合同"],
+      "evidence_required": ["接口合同、边界基准和跨模块最小算例"],
+      "not_applicable": ["文件写入集合不重叠不代表压力与输运接口兼容"],
+      "stop_conditions": ["接口合同由独立checker闭合或冲突被裁定时停止"],
+      "source_ids": ["design-derived:flow_transport:pressure-transport-interface"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    },
+    {
+      "id": "flow-retention-history", "revision": 1, "status": "active",
+      "title": "追问滞留、吸附与迁移历史的归属",
+      "task_kinds": ["feature", "debug", "calibration"], "domains": ["flow_transport"], "requires_features": {"moving_state": true},
+      "questions": ["组分存量在网格迁移、相态转换和重启后仍保持正确的物质身份与历史吗？", "表观输运加快或减慢能否由储存、滞留或输出抽样而非参数变化解释？"],
+      "first_actions": ["追踪组分存量和迁移历史在状态转换前后的所有权"],
+      "evidence_required": ["组分存量对照、历史迁移链和诊断反例"],
+      "not_applicable": ["拟合输出曲线不能单独证明迁移历史正确"],
+      "stop_conditions": ["身份与存量链闭合或反例被稳定复现时停止"],
+      "source_ids": ["design-derived:flow_transport:retention-history"],
+      "validated_scope": "本计划静态审查后允许作为调查候选；不构成科学结论或跨项目数值依据。"
+    }
+  ]
+}
