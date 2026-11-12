@@ -1,0 +1,39 @@
+{
+  "name": "zcode-supervisor",
+  "version": "0.4.1",
+  "description": "Delegate bounded development tasks to a local worker agent (ZCode/Codex/dsh) via the czs supervisor bridge, with explicit contracts, approval brokerage and retained execution evidence.",
+  "author": {
+    "name": "HonghaoXiong",
+    "url": "https://github.com/HonghaoXiong/agent-supervisor"
+  },
+  "homepage": "https://github.com/HonghaoXiong/agent-supervisor",
+  "repository": "https://github.com/HonghaoXiong/agent-supervisor",
+  "license": "Apache-2.0",
+  "keywords": [
+    "delegation",
+    "supervisor",
+    "czs",
+    "codex",
+    "zcode",
+    "tri-agent"
+  ],
+  "skills": [
+    "./skills/zcode-supervisor"
+  ],
+  "extension": {
+    "engines": {
+      "zcode": "^1.4.0"
+    },
+    "main": "extension/native-control.mjs",
+    "activationEvents": [
+      "onAvailable"
+    ],
+    "grants": [
+      "sessions.write"
+    ],
+    "protocols": {
+      "sessions": 1,
+      "rows": 4
+    }
+  }
+}

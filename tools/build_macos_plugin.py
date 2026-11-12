@@ -20,6 +20,9 @@ TEMPLATE_FILES = {
     "plugin.json", ".codex-plugin/plugin.json", "scripts/czs.py",
     "skills/zcode-supervisor/SKILL.md", "skills/zcode-supervisor/agents/openai.yaml",
     "skills/zcode-supervisor/references/delegation.md",
+    ".zcode-plugin/plugin.json", "extension/native-control.mjs",
+    "extension/channel-manager.mjs", "scripts/native_session.py",
+    "scripts/native_channels.py",
 }
 
 
@@ -83,11 +86,13 @@ def build(repo: Path, output: Path) -> Path:
     template = repo / "plugins" / PLUGIN
     portable = json.loads((template / "plugin.json").read_text())
     legacy = json.loads((template / ".codex-plugin/plugin.json").read_text())
+    native = json.loads((template / ".zcode-plugin/plugin.json").read_text())
     version = package_version(repo)
-    if portable["name"] != PLUGIN or legacy["name"] != PLUGIN:
+    if any(manifest["name"] != PLUGIN for manifest in (portable, legacy, native)):
         raise ValueError("Plugin manifests disagree on the plugin name")
     drift = [(f"plugins/{PLUGIN}/plugin.json", portable.get("version")),
              (f"plugins/{PLUGIN}/.codex-plugin/plugin.json", legacy.get("version")),
+             (f"plugins/{PLUGIN}/.zcode-plugin/plugin.json", native.get("version")),
              ("pyproject.toml", pyproject_version(repo))]
     stale = [f"{location}: {found!r}" for location, found in drift if found != version]
     if stale:
@@ -119,7 +124,7 @@ def build(repo: Path, output: Path) -> Path:
         # USAGE entry-point section is rewritten for plugin users; the accepted
         # index (including the packet.model feature) is the content authority.
         for name in ("USAGE.md", "COMPATIBILITY.md", "WORK-ORIENTATION.md",
-                     "WORKFLOW.md", "CAPABILITY-MATRIX.md"):
+                     "WORKFLOW.md", "CAPABILITY-MATRIX.md", "NATIVE-CHANNELS.md"):
             data = subprocess.run(["git", "show", ":docs/" + name], cwd=repo,
                                   capture_output=True, check=True).stdout
             if name == "USAGE.md":
@@ -154,11 +159,18 @@ def build(repo: Path, output: Path) -> Path:
                                     "category": "Developer tools"}]}
         write(release, ".agents/plugins/marketplace.json",
               (json.dumps(marketplace, ensure_ascii=False, indent=2) + "\n").encode())
+        zcode_marketplace = {"$schema": "https://anthropic.com/claude-code/marketplace.schema.json",
+                             "name": PLUGIN,
+                             "owner": {"name": "HonghaoXiong"},
+                             "plugins": [{"name": PLUGIN, "source": "./plugins/" + PLUGIN,
+                                          "category": "developer-tools"}]}
+        write(release, ".claude-plugin/marketplace.json",
+              (json.dumps(zcode_marketplace, ensure_ascii=False, indent=2) + "\n").encode())
         manifest = {"schema_version": 1, "name": PLUGIN, "version": version,
                     "core_version": version,
                     "accepted_core": pins, "runtime_dependencies": ["Python>=3.11", "Node.js", "supported signed-in ZCode", "Codex plugin CLI"],
                     "model_requests_during_install": 0,
-                    "scope": "Baseline CLI delegation and discoverable skill; fixed-model packet field included (verified selection plus provider receipts); no live strict budget or Codex cost claims.",
+                    "scope": "Contract-bound delegation, native desktop delivery and independent fixed-session channels; normal tool approvals apply; no OS sandbox or strict provider-cost-cap claim.",
                     "files": {p.relative_to(release).as_posix(): hashlib.sha256(p.read_bytes()).hexdigest()
                               for p in sorted(release.rglob("*")) if p.is_file()}}
         write(release, "release-manifest.json", (json.dumps(manifest, ensure_ascii=False, indent=2) + "\n").encode())

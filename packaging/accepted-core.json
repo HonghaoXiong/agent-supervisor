@@ -1,9 +1,9 @@
 {
-  "acceptance": "0.4.0 release candidate: managed-reviewer session loop live-verified; native ZCode claim with CLI --resume delivery and Codex desktop queue+wake bridge; GUI adapter implemented, real typing unverified 2026-11-12",
+  "acceptance": "0.4.1: native desktop extension delivery and independent fixed-session channels; macOS ZCode 0.17.1 / extension API 1.4.0 live-verified; normal tool approvals retained",
   "files": {
     "src/zcode_supervisor/__init__.py": {
-      "blob": "dff14cb46ee034fe68cd15c31abf890ce2ee6417",
-      "sha256": "b590f3610353bbe602ecae6332da869a670a67b44e960dddfbe298856de7acc7"
+      "blob": "dfae72543f5ff1fbdebab9802b362a7277c3dce9",
+      "sha256": "8032dfc270cf328dcd6e9c1be65d5bcf60ea8ee163ed88c65fb0dad686bac1d8"
     },
     "src/zcode_supervisor/__main__.py": {
       "blob": "eb53e2f31b2f703ad32ef64b8a41faa3e7d18e08",
@@ -30,8 +30,8 @@
       "sha256": "df3a5f15eaf75a92dd7ef8200f0e66b6bac787d87f95f0f3286b06f80505dc22"
     },
     "src/zcode_supervisor/cli.py": {
-      "blob": "7b85cafeb5d5cccf03cbd01089bd742d5d18a409",
-      "sha256": "1928749c5fe7a6447f505655e3aa6a84c0034d0305883ec2a991874eb1a0459d"
+      "blob": "0b17a44244dfb09a5cfa8b2aa4f9927ab0f20d98",
+      "sha256": "4634e7f5841fbcdee668ac19eb474369df32a07a0b15a51b0441aca670bdc6a6"
     },
     "src/zcode_supervisor/codex_appserver.py": {
       "blob": "5753af99104afb9ebaa1bb612469fa08ef66e370",
@@ -69,6 +69,10 @@
       "blob": "166f99aefd2ce84765207498ca5f2bb01d1f3885",
       "sha256": "2db0e11e9e53bdce50353a8eacffe81e2b0bdd20058e81589c908121ae2b3ee0"
     },
+    "src/zcode_supervisor/desktop_bridge.py": {
+      "blob": "c47a3dc75ce332ae4ec424a96fe4668a343d5517",
+      "sha256": "755ebe180c96c240b7407a4c89bdd6d2737a1dc1356d1f1e2e3c47e912cacde7"
+    },
     "src/zcode_supervisor/digest.py": {
       "blob": "0d7f359764ecd3ff3cf0a9cee5f54208a4ec359c",
       "sha256": "c362c7e14634e31d69e24d1097bf8b5b99b41abf5c12db71ca5dc55a1ca03fce"
@@ -104,6 +108,10 @@
     "src/zcode_supervisor/model_roster.py": {
       "blob": "aa31d0d9e9679e6127074dfce3e2af893511d1e1",
       "sha256": "bd3edc99e23c2655ed2b3ce4b7b0fc6587ad3e72fd5f46221301226ab1e78d20"
+    },
+    "src/zcode_supervisor/native_channels.py": {
+      "blob": "8ff83fc6fb31200531520e10c033b18787700faf",
+      "sha256": "dace5a4e47a8faa0710922d3bf388b149abad1796c0a606ed5e8a034448a5ada"
     },
     "src/zcode_supervisor/notify.py": {
       "blob": "255344734dc05a8a5bbc0df98dae90723f91473c",
@@ -233,6 +241,14 @@
       "blob": "956c1150f03e8e019aebd78b504b91af634bdb64",
       "sha256": "7ae40e9c17f4a3ae624c805fadef1d65550688b1b0661c63e1505515f85b4b54"
     },
+    "src/zcode_supervisor/session_binding.py": {
+      "blob": "3a702438a0eb48361075afe5a77d020b378f3d45",
+      "sha256": "fc87be0b513f738464b36cb3e0575ffc9a21ac4e96e3a49a3547f9a33e45a9a7"
+    },
+    "src/zcode_supervisor/session_loop.py": {
+      "blob": "434924f4fbbab483de6329c457c9159211e983f0",
+      "sha256": "3261a287477f68e4cc43c457620bdfad0a7288d3260d961072e50a436cba49bb"
+    },
     "src/zcode_supervisor/session_reader.py": {
       "blob": "68d0ae3ee7a80bcc3cf9cfe5afc643d05b35f6f1",
       "sha256": "a7242dc705939030cfa5d503ba89d5a3db50412b6da619f276ea2242a85b7fa9"
@@ -313,6 +329,10 @@
       "blob": "17483cde35720b0bd589b3762218b2b16633e9e6",
       "sha256": "dbc4cce89d6d2a09e42988d0fc503091d71e73d195ae0de7c2a11f205ddf62e1"
     },
+    "src/zcode_supervisor/work_runtime.py": {
+      "blob": "0b43df53728c5293e25bb7263c23918ab65b725e",
+      "sha256": "b5573b069a9201173bed3c36cfb43b58cbead4220b2c614eeecc89faadce7aff"
+    },
     "src/zcode_supervisor/work_scheduler.py": {
       "blob": "b0eab94c3da5473ea1b54d3710fa52055fe9aae0",
       "sha256": "be283b41838ec0bd04761a6ec8bcd7bf0a5abe9dbf6d197144d122b77c351433"
@@ -333,37 +353,25 @@
       "blob": "02cfd5ab6b18f43fcf1a5a04842e1aa8c26dbd87",
       "sha256": "7e2be182a52f421e6d657654a0d91c9cb8a9ac0102b35624ca4cb7643f04513e"
     },
-    "src/zcode_supervisor/zcode_resident.py": {
-      "blob": "1ace0649d029ffe940ceb6f8deb61a6002c0cc39",
-      "sha256": "3d54d6d1cdefc1b6a1a0c674bfd0624f9f784888627842fb58057281977ce7d8"
-    },
-    "src/zcode_supervisor/session_binding.py": {
-      "blob": "3a702438a0eb48361075afe5a77d020b378f3d45",
-      "sha256": "fc87be0b513f738464b36cb3e0575ffc9a21ac4e96e3a49a3547f9a33e45a9a7"
-    },
-    "src/zcode_supervisor/session_loop.py": {
-      "blob": "434924f4fbbab483de6329c457c9159211e983f0",
-      "sha256": "3261a287477f68e4cc43c457620bdfad0a7288d3260d961072e50a436cba49bb"
-    },
-    "src/zcode_supervisor/work_runtime.py": {
-      "blob": "0b43df53728c5293e25bb7263c23918ab65b725e",
-      "sha256": "b5573b069a9201173bed3c36cfb43b58cbead4220b2c614eeecc89faadce7aff"
-    },
-    "src/zcode_supervisor/desktop_bridge.py": {
-      "blob": "c47a3dc75ce332ae4ec424a96fe4668a343d5517",
-      "sha256": "755ebe180c96c240b7407a4c89bdd6d2737a1dc1356d1f1e2e3c47e912cacde7"
-    },
     "src/zcode_supervisor/zcode_cli_bridge.py": {
       "blob": "4eb085c936b6d481a67e1eaf378941fa75589413",
       "sha256": "4fd2c81b5b622f4e179cc3ca1b602bd550b0d5b199b4ac536b93efa0ee210637"
     },
+    "src/zcode_supervisor/zcode_desktop_session_bridge.py": {
+      "blob": "e701e4b7c85ac9b1162f587066fd1f6dfe1cec34",
+      "sha256": "c56a8ba8f9afb9f0eacf49c79173a58a85b72f05f4a3857e6ed418c93ea022aa"
+    },
     "src/zcode_supervisor/zcode_gui_bridge.py": {
       "blob": "9ac1540e52fd1e22d76ade28b752efe274aa3c82",
       "sha256": "27eb425b34635029a5e89e41316abb6647788194deeeec03c37bba7c7599a41c"
+    },
+    "src/zcode_supervisor/zcode_resident.py": {
+      "blob": "1ace0649d029ffe940ceb6f8deb61a6002c0cc39",
+      "sha256": "3d54d6d1cdefc1b6a1a0c674bfd0624f9f784888627842fb58057281977ce7d8"
     }
   },
   "optional_model_feature": "included since 2026-10-24 acceptance; live-validated on the 97490d0f pin (run-5 fresh and run-7 resume, model max/low options verified before dispatch and after completion)",
   "schema_version": 1,
   "refreshed_at": "2026-11-12",
-  "refresh_reason": "0.3.1 version bump (audit-fix patch release); only __version__ changed in this pinned file"
+  "refresh_reason": "0.4.1 native desktop bridge and multichannel release; reviewed core additions, CLI route selection and synchronized package version"
 }

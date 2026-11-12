@@ -1,6 +1,6 @@
 ---
 name: zcode-supervisor
-description: Delegate a bounded coding or investigation task from Codex to a local ZCode worker, resume a registered worker, or inspect its delivery evidence. Use when the user asks to use ZCode, zcode-supervisor, czs, or Codex–ZCode collaboration. Does not control an active ZCode GUI conversation or provide an OS sandbox.
+description: Use when the user asks for ZCode delegation, zcode-supervisor/czs, fixed desktop sessions, independent Codex–ZCode channels, same-session rework, or delivery evidence.
 ---
 
 Use the bundled supervisor; Codex owns the task contract and independent acceptance.
@@ -185,4 +185,101 @@ or material context pressure, use the host's supported context maintenance or a
 new coordinator with explicit handoff. Do not interrupt a busy user GUI, silently
 recreate workers, replay completed runs or assume permissions/skills survived.
 
-- Session loop (fixed-session auto round-trip): live-verified for the managed-reviewer background mode (`czs work bind-session` family). The owner pump advances terminal turns on its own; control bindings need a proven hub task record; the owner dispatches its own verification and records acceptance. `claim_native_session` handles a user-created session: it requires the paired Codex reviewer thread, keeps the session directory and the authorised code root separate, derives the cursor from the anchored turn and grants observe+review; the rework goes back through `ZCodeCliBridge` (`zcode --resume <same sess>`), with the persisted user message + turn as the receipt. Native GUI takeover is still unverified end-to-end; a running GUI session answers `session-busy` and nothing writes its database. A `ZCodeGuiBridge` adapter (System Events typing, fail-closed on drafts/ambiguous or title-colliding windows/busy sessions, verifiable session identity via `ZSC_GUI_SESSION_ID_ATTRIBUTE`, persisted intent plus message-marker/turn receipt) is implemented as the fallback when the CLI cannot resume, but this host denies macOS Accessibility to osascript (`-25211`) and exposes no configured identity attribute, so the GUI leg stays unsupported until the user grants both. Codex desktop chat delivery is live-verified on this host through the app's own queue+wake channel (`DesktopBridge`, `thread/queue/add` + `codex://threads/wake/<thread>`, receipt from the new turn), with `CZS_DESKTOP_WAKE_CMD` as the fallback.
+- Session loop (fixed-session auto round-trip): live-verified for the managed-reviewer background mode (`czs work bind-session` family). The owner pump advances terminal turns on its own; control bindings need a proven hub task record; the owner dispatches its own verification and records acceptance. `claim_native_session` handles a user-created session: it requires the paired Codex reviewer thread, keeps the session directory and the authorised code root separate, derives the cursor from the anchored turn and grants observe+review; the rework goes back through `ZCodeCliBridge` (`zcode --resume <same sess>`), with the persisted user message + turn as the receipt. The legacy `ZCodeGuiBridge` / System Events typing fallback is still unverified end-to-end; a running GUI session answers `session-busy` and nothing writes its database. A `ZCodeGuiBridge` adapter (System Events typing, fail-closed on drafts/ambiguous or title-colliding windows/busy sessions, verifiable session identity via `ZSC_GUI_SESSION_ID_ATTRIBUTE`, persisted intent plus message-marker/turn receipt) is implemented as the fallback when the CLI cannot resume, but this host denies macOS Accessibility to osascript (`-25211`) and exposes no configured identity attribute, so the GUI leg stays unsupported until the user grants both. Codex desktop chat delivery is live-verified on this host through the app's own queue+wake channel (`DesktopBridge`, `thread/queue/add` + `codex://threads/wake/<thread>`, receipt from the new turn), with `CZS_DESKTOP_WAKE_CMD` as the fallback.
+
+
+## Native desktop bridge (0.4.1)
+
+Version 0.4.1 includes a native extension transport for a user-selected,
+existing desktop ZCode session. It calls the official
+`ctx.sessions.sendToSession` API through the GUI host, preserving its normal
+permission client and visible conversation. It does not type into the GUI,
+resolve approvals automatically, switch permission modes, or write the chat DB.
+This transport is included in the 0.4.1 plugin payload.
+
+First-time setup uses the extension API 1.4.0 manifest, a normal Reload
+Extensions command, and explicit native `sessions.write` consent. The private
+control file is `~/.czs/native-gui/bridge.json`; it pins one session and its
+workspace. Never print its token. A new target needs explicit user authorization
+and binding reconciliation; do not silently repoint a busy session.
+
+For setup and complete commands, read [native channels](../../docs/NATIVE-CHANNELS.md).
+
+For a reviewed native turn, compile and hash the usual authorization/contract,
+then invoke the bundled launcher with `scripts/native_session.py` and:
+
+```
+--session-id <fixed sess_...> --delivery-id <unique id>
+--contract <contract.json> --authorization <authorization.json>
+--out <fresh receipt.json>
+```
+
+Keep Codex running for the task: read the final receipt, independently inspect
+actual files and tool results, then send the next bounded instruction to the
+same session. GUI tool approvals still follow that session's existing policy.
+Use an appropriate task budget; the 180-second live-test contracts are probes,
+not budgets for normal coding work. A timeout or unknown admission is not
+permission to replay a delivery. Preserve its intent and reconcile it first.
+
+The work owner selects this transport explicitly with
+`session_loop.native_transport = "desktop-extension"`; absent retains CLI.
+Native delivery cannot enforce a mandatory exact-command broker contract, so
+`require_command` remains refused; use the reviewed RPC runner for that case.
+A valid receipt proves delivery and a completed turn, not code acceptance.
+
+
+## Independent native channels (0.4.1)
+
+Each named channel binds one Codex chat to one ZCode session, its own Unix
+socket, token, durable delivery ledger and receipt directory. The default
+`bridge.json` remains the legacy route. Named routes never fall back to it.
+Choose one maintainer chat to edit or install plugin code; task chats
+register and use their own channels. Owner IDs are routing checks, not an OS
+security boundary.
+
+Use the bundled Python launcher:
+
+```sh
+bash "<plugin-root>/scripts/python.sh" "<plugin-root>/scripts/native_channels.py" \
+  register --channel <name> --session-id <sess_...> --workspace <absolute workspace>
+bash "<plugin-root>/scripts/python.sh" "<plugin-root>/scripts/native_channels.py" list
+```
+
+Registration defaults the owner to the current `CODEX_THREAD_ID`. For a channel
+explicitly authorized for another chat, use `--owner-thread-id <chat id>`.
+Names accept lowercase letters, digits, `_` and `-`, up to 48 characters;
+`legacy` is reserved. Existing bindings are immutable. Duplicate session,
+socket or overlapping state/receipt roots are rejected. The workspace must
+match the session's persisted directory. Registration does not send a turn.
+
+The private registry is `~/.czs/native-gui/channels.json`; per-channel config,
+ledger and receipts live under `~/.czs/native-gui/channels/<name>/`. Never print
+or copy channel tokens into reports. The extension discovers additions within
+about one second after its initial upgrade reload. A bad new config does not
+close good channels. Running bindings are retained if someone edits/removes
+registry entries; inspect `channels-ready.json` for errors and reconcile with
+the maintainer rather than silently switching a running channel.
+
+For delivery, use `scripts/native_session.py` with the usual reviewed contract
+and authorization, adding `--channel <name>`. Keep `--session-id` explicit.
+The current chat must match the bound owner. The completed receipt is published
+atomically at that channel's `receipts/<delivery-id>.json`; `--out` is optional
+and, if supplied, must stay inside its receipt directory. Reusing a delivery ID
+with its original contract recovers evidence without sending again. A different
+contract with the same ID is refused. Different channels may use the same ID.
+A missing or mismatched channel is an error, never permission to use legacy.
+
+The work owner selects a named route with `session_loop.native_channel` and may
+set `native_channels_root`; `native_transport` must be `desktop-extension`.
+Set `native_owner_thread` when the owner service does not inherit the intended
+Codex chat's environment. Each reviewer/callback binding must still name its
+own Codex chat; channel registration does not create or retarget a callback
+pump. Tool approvals retain the ZCode session's policy. Separate channels may
+share a workspace, so tasks must still coordinate edits to shared files.
+
+
+The native desktop owner must recognize and load a target session. Open a new
+native target in ZCode and obtain a completed anchor before first delivery.
+A session created only by a separate CLI runtime may be outside the app's
+trusted scope; `proto.sessionNotFound` or `forbidden` is a failed admission,
+not permission to repoint a channel or bypass application scope checks.

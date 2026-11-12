@@ -505,7 +505,18 @@ def main(argv=None):
                                       file=sys.stderr, flush=True)
 
                         native_bridge = None
-                        if session_cfg.get('native_bridge', True):
+                        native_transport = session_cfg.get('native_transport', 'cli')
+                        if native_transport not in ('cli', 'desktop-extension'):
+                            raise SystemExit('work serve: unknown native_transport')
+                        if session_cfg.get('native_bridge', True) and native_transport == 'desktop-extension':
+                            from .zcode_desktop_session_bridge import ZCodeDesktopSessionBridge
+                            native_bridge = ZCodeDesktopSessionBridge(
+                                control_config=session_cfg.get('native_control_config'),
+                                channel_id=session_cfg.get('native_channel'),
+                                channels_root=session_cfg.get('native_channels_root'),
+                                owner_thread_id=session_cfg.get('native_owner_thread'),
+                                timeout_s=int(session_cfg.get('zcode_timeout_s', 900)))
+                        if session_cfg.get('native_bridge', True) and native_transport == 'cli':
                             from .zcode_cli_bridge import (ZCodeCliBridge,
                                                            cli_capability)
                             native_cap = cli_capability(

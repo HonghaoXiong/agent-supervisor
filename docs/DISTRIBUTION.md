@@ -48,3 +48,15 @@ provider token/cost cap，严格预算请求在派发前 fail-closed；实际货
 包含 portable root manifest 和 Codex compatibility manifest；桌面运行声明参考
 [desktop-only plugins](https://developers.openai.com/plugins/deploy/desktop-only)。
 安装/发现测试使用隔离 Codex home，不改开发者现有插件、认证或账户。
+
+
+## 0.4.1 原生扩展载荷
+
+发行包同时包含 Codex 的 `.agents/plugins/marketplace.json` 与 ZCode 本地市场的
+`.claude-plugin/marketplace.json`，两者指向同一完整插件载荷。ZCode manifest、
+原生 extension 和注册/投递脚本纳入显式模板白名单，新增核心模块继续通过 Git blob pin 核验。
+`NATIVE-CHANNELS.md` 随包提供首次授权、桌面加载、具名绑定与旧通道兼容说明。
+
+`Install.command` 继续只管理 Codex 安装事务，不自动授予 ZCode 权限或改动已有通道。
+ZCode 安装步骤与验证边界见 [原生多通道](NATIVE-CHANNELS.md)。不要直接使用未构建的
+源码插件模板；其 `lib/` 仅在构建发行包时填充。

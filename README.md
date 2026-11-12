@@ -6,7 +6,8 @@ Python 包名为 `codex-zcode-supervisor`（仓库名 agent-supervisor），命�
 
 当前能力包括：
 
-- 独立 worker 会话及同会话续接，不接管正在使用的 GUI 聊天。
+- 独立 worker 会话及同会话续接；0.4.1 支持经用户绑定且空闲的桌面会话原生投递。
+- 具名多通道分别绑定 Codex chat、ZCode session、socket、账本和收据目录，可并发工作且保留现有默认通道。
 - 显式文件范围、冻结输入哈希、精确 Bash 命令与次数/时间预算。
 - 审批与实际工具调用绑定，核验前台命令退出码、超时和文件变化。
 - 保存成功与失败证据；提交服务器作业和回收结果可以拆成两个短任务。
@@ -25,6 +26,7 @@ Python 包名为 `codex-zcode-supervisor`（仓库名 agent-supervisor），命�
 `Check.command` 生成无模型环境诊断；`Validate.command` 验证本机技能发现并生成可回传报告。
 插件内含已审核心与自动发现技能，无需克隆本仓或单独 pip 安装。
 构建与目标机器前提见[插件发行说明](docs/DISTRIBUTION.md)；安装不会发送模型任务。
+0.4.1 的桌面原生扩展还需在 ZCode 安装并正常授权，见[原生多通道](docs/NATIVE-CHANNELS.md)与[版本说明](docs/RELEASE-0.4.1.md)。
 
 需要 Python 3.11+、Node.js、已安装且能正常登录使用的 ZCode。本仓库为公开仓库，直接克隆即可；推送权限使用自己的 GitHub 登录或 SSH 配置，不要把 token 放进 URL。
 
