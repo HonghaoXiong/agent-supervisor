@@ -49,9 +49,16 @@ class WorkService:
         self.client = client
 
     @classmethod
-    def for_state_root(cls, state_root):
+    def for_state_root(cls, state_root, *, host=False, token=None):
+        """A client for one owner socket.
+
+        ``host=True`` is only for the user's own CLI: it lets the client load
+        the host control token. The work MCP service keeps the default, so a
+        model connection cannot inherit the host role from the socket path.
+        """
         from .work_control import ControlClient
-        return cls(ControlClient(Path(state_root) / "control.sock"))
+        return cls(ControlClient(Path(state_root) / "control.sock",
+                                 host=host, token=token))
 
     def invoke(self, action: str, request: dict) -> dict:
         if not isinstance(request, dict):
@@ -67,6 +74,12 @@ class WorkService:
             "status": "work_status", "artifact": "read_artifact",
             "knowledge-search": "search_knowledge", "knowledge-revalidate": "revalidate_knowledge",
             "knowledge-propose": "propose_knowledge", "knowledge-review": "review_knowledge",
+            "bind-session": "bind_session",
+            "claim-session": "claim_native_session",
+            "session-status": "session_status",
+            "pause-session": "pause_session", "resume-session": "resume_session",
+            "unbind-session": "unbind_session", "advance-session": "advance_session_loop",
+            "submit-decision": "submit_review_decision", "adopt": "adopt_existing_work",
         }.get(action)
         if method is None:
             from .work_models import WorkError
@@ -84,4 +97,9 @@ MCP_ACTIONS = {
     "read_artifact": "artifact", "search_knowledge": "knowledge-search",
     "revalidate_knowledge": "knowledge-revalidate", "propose_knowledge": "knowledge-propose",
     "review_knowledge": "knowledge-review",
+    "bind_session": "bind-session",
+    "claim_native_session": "claim-session", "session_status": "session-status",
+    "pause_session": "pause-session", "resume_session": "resume-session",
+    "unbind_session": "unbind-session", "advance_session": "advance-session",
+    "submit_session_decision": "submit-decision", "adopt_work": "adopt",
 }

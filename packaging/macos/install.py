@@ -64,12 +64,24 @@ def verify_release(root: Path) -> dict:
         raise ValueError("Invalid release manifest")
     actual = set()
     for path in root.rglob("*"):
+        relative = path.relative_to(root)
         if path.is_symlink():
-            raise ValueError(f"Linked release component: {path.relative_to(root)}")
-        if path.name == ".DS_Store" and not stat.S_ISREG(path.lstat().st_mode):
+            raise ValueError(f"Linked release component: {relative}")
+        info = path.lstat()
+        if not (stat.S_ISREG(info.st_mode) or stat.S_ISDIR(info.st_mode)):
+            raise ValueError(f"Release component is not a regular file: {relative}")
+        # R6-B: only an ordinary file at the exact
+        # ``__pycache__/<name>.pyc|.pyo`` shape is a runtime cache. Real
+        # source inside ``__pycache__`` (or a bytecode file elsewhere) is a
+        # release member and must be in the manifest.
+        if (stat.S_ISREG(info.st_mode)
+                and relative.parent.name == "__pycache__"
+                and path.suffix in (".pyc", ".pyo")):
+            continue
+        if path.name == ".DS_Store" and not stat.S_ISREG(info.st_mode):
             raise ValueError("Finder metadata must be a regular file")
         if path.is_file() and path != manifest_path and path.name != ".DS_Store":
-            actual.add(path.relative_to(root).as_posix())
+            actual.add(relative.as_posix())
     if actual != set(manifest["files"]):
         raise ValueError("Release has unexpected or missing files")
     for name, expected in manifest["files"].items():

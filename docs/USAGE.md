@@ -201,3 +201,100 @@ hub 是决策层 agent 经 MCP stdio 驱动的统一派发点（`python -m zcode
 3. **独立验收**：Codex 同时核对调度器和工作程序证据。队列消失、文件缺失或调度器记录过期应记为 pending/unknown，不得推断成功。测试退出 0 仍需满足任务的内容判据。
 
 调度器状态可能有保留期限，生产执行器应持久化必要完成证据。所批准的资源、远程写入根目录、命令预算和失败处置都属于任务合同，不能靠自由文本报告替代。这种分阶段模式不需要让一个模型调用等候数小时，也不自动创建后台监控。
+
+
+## Session loop: fixed-session auto round-trip (0.4.0-dev, offline-tested)
+
+Bind an EXISTING native ZCode session once; after each completed turn the
+owner builds a review packet, drives the managed Codex reviewer (ONE pinned
+review thread, resumed every round), parses the structured decision and
+dispatches the next instruction back into the SAME session (`attach_to`).
+
+The running owner watches bound sessions itself. When `work serve` has both a
+`session_loop` factory and a hub state dir, a pump polls each active binding's
+latest turn, advances it once per turn, and records the dispatched attempt.
+No external `advance-session` call is required; the verb stays as a manual
+repair entry and derives its source from the recorded handoff or round.
+
+A `control` binding needs proof: a hub task record whose
+`session_locator.session_id` is this session. Without it the bind fails with
+`control-unproven` and only observe-only binding is available. Dispatched
+instructions must target that same session; after a dispatch the pump compares
+the worker's real `session_locator` with the binding and marks the round
+`needs_reconciliation` on a mismatch (never attaches to a different session).
+
+`desktop-bound` uses the app's queue+wake channel when available (`DesktopBridge`: `thread/queue/add` with a unique `clientUserMessageId`, then `codex://threads/wake/<thread>`; the receipt is the thread's new turn and final agent message, not the opener's exit code). Without that channel the round is resolved before any model call: without a host-validated
+`CZS_DESKTOP_WAKE_CMD` the round fails with `desktop-wakeup-unsupported` and
+nothing is sent to the background reviewer. Every result names the reviewer
+that actually ran (`requested_mode`, `kind`, `thread_id`, `turn_id`).
+The reviewer thread is a PAIRED field (`evidence.reviewer.thread_id`, a
+`01...` Codex thread with `host=local`); the binding's `sess_...` id is never
+passed to the Codex bridge, and a binding without the pair is refused with
+`reviewer-thread-missing`.
+
+A user-created session (no hub task record) is claimed read-only with
+`claim_native_session`: it verifies the session id, idle state, the session's
+own directory and a separately authorised `code_root`, derives the cursor from
+the anchored turn (`native-cursor-unresolved` instead of silently handing the
+whole history to the reviewer), and grants `observe+review`. Its rework is
+delivered through `ZCodeCliBridge`, which runs the shipped CLI with
+`--resume <same sess>`; the delivery counts only after the persisted user
+message carrying the unique delivery id (and the turn it started) is read back
+— the CLI's exit code is not a receipt. A running GUI session answers
+`session-busy`; the adapter never writes the chat database and never claims the
+host's exclusive lock.
+
+```
+czs work serve --state-root .zsc/work-owner --runner-config runner.json
+czs work bind-session   --request bind.json    # session_id, db_path, control,
+                                               # workspace_policy=bound_existing
+czs work claim-session  --request claim.json   # native claim: reviewer_thread,
+                                               # code_root, workspace; observe+review
+czs work advance-session --request advance.json# after a delivery lands
+czs work session-status --request status.json
+czs work pause-session / resume-session / unbind-session --request ...
+czs work submit-decision --request decision.json  # reviewer token suffices
+czs work adopt          --request adopt.json      # import an existing delivery
+```
+
+`runner.json` carries `hub_config`, `profile`, and a `session_loop` section
+(`codex_path`, `review_workspace`, `review_model`, `authorization`,
+`stage_bindings`, `control_token`, `review_token`, optional `max_rounds` /
+`max_no_progress`, and the native channel switch `native_bridge` with
+`zcode_cli_path` / `zcode_node` / `zcode_timeout_s` / `zcode_mode`). The
+control token gates every loop verb
+(`CZS_WORK_CONTROL_TOKEN` / `--control-token`); the reviewer token reaches
+`submit-decision` ONLY. Request-body `actor` fields are ignored.
+
+Limits, honestly: pause wins over queued dispatches; resume replays nothing;
+at most 20 dispatched rounds (configurable) and 3 no-progress rounds; a
+candidate drift or a user message after the review expires the decision.
+A turn counts as delivered only when its assistant message carries a
+completion time and a terminal `finish`; a turn-scoped running tool keeps it
+`waiting_tool`. The full turn text is byte-paged (32 KiB, a single long
+message continues at `text_offset`) and archived as an artifact the packet
+references. The candidate digest is built from git changes (tracked and
+untracked) or an explicit manifest; a scan that exhausts its file or byte
+budget reports `coverage=incomplete` and refuses to judge drift. Every
+dispatch must carry `authorization_sha256` of a registered work authorization;
+an intent without one is refused (`authorization-unverified`), and every
+mutating owner verb requires the control token.
+Desktop chat delivery is live-verified on macOS through the app's own
+thread queue (`DesktopBridge`: `thread/queue/add` + `codex://threads/wake/…`,
+receipt from the new turn). Without that channel — or a host-validated
+`CZS_DESKTOP_WAKE_CMD` — the round fails `desktop-wakeup-unsupported`; the
+managed reviewer never silently replaces the desktop chat. The managed
+round-trip (real ZCode session + real Codex review, two rounds incl. one
+rework, owner restart and automatic verification/acceptance) was demonstrated
+2026-11-11. The native leg back into a user-created session is implemented
+through the shipped CLI (`zcode --resume`), which appends to the same session
+store; it was exercised end-to-end on a native CLI-created session, while the
+probe against a GUI-owned session (which this agent itself occupies) is
+reported separately — the adapter refuses `session-busy` rather than writing
+the database or grabbing the host's lock. When even the CLI cannot resume the
+session, `ZCodeGuiBridge` types into the session's own window through System
+Events and verifies the persisted user message before reporting delivery. It
+refuses an ambiguous window title, a non-empty draft, a busy session and a
+missing Automation/Accessibility grant; on this host macOS denies Accessibility
+to `osascript` (`-25211`), so this leg reports `desktop-wakeup-unsupported`. The bridge also needs a verifiable session identity on the window (set `ZSC_GUI_SESSION_ID_ATTRIBUTE` to the accessibility attribute that carries the session id); without it the GUI channel is unsupported and the window title is only used to locate the window, never to prove identity
+with the exact helper and permission until the user authorises it.

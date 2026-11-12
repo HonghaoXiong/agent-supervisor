@@ -24,6 +24,17 @@ WORK_REQUEST_ACTIONS = {
     'artifact': 'artifact', 'revalidate': 'knowledge-revalidate',
 }
 
+# Session-loop control verbs: token-gated owner methods (spec §8). The
+# control token comes from --control-token or CZS_WORK_CONTROL_TOKEN; the
+# reviewer token (submit-decision only) from CZS_WORK_REVIEW_TOKEN.
+SESSION_REQUEST_ACTIONS = {
+    'bind-session': 'bind_session', 'claim-session': 'claim_native_session',
+    'session-status': 'session_status',
+    'pause-session': 'pause_session', 'resume-session': 'resume_session',
+    'unbind-session': 'unbind_session', 'advance-session': 'advance_session_loop',
+    'submit-decision': 'submit_review_decision', 'adopt': 'adopt_existing_work',
+}
+
 
 def create_project(directory, cli_path=None, provider_config=None, node='node'):
     """Generate local configuration and a harmless, reviewable first task."""
@@ -215,12 +226,25 @@ def parser():
                             help='Read-only UI socket (default <state-root>/ui-events.sock)')
     work_serve.add_argument('--no-ui', action='store_true',
                             help='Retain the legacy control-only foreground owner')
+    work_serve.add_argument('--runner-config', type=Path, default=None,
+                            help='Wire the real executor: JSON file with hub_config '
+                                 '(path to the czs config.json) and profile '
+                                 '(worker/mode/models); without it the owner stays '
+                                 'offline (runner-unconfigured)')
     for command in WORK_REQUEST_ACTIONS:
         request_cmd = work_sub.add_parser(
             command, help=f'Forward work {command} to the independent local owner')
         request_cmd.add_argument('--request', type=Path, required=True,
-                                 help='Bounded JSON request document')
+                                 help='JSON request body')
         request_cmd.add_argument('--state-root', type=Path, default=Path('.zsc/work-owner'))
+    for command in SESSION_REQUEST_ACTIONS:
+        session_cmd = work_sub.add_parser(
+            command, help=f'Session-loop {command} (token-gated owner method)')
+        session_cmd.add_argument('--request', type=Path, required=True,
+                                 help='Bounded JSON request document')
+        session_cmd.add_argument('--state-root', type=Path, default=Path('.zsc/work-owner'))
+        session_cmd.add_argument('--control-token', default=None,
+                                 help='Host control token (default CZS_WORK_CONTROL_TOKEN)')
     work_status = work_sub.add_parser('status', help='Read work state without waiting for a worker')
     work_status.add_argument('--work-id', required=True)
     work_status.add_argument('--attempt-id', default=None)
@@ -396,8 +420,161 @@ def main(argv=None):
         if args.action == 'work':
             if args.work_action == 'serve':
                 from .work_control import WorkOwner, WorkUiHost
+                runner = None
+                loop_options = {}
+                if args.runner_config is not None:
+                    from .runtime import load_config as _load_config
+                    from .work_runtime import build_work_runner as _build_work_runner
+                    document = json.loads(args.runner_config.read_text(encoding='utf-8'))
+                    hub_config = _load_config(document['hub_config'])
+                    evidence_root = Path(document.get('evidence_root')
+                                         or (Path(hub_config.work_root) / 'hub-evidence'))
+                    runner = _build_work_runner(
+                        hub_config, evidence_root,
+                        profile=document.get('profile'),
+                        # the owner registers authorizations in
+                        # <state_root>/objects; the runner must resolve the
+                        # same objects before it dispatches anything
+                        artifact_root=Path(args.state_root) / 'objects')
+                    session_cfg = document.get('session_loop') or {}
+                    if session_cfg:
+                        # managed-reviewer wiring: one bounded app-server
+                        # connection per review round, the review THREAD
+                        # pinned across rounds (thread/resume). The reviewer
+                        # is built LAZILY: a desktop-bound round must never
+                        # construct (or need) a background reviewer, and each
+                        # attempt gets its own evidence directory.
+                        import asyncio as _asyncio
+                        import uuid as _uuid
+                        from .codex_appserver import (CodexAppServerClient,
+                                                      CodexAppServerDriver,
+                                                      SimpleContractAuthority)
+                        from .session_binding import SessionReviewer
+                        from .session_loop import SessionLoop
+                        from .work_models import ActorContext
+
+                        class _LazyReviewer:
+                            def __init__(self):
+                                self.thread_id = None
+
+                            def _build(self):
+                                codex_path = session_cfg.get('codex_path')
+                                if not codex_path:
+                                    raise SystemExit(
+                                        'work serve: session_loop.codex_path is '
+                                        'required for the managed reviewer')
+
+                                def driver_factory():
+                                    stamp = _uuid.uuid4().hex[:8]
+                                    evidence = (Path(hub_config.work_root)
+                                                / 'review-evidence' / f'attempt-{stamp}')
+                                    return CodexAppServerDriver(
+                                        CodexAppServerClient(codex_path, evidence))
+
+                                reviewer = SessionReviewer(
+                                    driver_factory,
+                                    session_cfg['review_workspace'],
+                                    model=session_cfg.get('review_model'))
+                                if self.thread_id:
+                                    reviewer.thread_id = self.thread_id
+                                return reviewer
+
+                            async def review_round(self, authority, prompt, **kwargs):
+                                reviewer = self._build()
+                                result = await reviewer.review_round(
+                                    authority, prompt, **kwargs)
+                                self.thread_id = reviewer.thread_id
+                                return result
+
+                        desktop_bridge = None
+                        if session_cfg.get('desktop_bridge', True):
+                            from .desktop_bridge import (DesktopBridge,
+                                                         bridge_capability)
+                            capability = bridge_capability(
+                                session_cfg.get('codex_path'))
+                            if capability.get('state') == \
+                                    'desktop-wakeup-available':
+                                desktop_bridge = DesktopBridge(
+                                    session_cfg.get('codex_path'),
+                                    evidence_root=(Path(hub_config.state_dir)
+                                                   / 'desktop-bridge'))
+                            else:
+                                print('session-loop: desktop bridge '
+                                      f"{capability.get('state')}: "
+                                      f"{capability.get('detail', '')}",
+                                      file=sys.stderr, flush=True)
+
+                        native_bridge = None
+                        if session_cfg.get('native_bridge', True):
+                            from .zcode_cli_bridge import (ZCodeCliBridge,
+                                                           cli_capability)
+                            native_cap = cli_capability(
+                                session_cfg.get('zcode_cli_path'))
+                            if native_cap.get('state') == \
+                                    'native-delivery-available':
+                                native_bridge = ZCodeCliBridge(
+                                    session_cfg.get('zcode_cli_path'),
+                                    node=session_cfg.get('zcode_node', 'node'),
+                                    timeout_s=int(session_cfg.get(
+                                        'zcode_timeout_s', 900)),
+                                    mode=session_cfg.get('zcode_mode', 'edit'),
+                                    runtime_config=hub_config)
+                            else:
+                                print('session-loop: native delivery '
+                                      f"{native_cap.get('reason', '')}",
+                                      file=sys.stderr, flush=True)
+
+                        native_gui = None
+                        if session_cfg.get('native_gui', True):
+                            from .zcode_gui_bridge import (ZCodeGuiBridge,
+                                                           gui_capability)
+                            capability = gui_capability()
+                            if capability.get('state') == \
+                                    'native-delivery-available':
+                                native_gui = ZCodeGuiBridge(
+                                    db_path=session_cfg.get('zcode_db'),
+                                    timeout_s=int(session_cfg.get(
+                                        'gui_timeout_s', 180)),
+                                    session_identity_attribute=capability.get(
+                                        'session_identity_attribute'),
+                                    evidence_root=(Path(hub_config.state_dir)
+                                                   / 'gui-bridge'))
+                            else:
+                                print('session-loop: native GUI bridge '
+                                      f"{capability.get('state')}: "
+                                      f"{capability.get('detail', '')}",
+                                      file=sys.stderr, flush=True)
+
+                        def loop_factory(owner):
+                            loop_actor = ActorContext(
+                                'local-work-owner',
+                                owner.actor.roles | frozenset({'review:submit'}),
+                                host_bound=True)
+                            return SessionLoop(
+                                owner.store, owner.dispatcher, owner.collaboration,
+                                reviewer=_LazyReviewer(),
+                                desktop_bridge=desktop_bridge,
+                                native_bridge=native_bridge,
+                                native_gui_bridge=native_gui,
+                                authority=SimpleContractAuthority([], []),
+                                owner_actor=loop_actor,
+                                authorization=session_cfg['authorization'],
+                                stage_bindings=session_cfg['stage_bindings'],
+                                hub_state_dir=hub_config.state_dir,
+                                authorization_root=owner.artifacts.root,
+                                profile=document.get('profile'),
+                                max_rounds=session_cfg.get('max_rounds', 20),
+                                max_no_progress=session_cfg.get('max_no_progress', 3))
+
+                        loop_options = {
+                            'session_loop_factory': loop_factory,
+                            'control_token': session_cfg.get('control_token'),
+                            'review_token': session_cfg.get('review_token'),
+                            'hub_state_dir': hub_config.state_dir,
+                        }
                 if args.no_ui:
-                    owner = WorkOwner(args.state_root).start()
+                    owner = WorkOwner(args.state_root, runner=runner,
+                                      **loop_options).start()
                     print(json.dumps({'ok': True, 'pid': os.getpid(),
                                       'control_socket': str(owner.socket_path)}), flush=True)
                     try:
@@ -406,7 +583,8 @@ def main(argv=None):
                         owner.stop()
                     return 0
                 async def serve():
-                    host = WorkUiHost(args.state_root, socket_path=args.ui_socket)
+                    host = WorkUiHost(args.state_root, socket_path=args.ui_socket,
+                                      owner_options={'runner': runner, **loop_options})
                     await host.start()
                     print(json.dumps({'ok': True, 'pid': os.getpid(),
                         'control_socket': str(host.owner.socket_path),
@@ -422,13 +600,29 @@ def main(argv=None):
                     pass
                 return 0
             if args.work_action == 'status' or args.work_action in WORK_REQUEST_ACTIONS \
-                    or args.work_action == 'knowledge':
+                    or args.work_action == 'knowledge' \
+                    or args.work_action in SESSION_REQUEST_ACTIONS:
                 from .work_contracts import WorkInputError, read_json_input
                 from .work_models import WorkError
                 from .work_tools import WorkService
                 try:
-                    service = WorkService.for_state_root(args.state_root)
-                    if args.work_action == 'status':
+                    service = WorkService.for_state_root(args.state_root, host=True)
+                    if args.work_action in SESSION_REQUEST_ACTIONS:
+                        # token-gated owner method: the token rides the
+                        # request; a body "actor" field is ignored server-side
+                        request = read_json_input(args.request, max_bytes=4 * 1024 * 1024)
+                        if not isinstance(request, dict):
+                            raise WorkInputError('schema-invalid', [{
+                                'code': 'request-not-object', 'path': '$',
+                                'message': 'session request must be a JSON object'}])
+                        token = args.control_token \
+                            or os.environ.get('CZS_WORK_CONTROL_TOKEN') \
+                            or os.environ.get('CZS_WORK_REVIEW_TOKEN')
+                        if token:
+                            request['control_token'] = token
+                        result = service.client.call(
+                            SESSION_REQUEST_ACTIONS[args.work_action], request)
+                    elif args.work_action == 'status':
                         result = service.invoke('status', {'work_id': args.work_id,
                                                           'attempt_id': args.attempt_id})
                     else:

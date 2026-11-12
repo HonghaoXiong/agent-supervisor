@@ -18,16 +18,26 @@ class CollaborationService:
         return self.store.create_work(spec, idempotency_key=idempotency_key, actor=actor)
 
     def context(self, work_id):
-        row = self.store._connection.execute("SELECT * FROM works WHERE work_id=?", (work_id,)).fetchone()
-        if row is None:
-            raise WorkError("work-missing", "unknown work")
+        # Materialize under the SAME lock the writers use: status polls run
+        # on control threads while dispatch/apply threads write — an
+        # unlocked interleaved read on the shared sqlite connection raises
+        # intermittently and kills the polling connection.
+        with self.store._lock:
+            row = self.store._connection.execute(
+                "SELECT * FROM works WHERE work_id=?", (work_id,)).fetchone()
+            if row is None:
+                raise WorkError("work-missing", "unknown work")
+            events = [
+                (event["action"], event["payload_json"])
+                for event in self.store._connection.execute(
+                    "SELECT action,payload_json FROM events WHERE work_id=? ORDER BY event_id",
+                    (work_id,))]
         result = {"spec": json.loads(row["spec_json"]), "state": row["state"],
                   "revision": row["revision"], "contributors": []}
         contributors = []
-        for event in self.store._connection.execute(
-                "SELECT action,payload_json FROM events WHERE work_id=? ORDER BY event_id", (work_id,)):
-            payload = json.loads(event["payload_json"])
-            if event["action"] == "create":
+        for action, payload_json in events:
+            payload = json.loads(payload_json)
+            if action == "create":
                 continue
             for key, value in payload.items():
                 if key not in ("state", "contributors"):
@@ -36,7 +46,7 @@ class CollaborationService:
                 for contributor in payload["contributors"]:
                     if contributor not in contributors:
                         contributors.append(contributor)
-            result["last_action"] = event["action"]
+            result["last_action"] = action
         result["contributors"] = contributors
         return result
 
@@ -53,6 +63,12 @@ class CollaborationService:
             "record_acceptance": "verification_running", "complete": "completed",
             "rework": "rework_required", "cancel": "cancelled",
             "reconcile": "needs_reconciliation",
+            # Session-loop adoption of an ALREADY-EXISTING delivery: created
+            # → adoption_pending (source refs recorded) → candidate_ready
+            # only once design/candidate/contributors are complete. No recon
+            # events are fabricated on this path.
+            "start_adoption": "adoption_pending",
+            "adopt_candidate": "candidate_ready",
         }
         if action not in transitions:
             raise WorkError("invalid-argument", f"unknown collaboration action {action}")
@@ -76,7 +92,12 @@ class CollaborationService:
         expected = {
             "start_recon": {"created", "rework_required"},
             "recon_running": {"recon_queued"}, "submit_brief": {"recon_running"},
-            "accept_design": {"brief_ready"}, "start_implementation": {"design_ready"},
+            "accept_design": {"brief_ready"},
+            # Session-loop: an ORDINARY rework (design hash unchanged — the
+            # design_sha256 check below still applies) goes straight back to
+            # the next implementation round without a new recon.
+            "start_implementation": {"design_ready", "rework_required"},
+            "start_adoption": {"created"}, "adopt_candidate": {"adoption_pending"},
             "implementation_running": {"implementation_queued"},
             "submit_delivery": {"implementation_running"},
             "start_verification": {"candidate_ready"},
@@ -97,6 +118,27 @@ class CollaborationService:
         if action == "start_recon":
             if not payload.get("attempt_id"):
                 raise WorkError("schema-invalid", "recon attempt required")
+        elif action == "start_adoption":
+            # Adoption declares WHERE the delivery came from; the evidence
+            # set may still be incomplete (that is what adoption_pending
+            # means — a directed Codex pass completes it).
+            source = payload.get("source")
+            if not isinstance(source, dict) or not source.get("binding_id"):
+                raise WorkError("schema-invalid",
+                                "adoption requires source refs (binding_id)")
+        elif action == "adopt_candidate":
+            # candidate_ready only with a traceable accepted design, a real
+            # candidate snapshot, the source round and contributor records.
+            for field in ("design", "candidate", "source", "contributors"):
+                if not payload.get(field):
+                    raise WorkError(
+                        "adoption-incomplete",
+                        f"{field} is missing; the work stays adoption_pending")
+            if not payload["design"].get("sha256") \
+                    or not payload["candidate"].get("sha256") \
+                    or not isinstance(payload["contributors"], list):
+                raise WorkError("adoption-incomplete",
+                                "design/candidate hashes and contributors are required")
         elif action == "recon_running":
             self._attempt(payload, context)
         elif action == "submit_brief":
@@ -116,7 +158,28 @@ class CollaborationService:
                 raise WorkError("source-drift", "implementation must use the current accepted design")
             parent = Path(context["spec"]["candidate_parent"]).resolve(strict=False)
             workspace = Path(payload.get("workspace", "")).resolve(strict=False)
-            if workspace == parent or parent not in workspace.parents:
+            binding_ref = payload.get("binding_ref")
+            if isinstance(binding_ref, str) and binding_ref:
+                # Session-loop bound_existing: an explicitly bound native
+                # session continues in ITS OWN directory — exact match only,
+                # never a sibling, never the candidate parent.
+                binding = self.store.get_session_binding(binding_ref)
+                if binding is None:
+                    raise WorkError("binding-missing", "unknown session binding reference")
+                capabilities = set(binding["capabilities"])
+                # A native claim (review + a proven CLI delivery bridge) runs
+                # the implementation attempt in ITS session; the hub never
+                # dispatches there, so `control` is not the gate — the claim
+                # provenance is.
+                native = bool((binding.get("evidence") or {}).get("native_claim"))
+                if binding["workspace_policy"] != "bound_existing" \
+                        or not ("control" in capabilities
+                                or ("review" in capabilities and native)) \
+                        or workspace != Path(binding["workspace"]).resolve(strict=False):
+                    raise WorkError(
+                        "scope-conflict",
+                        "the binding does not authorize control over this workspace")
+            elif workspace == parent or parent not in workspace.parents:
                 raise WorkError("scope-conflict", "implementation requires an isolated candidate child")
             if not set(payload.get("allowed_files", [])) <= set(context["design"].get("allowed_files", [])):
                 raise WorkError("scope-conflict", "write set exceeds accepted design")

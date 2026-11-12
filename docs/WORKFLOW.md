@@ -144,3 +144,7 @@ Offline fixture rendering and headless egui audits are not live-app visual
 acceptance. The checked-in shared fixture is
 `tests/fixtures/ui/work-wire-golden.json`; `tools/render_ui_fixture.py` writes
 360/720/1280 PNG resize evidence without launching a model or a real desktop.
+
+## Session loop (0.4.0-dev)
+
+Bind a fixed ZCode session once; the owner's pump notices each completed turn by itself, the pinned-thread Codex reviewer decides, and the next instruction returns to the same session via attach. Control bindings need a matching hub task record; a dispatch that lands in another session is marked needs_reconciliation. See USAGE.md 'Session loop'. Offline-tested only; live desktop wakeup unsupported without CZS_DESKTOP_WAKE_CMD.

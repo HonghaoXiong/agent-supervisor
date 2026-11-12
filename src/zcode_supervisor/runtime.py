@@ -43,6 +43,34 @@ CACHE_LAYOUT = 3
 # carried from the single-pin releases, NOT a claim that every pinned CLI is
 # 0.16.9 — fingerprints remain the authority.
 REVIEWED_BUNDLES = {
+    "26785f28ab8fb9f8b0f3821f2bf71d294f4d0b8bf28108785292f86c7e14090d": {
+        "patched_sha256": "62cb9ecdee59841e991fdeb54033e32d1407947019981c0b73f37d8dade9867a",
+        "upstream_commit": None,
+        "reviewed": "2026-11-11",
+        "provenance": (
+            "Desktop auto-update replaced the installed bundle in place (0.17.1; "
+            "full rebuild, minified identifiers regenerated, so only the "
+            "allowlist-conversion fragment and the protocol surface can be "
+            "compared). The fragment occurs exactly once and the patched digest "
+            "matches. Accepted 2026-11-11 after static literal comparison "
+            "(tool allowlist 15/15, allowed tools 100/100, high-risk "
+            "auto-approve 11/11, medium-risk 10/10, reasoning-level schema, "
+            "session create/resume methods), a protocol probe, and live "
+            "allow (Write), deny (unregistered Bash), resume (Edit on the same "
+            "session) and timeout runs. The first deny probe was a low-risk "
+            "bare echo, which the bundle executed before delivery review "
+            "rejected it; pre-execution denial was proven separately on "
+            "2026-11-11 with the installed CLI (interaction/requestPermission "
+            "-> host deny 'Not in this task contract' -> "
+            "permission.resolved:deny, no successful execution receipt; "
+            "session sess_d1670560-3bc9-431c-b11d-684cbeb92447, tool call "
+            "call_93c0b922124042129fef5f3e). Not a blanket approval of "
+            "untested UI or provider features. Evidence: "
+            "/private/tmp/zsc-bundle-review-26785 and "
+            "/private/tmp/zsc-acceptance-20261111-r6/deny-probe-summary.json."
+        ),
+        "cli_version": "0.17.1",
+    },
     "d9afd58d694f98a5279bf548cdc7646413c125762e86730605a6071f9e0346d6": {
         "patched_sha256": "7932cde2ac1af0d1431d01225993786036d7ca4a6ef3a8219878b5cab926956c",
         "upstream_commit": None,
@@ -190,6 +218,11 @@ class Config:
         environment = os.environ.copy()
         environment["OPENBLAS_NUM_THREADS"] = "1"
         environment["OMP_NUM_THREADS"] = "1"
+        # The verification worker must not leave bytecode caches in the
+        # workspace: the candidate scan now treats every workspace file as a
+        # real change, and an import-written .pyc would otherwise move the
+        # fingerprint after the review.
+        environment["PYTHONDONTWRITEBYTECODE"] = "1"
         if self.provider_config is not None:
             environment["ZCODE_BUILTIN_PROVIDER_CONFIG_FILE"] = str(self.provider_config)
         return environment
@@ -605,6 +638,22 @@ def prepare_cli(config: Config) -> Path:
             raise ValueError(f"Local protocol CLI was modified: {output}")
     else:
         atomic_write(output, patched)
+    # The CLI resolves its built-in provider seed from its own entrypoint:
+    # <entrypoint dir>/provider/zcode-builtin.json (falling back to a path
+    # five levels up). A cache copy has neither, so an owner-dispatched worker
+    # would die at start-up with "无法定位 CLI ZCode Built-in Provider
+    # Config". Seed the first candidate from the installed app's own
+    # resources; that file is the provider template, not a credential.
+    seed = (Path(config.cli_path).parent.parent / "config" / "provider"
+            / "zcode-builtin.json")
+    if seed.is_file():
+        target = runtime / "provider" / "zcode-builtin.json"
+        data = read_regular(seed)
+        if not target.exists() and not target.is_symlink():
+            ensure_directory(target.parent)
+            atomic_write(target, data)
+        elif read_regular(target) != data:
+            atomic_write(target, data)
     if manifest_path.exists() or manifest_path.is_symlink():
         try:
             existing = json.loads(read_regular(manifest_path))

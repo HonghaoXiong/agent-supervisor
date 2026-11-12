@@ -116,15 +116,19 @@ class WorkDispatcher:
                 intent = json.loads(payload["payload_json"])
             if canonical_sha256(intent) != row["request_sha256"]:
                 raise WorkError("dispatch-contract-mismatch", "contract digest differs from durable intent")
-            if row["state"] == "completed":
-                return self.status(row["attempt_id"])
-            if row["state"] != "pending":
-                return self.status(row["attempt_id"])
-            claimed = self.store._connection.execute(
-                "UPDATE dispatch_intents SET state='dispatching' WHERE intent_id=? AND state='pending'",
-                (intent_id,)).rowcount
-            if claimed != 1:
-                return self.status(row["attempt_id"])
+            if row["state"] != "pending" or self.store._connection.execute(
+                    "UPDATE dispatch_intents SET state='dispatching' WHERE intent_id=? AND state='pending'",
+                    (intent_id,)).rowcount != 1:
+                # already claimed/completed elsewhere: report the attempt
+                # WITHOUT re-acquiring the store lock (we hold it here —
+                # status() locks on its own)
+                attempt = self.store._connection.execute(
+                    "SELECT * FROM attempts WHERE attempt_id=?", (row["attempt_id"],)).fetchone()
+                if attempt is None:
+                    raise WorkError("attempt-missing", "unknown attempt")
+                return {"attempt_id": attempt["attempt_id"], "task_id": attempt["task_id"],
+                        "status": attempt["status"],
+                        "result": json.loads(attempt["result_json"]) if attempt["result_json"] else None}
             self.store._connection.execute("UPDATE attempts SET status='running' WHERE attempt_id=?",
                                            (row["attempt_id"],))
             binding = DispatchBinding(row["task_id"], intent["contract_sha256"], intent_id, row["attempt_id"])
@@ -152,14 +156,23 @@ class WorkDispatcher:
         return result
 
     def handle(self, attempt_id):
-        row = self.store._connection.execute(
-            "SELECT intent_id,task_id FROM dispatch_intents WHERE attempt_id=?", (attempt_id,)).fetchone()
+        with self.store._lock:
+            row = self.store._connection.execute(
+                "SELECT intent_id,task_id FROM dispatch_intents WHERE attempt_id=?", (attempt_id,)).fetchone()
         if row is None:
             raise WorkError("attempt-missing", "unknown attempt")
         return TaskHandle(self, row["intent_id"], attempt_id, row["task_id"])
 
+    def _attempt_row(self, attempt_id):
+        """Locked single-row read (the lock serializes against writer
+        threads recording results; status polls run on control threads)."""
+        with self.store._lock:
+            row = self.store._connection.execute(
+                "SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        return row
+
     def status(self, attempt_id):
-        row = self.store._connection.execute("SELECT * FROM attempts WHERE attempt_id=?", (attempt_id,)).fetchone()
+        row = self._attempt_row(attempt_id)
         if row is None:
             raise WorkError("attempt-missing", "unknown attempt")
         return {"attempt_id": attempt_id, "task_id": row["task_id"], "status": row["status"],

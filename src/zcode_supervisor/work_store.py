@@ -40,6 +40,19 @@ CREATE TABLE IF NOT EXISTS dispatch_payloads(
 CREATE TABLE IF NOT EXISTS artifact_refs(
  work_id TEXT NOT NULL, ref_json TEXT NOT NULL, object_root TEXT NOT NULL,
  PRIMARY KEY(work_id,ref_json), FOREIGN KEY(work_id) REFERENCES works(work_id));
+CREATE TABLE IF NOT EXISTS session_bindings(
+ binding_id TEXT PRIMARY KEY, session_id TEXT NOT NULL, db_path TEXT,
+ mode TEXT NOT NULL, state TEXT NOT NULL, capabilities_json TEXT NOT NULL,
+ workspace TEXT, workspace_policy TEXT NOT NULL, authorization_ref TEXT,
+ initial_review TEXT NOT NULL, cursor_json TEXT, revision INTEGER NOT NULL,
+ evidence_json TEXT, created TEXT NOT NULL, updated TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS session_rounds(
+ round_id TEXT PRIMARY KEY, binding_id TEXT NOT NULL, seq INTEGER NOT NULL,
+ state TEXT NOT NULL, source_json TEXT NOT NULL, candidate_sha256 TEXT,
+ design_revision INTEGER, reviewer_json TEXT, packet_json TEXT,
+ decision_json TEXT, instruction_json TEXT, error TEXT,
+ created TEXT NOT NULL, updated TEXT NOT NULL, verification_json TEXT,
+ review_json TEXT, dispatch_json TEXT);
 """
 
 
@@ -74,6 +87,17 @@ class WorkStore:
             attempt_columns = {row[1] for row in connection.execute("PRAGMA table_info(attempts)")}
             if "result_json" not in attempt_columns:
                 connection.execute("ALTER TABLE attempts ADD COLUMN result_json TEXT")
+            round_columns = {row[1] for row in connection.execute(
+                "PRAGMA table_info(session_rounds)")}
+            if "verification_json" not in round_columns:
+                connection.execute(
+                    "ALTER TABLE session_rounds ADD COLUMN verification_json TEXT")
+            if "review_json" not in round_columns:
+                connection.execute(
+                    "ALTER TABLE session_rounds ADD COLUMN review_json TEXT")
+            if "dispatch_json" not in round_columns:
+                connection.execute(
+                    "ALTER TABLE session_rounds ADD COLUMN dispatch_json TEXT")
             connection.execute("PRAGMA user_version=2")
             store = cls(root, connection, lock_fd)
             store._verify_artifacts()
@@ -195,6 +219,145 @@ class WorkStore:
         with self._lock:
             return [row["work_id"] for row in self._connection.execute(
                 "SELECT work_id FROM works ORDER BY rowid")]
+
+    # ------------------------------------------------- session bindings
+
+    _BINDING_COLUMNS = ("binding_id", "session_id", "db_path", "mode", "state",
+                        "capabilities_json", "workspace", "workspace_policy",
+                        "authorization_ref", "initial_review", "cursor_json",
+                        "revision", "evidence_json", "created", "updated")
+
+    @staticmethod
+    def _binding_row(row) -> dict:
+        record = {key: row[key] for key in WorkStore._BINDING_COLUMNS}
+        record["capabilities"] = json.loads(record.pop("capabilities_json"))
+        record["cursor"] = json.loads(record.pop("cursor_json")) if record["cursor_json"] else None
+        record["evidence"] = json.loads(record.pop("evidence_json")) if record["evidence_json"] else {}
+        return record
+
+    def save_session_binding(self, record: dict) -> None:
+        with self._lock:
+            self._connection.execute(
+                "INSERT OR REPLACE INTO session_bindings VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                (record["binding_id"], record["session_id"], record.get("db_path"),
+                 record["mode"], record["state"],
+                 canonical_json(record.get("capabilities", [])),
+                 record.get("workspace"), record["workspace_policy"],
+                 record.get("authorization_ref"), record["initial_review"],
+                 canonical_json(record.get("cursor") or {}), record.get("revision", 1),
+                 canonical_json(record.get("evidence") or {}),
+                 record["created"], record["updated"]))
+
+    def get_session_binding(self, binding_id: str):
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM session_bindings WHERE binding_id=?", (binding_id,)).fetchone()
+        return self._binding_row(row) if row is not None else None
+
+    def session_bindings(self, session_id: str) -> list:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT * FROM session_bindings WHERE session_id=? ORDER BY created",
+                (session_id,)).fetchall()
+        return [self._binding_row(row) for row in rows]
+
+    # ------------------------------------------------- session rounds
+
+    _ROUND_COLUMNS = ("round_id", "binding_id", "seq", "state", "source_json",
+                      "candidate_sha256", "design_revision", "reviewer_json",
+                      "packet_json", "decision_json", "instruction_json",
+                      "error", "created", "updated", "verification_json",
+                      "review_json", "dispatch_json")
+
+    def claim_dispatch(self, round_id: str, dispatch: dict):
+        """Register the FIRST native dispatch for a round atomically.
+
+        Returns ``(stored, created)``. Only the creator may send: two
+        concurrent decisions can reach the send path, and the second must
+        reuse the first identity instead of typing the instruction again.
+        """
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT dispatch_json FROM session_rounds WHERE round_id=?",
+                (round_id,)).fetchone()
+            if row is not None and row[0]:
+                existing = json.loads(row[0])
+                if existing:
+                    return existing, False
+            self._connection.execute(
+                "UPDATE session_rounds SET dispatch_json=? WHERE round_id=?",
+                (canonical_json(dispatch), round_id))
+            self._connection.commit()
+            return dispatch, True
+
+    def update_dispatch(self, round_id: str, **fields) -> dict:
+        """Merge fields into the stored dispatch; a receipt is never cleared."""
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT dispatch_json FROM session_rounds WHERE round_id=?",
+                (round_id,)).fetchone()
+            current = json.loads(row[0]) if row is not None and row[0] else {}
+            merged = {**current, **fields}
+            if current.get("completed_at") and "completed_at" not in fields:
+                merged["completed_at"] = current["completed_at"]
+            self._connection.execute(
+                "UPDATE session_rounds SET dispatch_json=? WHERE round_id=?",
+                (canonical_json(merged), round_id))
+            self._connection.commit()
+            return merged
+
+    def save_session_round(self, record: dict) -> None:
+        with self._lock:
+            row = dict(record)
+            for key, inner in (("source", "source_json"), ("reviewer", "reviewer_json"),
+                               ("packet", "packet_json"), ("decision", "decision_json"),
+                               ("instruction", "instruction_json"),
+                               ("verification", "verification_json"),
+                               ("review", "review_json"),
+                               ("dispatch", "dispatch_json")):
+                value = row.pop(key, None)
+                row[inner] = canonical_json(value) if value is not None else None
+            self._connection.execute(
+                "INSERT OR REPLACE INTO session_rounds VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                tuple(row.get(key) for key in self._ROUND_COLUMNS))
+
+    def get_session_round(self, round_id: str):
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT * FROM session_rounds WHERE round_id=?", (round_id,)).fetchone()
+        if row is None:
+            return None
+        record = {key: row[key] for key in self._ROUND_COLUMNS}
+        for key, inner in (("source", "source_json"), ("reviewer", "reviewer_json"),
+                           ("packet", "packet_json"), ("decision", "decision_json"),
+                           ("instruction", "instruction_json"),
+                           ("verification", "verification_json"),
+                           ("review", "review_json"),
+                           ("dispatch", "dispatch_json")):
+            text = record.pop(inner)
+            record[key] = json.loads(text) if text else None
+        return record
+
+    def session_rounds(self, binding_id: str) -> list:
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT round_id FROM session_rounds WHERE binding_id=? ORDER BY seq",
+                (binding_id,)).fetchall()
+        return [self.get_session_round(row["round_id"]) for row in rows]
+
+    def session_rounds_all(self) -> list:
+        """Every round in the store, for cross-binding turn ownership."""
+        with self._lock:
+            rows = self._connection.execute(
+                "SELECT round_id FROM session_rounds ORDER BY seq").fetchall()
+        return [self.get_session_round(row["round_id"]) for row in rows]
+
+    def next_round_seq(self, binding_id: str) -> int:
+        with self._lock:
+            row = self._connection.execute(
+                "SELECT MAX(seq) FROM session_rounds WHERE binding_id=?",
+                (binding_id,)).fetchone()
+        return (row[0] or 0) + 1
 
     def register_artifact(self, work_id, ref, artifact_store):
         from .artifact_store import ArtifactStore

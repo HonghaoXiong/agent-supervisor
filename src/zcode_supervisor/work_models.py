@@ -12,6 +12,7 @@ class WorkError(ValueError):
     def __init__(self, code: str, message: str, details=None):
         super().__init__(f"{code}: {message}")
         self.code = code
+        self.message = message  # the bare message, without the code prefix
         self.details = details or []
 
 

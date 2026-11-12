@@ -81,7 +81,7 @@ REQUIRED = (
 )
 WORKERS = ("zcode", "codex", "dsh")
 OPTIONAL = ("snapshots", "output_schema", "mode", "sandbox", "stall_timeout_ms",
-               "skills", "orchestration")
+               "skills", "orchestration", "authorization_sha256", "template_version")
 
 ZCODE_MODES = ("cold", "resident")
 CODEX_MODES = ("exec", "app-server")

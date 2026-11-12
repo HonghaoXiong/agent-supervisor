@@ -1586,8 +1586,10 @@ async def delegate_impl(config, evidence_root, contract_id, initiator, *,
         task_id = uuid.uuid4().hex
     else:
         # Internal durable-owner path only; MCP delegate arguments never expose this.
+        # Session-loop: attach is allowed too — re-dispatch under durable
+        # identity goes through the SAME record checks as any attach.
         from .work_dispatch import DispatchBinding
-        if not isinstance(dispatch_binding, DispatchBinding) or action != "start" \
+        if not isinstance(dispatch_binding, DispatchBinding) or action not in ("start", "attach") \
                 or not re.fullmatch(r"[0-9a-f]{32}", dispatch_binding.reserved_task_id):
             raise HubError("invalid-argument", "invalid internal dispatch binding")
         if dispatch_binding.contract_sha256 != digest:
@@ -2388,7 +2390,13 @@ def build_server(config, evidence_root: Path, *, codex_path=None,
                 from .work_models import WorkError
                 from .work_tools import WorkService
                 try:
-                    service = WorkService.for_state_root(Path(config.state_dir) / "work-owner")
+                    # R10: the MCP connection is NOT the host. It may
+                    # mutate only when the host explicitly provisioned a
+                    # token for THIS server process; the socket path alone
+                    # never grants the host role.
+                    service = WorkService.for_state_root(
+                        Path(config.state_dir) / "work-owner", host=False,
+                        token=os.environ.get("CZS_WORK_MCP_CONTROL_TOKEN"))
                     value = await _offload_read(
                         partial(service.invoke, WORK_MCP_ACTIONS[name]), arguments)
                 except WorkError as error:

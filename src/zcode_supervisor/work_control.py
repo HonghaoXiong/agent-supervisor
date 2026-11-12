@@ -6,7 +6,9 @@ import asyncio
 import hashlib
 import json
 import os
+import secrets
 import socket
+import sys
 import threading
 import uuid
 from pathlib import Path
@@ -14,8 +16,9 @@ from pathlib import Path
 from .artifact_store import ArtifactStore
 from .capability_registry import discover_capabilities
 from .collaboration import CollaborationService
+from .contract_compile import verify_against_authorization
 from .knowledge_store import KnowledgeStore
-from .work_authorization import register_work_authorization
+from .work_authorization import register_work_authorization, validate_authorization
 from .work_dispatch import WorkDispatcher
 from .work_models import ActorContext, WorkError
 from .work_policy import choose_route
@@ -24,6 +27,35 @@ from .work_contracts import canonical_sha256
 
 
 FRAME_LIMIT = 1024 * 1024
+
+# Session-loop control surface. Control identity is TOKEN-bound at the
+# connection-message level for v1: bind/pause/resume/unbind/advance/adopt
+# demand the host control token; decision submission additionally accepts
+# the reviewer token (which can NEVER bind, pause or adopt). Request-body
+# "actor" fields are ignored — possession of the token IS the identity.
+_LOOP_METHODS = frozenset({
+    "bind_session", "claim_native_session", "session_status",
+    "pause_session", "resume_session", "unbind_session",
+    "advance_session_loop", "submit_review_decision", "adopt_existing_work",
+})
+_LOOP_CONTROL_METHODS = frozenset({
+    "bind_session", "claim_native_session", "pause_session",
+    "resume_session", "unbind_session", "advance_session_loop",
+    "adopt_existing_work",
+})
+
+# Every method that mutates work state, registers an authorization or can
+# cause an execution requires the host control token — the same credential
+# for the whole surface, checked before any handler runs. Read-only
+# projections (ping/status/work_status/read_artifact/knowledge search) stay
+# open to the owner's read-only peers.
+_MUTATING_METHODS = frozenset({
+    "create_work", "authorize", "start_recon", "start_implementation",
+    "start_verification", "submit_brief", "accept_design", "submit_delivery",
+    "record_acceptance", "rework_work", "cancel_work", "reconcile_work",
+    "enqueue", "cancel", "reconcile", "propose_knowledge", "review_knowledge",
+    "revalidate_knowledge",
+})
 
 
 class WorkOwner:
@@ -34,16 +66,25 @@ class WorkOwner:
         "record_acceptance", "rework_work", "cancel_work", "reconcile_work", "work_status",
         "read_artifact", "search_knowledge", "revalidate_knowledge",
         "propose_knowledge", "review_knowledge",
-    })
+    }) | _LOOP_METHODS
 
     def __init__(self, state_root, *, store=None, runner=None, max_workers=4,
                  capability_config=None, routing_policy=None, routing_history=None,
-                 work_journal=None):
+                 work_journal=None, session_loop_factory=None,
+                 control_token=None, review_token=None, hub_state_dir=None,
+                 pump_interval_s=1.0):
         self.root = Path(state_root).expanduser().resolve()
         self.root.mkdir(parents=True, exist_ok=True, mode=0o700)
         self.root.chmod(0o700)
         self.socket_path = self.root / "control.sock"
+        self.hub_state_dir = Path(hub_state_dir) if hub_state_dir is not None else None
+        self._pump_interval_s = pump_interval_s
+        self._pump = None
         self.store = store or WorkStore.open(self.root)
+        self._session_loop_factory = session_loop_factory
+        self._session_loop = None
+        self._control_token = control_token
+        self._review_token = review_token
         self.actor = ActorContext("local-work-owner", {
             "work:create", "work:action", "work:authorize", "design:accept",
             "verification:start", "acceptance:record", "knowledge:review"}, host_bound=True)
@@ -72,6 +113,112 @@ class WorkOwner:
         raise WorkError("runner-unconfigured",
                         "no production runner is configured for this independent owner")
 
+    # ------------------------------------------------------------ credentials
+
+    def _control_token_value(self) -> str:
+        """The host control token: configured, or minted once per state root.
+
+        When the host does not configure one, the owner mints a random token
+        and persists it with mode 0600; every mutating request must present
+        it. Possession of the file is the host's own credential — this
+        defends against other processes, not against the same UID.
+        """
+        if isinstance(self._control_token, str) and self._control_token:
+            return self._control_token
+        path = self.root / "control.token"
+        if not path.exists():
+            fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(secrets.token_hex(32))
+        # cache it: every control path must compare against the SAME value,
+        # including the one this owner just minted
+        self._control_token = path.read_text(encoding="utf-8").strip()
+        return self._control_token
+
+    def _adopt_native_claim(self, binding, params):
+        """Let a claimed native session adopt an existing work.
+
+        The claim alone proves only the session identity: it is observe +
+        review. A work becomes reviewable only when the host supplies its
+        design and code_root carries a complete candidate fingerprint. Both
+        are recorded as adoption — never as a fabricated hub task.
+        """
+        design = params.get("design")
+        work_id = binding.get("work_id")
+        if not isinstance(design, dict) or not design.get("sha256"):
+            return binding
+        from .session_binding import build_candidate
+        context = self.collaboration.context(work_id)
+        if context.get("state") == "created":
+            self.collaboration.apply_action(
+                work_id, "start_adoption",
+                {"source": {"binding_id": binding["binding_id"],
+                            "session_id": binding["session_id"]}},
+                expected_revision=context["revision"],
+                idempotency_key=f"native-adopt-{binding['binding_id']}",
+                actor=self.actor)
+            context = self.collaboration.context(work_id)
+        if context.get("state") != "adoption_pending":
+            raise WorkError(
+                "state-conflict",
+                f"native adoption cannot start from {context.get('state')!r}")
+        candidate = build_candidate(binding["workspace"])
+        if candidate.get("coverage") != "complete" \
+                or not candidate.get("sha256"):
+            raise WorkError(
+                "candidate-coverage-incomplete",
+                "the claimed code_root has no complete candidate fingerprint")
+        contributors = params.get("contributors") or [
+            {"actor_id": "zcode", "session_id": binding["session_id"]}]
+        self.collaboration.apply_action(
+            work_id, "adopt_candidate", {
+                "design": design,
+                "candidate": {"sha256": candidate["sha256"]},
+                "candidate_manifest": candidate.get("files") or {},
+                "source": {"binding_id": binding["binding_id"],
+                           "session_id": binding["session_id"]},
+                "contributors": contributors},
+            expected_revision=context["revision"],
+            idempotency_key=f"native-adopt-candidate-{binding['binding_id']}",
+            actor=self.actor)
+        return binding
+
+    def _require_control(self, params):
+        import hmac as _hmac
+        token = params.get("control_token")
+        expected = self._control_token_value()
+        if not (isinstance(token, str) and _hmac.compare_digest(token, expected)):
+            raise WorkError("actor-untrusted",
+                            "this method changes work state and requires the "
+                            "owner's control token")
+        params.pop("control_token", None)
+        params.pop("actor", None)
+
+    def _verify_intent_authorization(self, intent):
+        """Refuse to enqueue an intent that no registered authorization backs."""
+        contract = intent.get("contract") if isinstance(intent, dict) else None
+        if not isinstance(contract, dict):
+            raise WorkError("authorization-unverified", "the intent carries no contract")
+        digest = contract.get("authorization_sha256")
+        if not isinstance(digest, str) or len(digest) != 64:
+            raise WorkError("authorization-unverified",
+                            "the contract carries no authorization hash")
+        try:
+            data = (self.artifacts.root / "sha256" / digest[:2] / digest).read_bytes()
+        except OSError as error:
+            raise WorkError(
+                "authorization-unverified",
+                f"no registered work authorization for {digest[:12]}…") from error
+        if hashlib.sha256(data).hexdigest() != digest:
+            raise WorkError("authorization-unverified",
+                            "the authorization object does not match its hash")
+        document = validate_authorization(json.loads(data))
+        # The hash proves this authorization EXISTS. Re-derive the contract
+        # from it so a caller cannot keep the hash and swap the stage, the
+        # program or the write scope.
+        verify_against_authorization(document, contract)
+        return document
+
     def start(self):
         if self.socket_path.exists() or self.socket_path.is_symlink():
             if self.socket_path.is_symlink():
@@ -90,8 +237,31 @@ class WorkOwner:
         os.chmod(self.socket_path, 0o600)
         self._server.listen(32)
         self._server.settimeout(0.2)
+        self._control_token_value()  # mint/persist the credential before serving
         threading.Thread(target=self._accept_loop, name="zsc-work-owner", daemon=True).start()
+        self._start_pump()
         return self
+
+    def _session_loop_instance(self):
+        if self._session_loop is None:
+            if self._session_loop_factory is None:
+                raise WorkError("loop-unconfigured",
+                                "the owner was started without a session-loop "
+                                "configuration (runner-config session_loop section)")
+            self._session_loop = self._session_loop_factory(self)
+        return self._session_loop
+
+    def _start_pump(self):
+        """Watch every bound session from the owner itself (no external calls)."""
+        if self._session_loop_factory is None or self.hub_state_dir is None:
+            return
+        from .session_loop import SessionPump
+        self._pump = SessionPump(
+            self._session_loop_instance, self.store,
+            interval_s=self._pump_interval_s,
+            logger=lambda message: print(f"session-pump: {message}",
+                                         file=sys.stderr, flush=True))
+        self._pump.start()
 
     def _accept_loop(self):
         while not self._stopped.is_set():
@@ -133,11 +303,18 @@ class WorkOwner:
                             result = self._invoke(request["method"], request["params"])
                             response = {"v": 1, "request_id": request["request_id"], "ok": True,
                                         "result": result}
-                        except (WorkError, ValueError, OSError) as error:
+                        except Exception as error:  # noqa: BLE001 - a handler fault
+                            # must surface as an error frame on THIS request,
+                            # never as a silently dropped connection
+                            code = getattr(error, "code", None)
+                            if code is None:
+                                code = ("invalid-argument"
+                                        if isinstance(error, (ValueError, OSError))
+                                        else "owner-internal-error")
                             response = {"v": 1, "request_id": locals().get("request", {}).get("request_id"),
                                         "ok": False,
-                                        "error": {"code": getattr(error, "code", "invalid-argument"),
-                                                  "message": str(error)[:500]}}
+                                        "error": {"code": code,
+                                                  "message": f"{type(error).__name__}: {error}"[:500]}}
                         payload = (json.dumps(response, ensure_ascii=False) + "\n").encode("utf-8")
                         if len(payload) > FRAME_LIMIT:
                             payload = b'{"v":1,"error":{"code":"response-too-large"}}\n'
@@ -160,11 +337,91 @@ class WorkOwner:
             self._project_work(work_id)
         return result
 
+    def _invoke_loop(self, method, params):
+        """Token-gated session-loop control surface.
+
+        The control token authorizes bind/pause/resume/unbind/advance/adopt;
+        decision submission additionally accepts the reviewer token, which
+        can NEVER reach the control methods. A request-body "actor" field
+        changes nothing — possession of the token is the identity, and a
+        missing token configuration fails closed for every loop method.
+        """
+        import hmac as _hmac
+        token = params.get("control_token")
+        tokens_ok = isinstance(self._control_token, str) and isinstance(token, str) \
+            and _hmac.compare_digest(token, self._control_token)
+        review_ok = isinstance(self._review_token, str) and isinstance(token, str) \
+            and _hmac.compare_digest(token, self._review_token) \
+            and method == "submit_review_decision"
+        if method == "session_status":
+            pass  # read-only projection of binding/round state
+        elif not (tokens_ok or review_ok):
+            raise WorkError("actor-untrusted",
+                            "session-loop control requires the host control "
+                            "token (or the reviewer token for decisions)")
+        params.pop("control_token", None)
+        params.pop("actor", None)  # body actor fields are never trusted
+
+        if method in ("bind_session", "claim_native_session", "pause_session",
+                      "resume_session", "unbind_session"):
+            from . import session_binding
+            if method == "bind_session":
+                return session_binding.bind_session(
+                    self.store, params, self.actor,
+                    hub_state_dir=self.hub_state_dir)
+            if method == "claim_native_session":
+                binding = session_binding.claim_native_session(
+                    self.store, params, self.actor,
+                    hub_state_dir=self.hub_state_dir)
+                return self._adopt_native_claim(binding, params)
+            handler = {"pause_session": session_binding.pause_session,
+                       "resume_session": session_binding.resume_session,
+                       "unbind_session": session_binding.unbind_session}[method]
+            return handler(self.store, params, self.actor)
+        if method == "session_status":
+            binding_id = params.get("binding_id")
+            binding = self.store.get_session_binding(binding_id) if binding_id else None
+            if binding is None:
+                return {"bindings": [
+                    {"binding_id": item["binding_id"], "session_id": item["session_id"],
+                     "state": item["state"], "mode": item["mode"]}
+                    for item in self.store.session_bindings(params.get("session_id") or "")
+                    or []] if params.get("session_id") else []}
+            return {"binding": {key: binding[key] for key in
+                                ("binding_id", "session_id", "state", "mode",
+                                 "workspace", "workspace_policy", "cursor",
+                                 "capabilities")},
+                    "rounds": [{"round_id": item["round_id"], "seq": item["seq"],
+                                "state": item["state"],
+                                "candidate_sha256": item["candidate_sha256"],
+                                "decision": item.get("decision"),
+                                "instruction": item.get("instruction"),
+                                "verification": item.get("verification")}
+                               for item in self.store.session_rounds(binding_id)]}
+        # loop-consuming methods need the configured SessionLoop
+        session_loop = self._session_loop_instance()
+        if method == "advance_session_loop":
+            return session_loop.advance(params.get("binding_id"),
+                                        params.get("source") or None)
+        if method == "submit_review_decision":
+            reviewer_actor = ActorContext(
+                "session-loop-reviewer", {"review:submit"},
+                host_bound=True, session_id="reviewer-credential")
+            return session_loop.submit_decision(
+                params.get("decision"), reviewer_actor)
+        if method == "adopt_existing_work":
+            return session_loop.adopt_existing_work(params, self.actor)
+        raise WorkError("unknown-method", "unreachable loop method")
+
     def _invoke_inner(self, method, params):
         if method == "ping":
             return {"pid": os.getpid(), "protocol_version": 1}
         if method == "shutdown":
             return {"stopping": True}
+        if method in _LOOP_METHODS:
+            return self._invoke_loop(method, params)
+        if method in _MUTATING_METHODS:
+            self._require_control(params)
         if method == "create_work":
             created = self.collaboration.create_work(params.get("spec"),
                 idempotency_key=params.get("idempotency_key"), actor=self.actor)
@@ -232,6 +489,7 @@ class WorkOwner:
             ref = params.get("ref") or {"claim_id": params.get("claim_id")}
             return self.knowledge.revalidate(ref, params.get("current_manifest"))
         if method == "enqueue":
+            self._verify_intent_authorization(params.get("intent"))
             handle = self.dispatcher.enqueue(params.get("intent"))
             return {"attempt_id": handle.attempt_id, "task_id": handle.task_id,
                     "intent_id": handle.intent_id}
@@ -292,6 +550,7 @@ class WorkOwner:
             intent = {**intent, "contract": contract, "contract_sha256": canonical_sha256(contract)}
             params["intent"] = intent
         accepted = self._apply(action, params)
+        self._verify_intent_authorization(intent)
         handle = self.dispatcher.enqueue(intent)
         current = accepted
         if method in ("start_recon", "start_implementation"):
@@ -320,14 +579,16 @@ class WorkOwner:
                     raise
                 result["execution"] = {"attempt_id": attempt_id, "status": "not_enqueued"}
         result["next_actions"] = {
-            "created": ["start_recon"], "recon_queued": ["recon_running", "work_status"],
+            "created": ["start_recon", "start_adoption"], "recon_queued": ["recon_running", "work_status"],
             "recon_running": ["submit_brief", "work_status"], "brief_ready": ["accept_design"],
             "design_ready": ["start_implementation"],
+            "adoption_pending": ["adopt_candidate", "work_status"],
             "implementation_queued": ["implementation_running", "work_status"],
             "implementation_running": ["submit_delivery", "work_status"],
             "candidate_ready": ["start_verification"],
             "verification_running": ["record_acceptance", "work_status"],
-            "rework_required": ["start_recon"], "completed": ["work_status"],
+            "rework_required": ["start_implementation", "start_recon"],
+            "completed": ["work_status"],
             "cancelled": ["work_status"], "needs_reconciliation": ["reconcile_work"],
         }.get(result["state"], [])
         return result
@@ -347,8 +608,18 @@ class WorkOwner:
 
     def stop(self):
         self._stopped.set()
+        if self._pump is not None:
+            self._pump.stop()
         if self._server is not None:
             self._server.close()
+        runner = getattr(self.dispatcher, "runner", None)
+        if hasattr(runner, "close"):
+            # Real-executor runners own shared worker holders; settle them
+            # with the owner (never per client connection).
+            try:
+                runner.close()
+            except Exception:  # noqa: BLE001 - shutdown must complete anyway
+                pass
         self.dispatcher.close()
         self.knowledge.close()
         self.store.close()
@@ -396,12 +667,42 @@ class WorkUiHost:
 
 
 class ControlClient:
-    def __init__(self, socket_path):
+    """One request-scoped control connection.
+
+    ``host=True`` is for the user's own trusted CLI: it may pick the control
+    token up from the environment or the 0600 token file next to the socket.
+    A model-facing connection (the work MCP service) is never host by
+    default: seeing the socket path must not upgrade it to the host role.
+    """
+
+    def __init__(self, socket_path, *, token=None, host=False):
         self.socket_path = Path(socket_path)
+        self.token = token
+        self.host = bool(host)
+
+    def _token(self):
+        if isinstance(self.token, str) and self.token:
+            return self.token
+        if not self.host:
+            return None
+        environment = os.environ.get("CZS_WORK_CONTROL_TOKEN")
+        if environment:
+            return environment
+        path = self.socket_path.parent / "control.token"
+        try:
+            if path.stat().st_mode & 0o077:
+                return None
+            return path.read_text(encoding="utf-8").strip() or None
+        except OSError:
+            return None
 
     def request(self, method, params=None, *, timeout=10):
+        body = dict(params or {})
+        token = self._token()
+        if token is not None and "control_token" not in body:
+            body["control_token"] = token
         payload = json.dumps({"v": 1, "request_id": uuid.uuid4().hex, "method": method,
-                              "params": params or {}}, ensure_ascii=False).encode("utf-8") + b"\n"
+                              "params": body}, ensure_ascii=False).encode("utf-8") + b"\n"
         return self.raw(payload, timeout=timeout)
 
     def raw(self, payload, *, timeout=10):

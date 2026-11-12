@@ -229,11 +229,15 @@ class CodexAppServerClient:
     """
 
     def __init__(self, codex_path, evidence_dir: Path, *, transport='stdio',
-                 env=None, exit_event_sink=None):
+                 env=None, exit_event_sink=None, experimental_api=False):
         self.codex_path = str(codex_path)
         self.evidence_dir = Path(evidence_dir)
         self.transport = transport
         self.env = env
+        # The desktop bridge needs the app-server's thread queue, which is
+        # gated behind the experimentalApi capability. Review traffic does
+        # not use it, so the default stays False.
+        self.experimental_api = bool(experimental_api)
         self.pending = {}
         self.notifications = []
         self.counter = 0
@@ -554,7 +558,7 @@ class CodexAppServerClient:
             self.initialize_result = await self.request('initialize', {
                 'clientInfo': {'name': 'czs-hub', 'version': __version__,
                                'title': 'czs-hub supervisor'},
-                'capabilities': {'experimentalApi': False}},
+                'capabilities': {'experimentalApi': self.experimental_api}},
                 timeout=initialize_timeout)
             return self.initialize_result
         except BaseException:
@@ -1253,7 +1257,9 @@ class CodexAppServerDriver:
 
     async def run_task(self, authority, workspace: Path, prompt: str, *, model=None,
                        sandbox='read-only', approval_policy='on-request',
-                       timeout_s=600, budget=None, progress_ledger=None) -> dict:
+                       timeout_s=600, budget=None, progress_ledger=None,
+                       resume_thread=None, expect_model=None,
+                       client_message_id=None) -> dict:
         # P0.1 (review spec-I3/I5): the budget originates at the CALL START,
         # before any setup — and a caller that already owns one (CLI run with
         # its initialize, hub delegate with the lazy app-server start) passes
@@ -1515,12 +1521,33 @@ class CodexAppServerDriver:
                              'approvalsReviewer': 'user', 'ephemeral': False}
             if model is not None:
                 thread_params['model'] = str(model)
-            result = await self.client.request('thread/start', thread_params,
-                                               timeout=budget.wait_s(cap=120))
-            thread = result.get('thread') if isinstance(result, dict) else None
-            receipt['thread_id'] = (thread or {}).get('id') if isinstance(thread, dict) else None
-            if not receipt['thread_id']:
-                raise AppServerError('thread/start returned no thread id')
+            if resume_thread is not None:
+                # Session-loop fixed reviewer: continue the SAME thread —
+                # thread/resume, never a silent new conversation. A server
+                # answering with a different thread id (or a drifted model)
+                # is refused, not adopted.
+                result = await self.client.request('thread/resume',
+                                                   {'threadId': resume_thread},
+                                                   timeout=budget.wait_s(cap=120))
+                thread = result.get('thread') if isinstance(result, dict) else None
+                thread_id = (thread or {}).get('id') if isinstance(thread, dict) else None
+                if thread_id != resume_thread:
+                    raise AppServerError(
+                        f'thread/resume returned a different thread: {thread_id!r}')
+                if expect_model is not None:
+                    resumed_model = thread.get('model') if isinstance(thread, dict) else None
+                    if isinstance(resumed_model, str) and resumed_model != str(expect_model):
+                        raise AppServerError(
+                            'reviewer thread model drifted: '
+                            f'{resumed_model!r} != {str(expect_model)!r}')
+            else:
+                result = await self.client.request('thread/start', thread_params,
+                                                   timeout=budget.wait_s(cap=120))
+                thread = result.get('thread') if isinstance(result, dict) else None
+                thread_id = (thread or {}).get('id') if isinstance(thread, dict) else None
+                if not thread_id:
+                    raise AppServerError('thread/start returned no thread id')
+            receipt['thread_id'] = thread_id
             # Authority identity binding: the hub-built Authority re-checks
             # sessionId on every decide(), so it must learn the thread id
             # before any approval callback can fire (hasattr keeps
@@ -1548,7 +1575,9 @@ class CodexAppServerDriver:
             result = await self.client.request(
                 'turn/start',
                 {'threadId': receipt['thread_id'],
-                 'input': [{'type': 'text', 'text': prompt}]},
+                 'input': [{'type': 'text', 'text': prompt}],
+                 **({'clientUserMessageId': client_message_id}
+                    if client_message_id else {})},
                 timeout=budget.wait_s(cap=120),
                 **({'on_written': lambda: turn_wire.__setitem__('written', True)}
                    if accepts_on_written else {}))

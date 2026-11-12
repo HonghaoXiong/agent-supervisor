@@ -18,16 +18,39 @@ from typing import Protocol, runtime_checkable
 from .common import read_regular, sha256_regular
 
 
+def _is_runtime_bytecode_cache(path, info):
+    """A CPython bytecode cache: a regular ``__pycache__/<name>.pyc|.pyo``.
+
+    R6-B: neither the suffix alone nor an ancestor directory called
+    ``__pycache__`` is enough. A tracked ``vendor.pyc`` outside a
+    ``__pycache__`` directory, and real source (``__pycache__/fixture.py``)
+    are reviewable inputs, not caches.
+    """
+    return (stat.S_ISREG(info.st_mode)
+            and path.parent.name == '__pycache__'
+            and path.suffix in ('.pyc', '.pyo'))
+
+
 def inventory(workspace):
     if not workspace.is_dir() or workspace.is_symlink():
         raise ValueError('Workspace must be a real directory')
     result = {}
     total = 0
     for path in [workspace, *sorted(workspace.rglob('*'))]:
-        info = path.lstat()
+        # R6-A: the structural checks run BEFORE any cache exemption. A
+        # link or special file whose name looks like a cache is refused.
+        try:
+            info = path.lstat()
+        except OSError as error:
+            raise ValueError(f'Cannot stat input: {path}') from error
         if stat.S_ISLNK(info.st_mode):
             raise ValueError(f'Symlink in input: {path}')
         if stat.S_ISDIR(info.st_mode):
+            continue
+        # Bytecode caches are derived artifacts, not frozen inputs: running
+        # the registered verification command imports project code and would
+        # otherwise report its own __pycache__ as a changed input.
+        if _is_runtime_bytecode_cache(path, info):
             continue
         if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
             raise ValueError(f'Only ordinary, unshared files are allowed: {path}')
